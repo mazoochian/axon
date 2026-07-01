@@ -63,7 +63,37 @@ defmodule AxonCrypto.KeyServer do
   @impl true
   def handle_call(:server_key_info, _from, state) do
     public_key_b64 = Base.encode64(state.public_key, padding: false)
-    {:reply, {state.key_id, public_key_b64, state.valid_until_ts}, state}
+
+    # Build the self-signed key info document
+    unsigned_doc = %{
+      "server_name" => state.server_name,
+      "valid_until_ts" => state.valid_until_ts,
+      "verify_keys" => %{
+        state.key_id => %{"key" => public_key_b64}
+      }
+    }
+
+    sig_bytes =
+      :crypto.sign(
+        :eddsa,
+        :none,
+        AxonCrypto.CanonicalJSON.encode_to_binary(unsigned_doc),
+        [state.private_key, :ed25519]
+      )
+
+    sig_b64 = Base.encode64(sig_bytes, padding: false)
+
+    info = %{
+      server_name: state.server_name,
+      key_id: state.key_id,
+      public_key_b64: public_key_b64,
+      valid_until_ts: state.valid_until_ts,
+      signatures: %{
+        state.server_name => %{state.key_id => sig_b64}
+      }
+    }
+
+    {:reply, info, state}
   end
 
   def handle_call(:server_name, _from, state) do

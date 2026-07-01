@@ -27,6 +27,7 @@ defmodule AxonRoom.MixProject do
     [
       {:axon_core, in_umbrella: true},
       {:horde, "~> 0.9"},
+      {:phoenix_pubsub, "~> 2.1"},
       {:telemetry, "~> 1.2"}
     ]
   end

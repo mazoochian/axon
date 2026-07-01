@@ -11,6 +11,7 @@ defmodule AxonCore.Schema.RoomMembership do
     field :sender, :string
     field :display_name, :string
     field :avatar_url, :string
+    field :forgotten, :boolean, default: false
 
     belongs_to :room, AxonCore.Schema.Room, foreign_key: :room_id, references: :room_id, define_field: false
 
