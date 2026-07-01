@@ -22,12 +22,12 @@ defmodule AxonWeb.Router do
     pipe_through :api
 
     get "/versions", VersionController, :versions
-    get "/v3/capabilities", VersionController, :capabilities
 
     # Auth
     get "/v3/login", AuthController, :login_types
     post "/v3/login", AuthController, :login
     post "/v3/register", AuthController, :register
+    get "/v3/register/available", AuthController, :register_available
 
     # Public profile (no auth needed per spec)
     get "/v3/profile/:user_id", ProfileController, :show
@@ -38,6 +38,16 @@ defmodule AxonWeb.Router do
     get "/v3/publicRooms", DirectoryController, :public_rooms
     post "/v3/publicRooms", DirectoryController, :public_rooms
     get "/v3/directory/room/:room_alias", DirectoryController, :get_alias
+  end
+
+  # -------------------------------------------------------------------------
+  # Synapse admin registration (no auth — uses HMAC MAC for auth)
+  # -------------------------------------------------------------------------
+  scope "/_synapse/admin/v1", AxonWeb do
+    pipe_through :api
+
+    get "/register", AuthController, :synapse_nonce
+    post "/register", AuthController, :synapse_register
   end
 
   # -------------------------------------------------------------------------
@@ -57,9 +67,12 @@ defmodule AxonWeb.Router do
     pipe_through :authenticated
 
     # Account
+    get "/v3/capabilities", VersionController, :capabilities
     post "/v3/logout", AuthController, :logout
     post "/v3/logout/all", AuthController, :logout_all
     get "/v3/account/whoami", AuthController, :whoami
+    post "/v3/account/password", AuthController, :change_password
+    post "/v3/account/deactivate", AuthController, :deactivate
 
     # Profile
     put "/v3/profile/:user_id/displayname", ProfileController, :set_displayname
@@ -109,6 +122,16 @@ defmodule AxonWeb.Router do
     put "/v3/user/:user_id/account_data/:type", AccountDataController, :put
     get "/v3/user/:user_id/rooms/:room_id/account_data/:type", AccountDataController, :get_room
     put "/v3/user/:user_id/rooms/:room_id/account_data/:type", AccountDataController, :put_room
+
+    # Devices
+    get "/v3/devices", DeviceController, :index
+    get "/v3/devices/:device_id", DeviceController, :show
+    put "/v3/devices/:device_id", DeviceController, :update
+    delete "/v3/devices/:device_id", DeviceController, :delete
+
+    # Receipts & read markers
+    post "/v3/rooms/:room_id/receipt/:receipt_type/:event_id", ReceiptController, :receipt
+    post "/v3/rooms/:room_id/read_markers", ReceiptController, :read_markers
 
     # E2EE
     post "/v3/keys/upload", KeyController, :upload
