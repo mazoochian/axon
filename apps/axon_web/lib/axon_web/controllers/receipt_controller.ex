@@ -39,10 +39,10 @@ defmodule AxonWeb.ReceiptController do
     end
 
     if event_id = params["m.fully_read"] do
-      Repo.insert_all("receipts",
-        [%{room_id: room_id, user_id: user_id, receipt_type: "m.fully_read", event_id: event_id, ts: ts}],
-        on_conflict: {:replace, [:event_id, :ts]},
-        conflict_target: [:room_id, :user_id, :receipt_type]
+      Repo.insert_all("room_account_data",
+        [%{user_id: user_id, room_id: room_id, type: "m.fully_read", content: %{"event_id" => event_id}}],
+        on_conflict: {:replace, [:content]},
+        conflict_target: [:user_id, :room_id, :type]
       )
     end
 

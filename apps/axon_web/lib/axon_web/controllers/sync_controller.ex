@@ -165,6 +165,7 @@ defmodule AxonWeb.SyncController do
     filtered_timeline = apply_type_filter(timeline_events, tl_types)
 
     ephemeral = build_ephemeral(room_id)
+    room_account_data = build_room_account_data(room_id, user_id)
 
     %{
       "timeline" => %{
@@ -173,7 +174,7 @@ defmodule AxonWeb.SyncController do
         "prev_batch" => prev_batch
       },
       "state" => %{"events" => filtered_state},
-      "account_data" => %{"events" => []},
+      "account_data" => %{"events" => room_account_data},
       "ephemeral" => %{"events" => ephemeral},
       "summary" => %{}
     }
@@ -307,6 +308,15 @@ defmodule AxonWeb.SyncController do
       {n, _} -> n
       :error -> 0
     end
+  end
+
+  defp build_room_account_data(room_id, user_id) do
+    Repo.all(
+      from r in "room_account_data",
+        where: r.room_id == ^room_id and r.user_id == ^user_id,
+        select: %{type: r.type, content: r.content}
+    )
+    |> Enum.map(fn r -> %{"type" => r.type, "content" => r.content} end)
   end
 
   defp build_ephemeral(room_id) do

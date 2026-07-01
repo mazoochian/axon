@@ -79,17 +79,27 @@ defmodule AxonWeb.DeviceController do
         end
 
       true ->
-        conn
-        |> put_status(401)
-        |> json(%{
-          "session" => gen_session(),
-          "flows" => [%{"stages" => ["m.login.password"]}],
-          "params" => %{},
-          "errcode" => "M_FORBIDDEN",
-          "error" => "Invalid credentials"
-        })
+        # Distinguish: auth user doesn't match current user → 403; wrong password → 401
+        auth_user_id = get_auth_user_id(auth, user_id)
+        if auth_user_id != user_id do
+          conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Auth user does not match device owner"})
+        else
+          conn
+          |> put_status(401)
+          |> json(%{
+            "session" => gen_session(),
+            "flows" => [%{"stages" => ["m.login.password"]}],
+            "params" => %{},
+            "errcode" => "M_FORBIDDEN",
+            "error" => "Invalid credentials"
+          })
+        end
     end
   end
+
+  defp get_auth_user_id(%{"identifier" => %{"user" => u}}, _default) when is_binary(u), do: u
+  defp get_auth_user_id(%{"user" => u}, _default) when is_binary(u), do: u
+  defp get_auth_user_id(_auth, default), do: default
 
   defp validate_ui_auth(current_user_id, %{"type" => "m.login.password"} = auth) do
     identifier = auth["identifier"] || %{}
