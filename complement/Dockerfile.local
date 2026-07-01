@@ -1,0 +1,15 @@
+FROM nextcloud:latest AS base
+
+# Install only postgresql (libssl3 + libncurses6 already present in nextcloud/debian)
+RUN apt-get update && apt-get install -y \
+    postgresql \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built Axon release (built on host, same OTP version)
+COPY _build/prod/rel/axon /axon
+COPY complement/start.sh /start.sh
+RUN chmod +x /start.sh
+
+EXPOSE 8008 8448
+
+CMD ["/start.sh"]

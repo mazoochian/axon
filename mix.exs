@@ -8,7 +8,23 @@ defmodule Axon.MixProject do
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      aliases: aliases()
+      aliases: aliases(),
+      releases: releases()
+    ]
+  end
+
+  defp releases do
+    [
+      axon: [
+        include_executables_for: [:unix],
+        applications: [
+          axon_crypto: :permanent,
+          axon_core: :permanent,
+          axon_room: :permanent,
+          axon_sync: :permanent,
+          axon_web: :permanent
+        ]
+      ]
     ]
   end
 

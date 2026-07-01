@@ -17,13 +17,29 @@ config :axon_core, ecto_repos: [AxonCore.Repo]
 
 # Phoenix endpoint
 config :axon_web, AxonWeb.Endpoint,
-  http: [port: 8008],
-  secret_key_base: System.get_env("SECRET_KEY_BASE", String.duplicate("a", 64))
+  adapter: Bandit.PhoenixAdapter,
+  http: [ip: {0, 0, 0, 0}, port: 8008],
+  url: [host: "localhost"],
+  secret_key_base: System.get_env("SECRET_KEY_BASE", String.duplicate("a", 64)),
+  render_errors: [
+    formats: [json: AxonWeb.FallbackController],
+    layout: false
+  ],
+  pubsub_server: Axon.PubSub,
+  live_view: [signing_salt: "axon_lv"]
 
 # Federation HTTP listener (separate port)
 config :axon_federation,
   http_port: 8448,
   server_name: System.get_env("AXON_SERVER_NAME", "localhost")
+
+config :axon_web, AxonWeb.FederationEndpoint,
+  adapter: Bandit.PhoenixAdapter,
+  http: [ip: {0, 0, 0, 0}, port: 8448],
+  url: [host: "localhost"],
+  secret_key_base: System.get_env("SECRET_KEY_BASE", String.duplicate("a", 64)),
+  render_errors: [formats: [json: AxonWeb.FallbackController], layout: false],
+  pubsub_server: Axon.PubSub
 
 # Media storage backend: :local or :s3
 config :axon_media,

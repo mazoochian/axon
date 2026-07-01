@@ -33,7 +33,7 @@ defmodule AxonCore.Schema.Event do
       :event_id, :room_id, :sender, :type, :state_key, :content, :unsigned,
       :origin_server_ts, :origin, :auth_event_ids, :prev_event_ids, :depth,
       :signatures, :hashes, :room_version, :rejected, :soft_failed
-    ])
+    ], empty_values: [])
     |> validate_required([
       :event_id, :room_id, :sender, :type, :content,
       :origin_server_ts, :origin, :depth, :signatures, :hashes, :room_version
