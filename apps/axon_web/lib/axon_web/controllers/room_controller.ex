@@ -46,7 +46,7 @@ defmodule AxonWeb.RoomController do
 
   # POST /_matrix/client/v3/join/:room_id_or_alias
   # POST /_matrix/client/v3/rooms/:room_id/join
-  def join(conn, %{"room_id" => room_id_or_alias}) do
+  def join(conn, %{"room_id" => room_id_or_alias} = params) do
     user_id = conn.assigns.current_user_id
 
     room_id =
@@ -59,9 +59,12 @@ defmodule AxonWeb.RoomController do
     if is_nil(room_id) do
       conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room alias not found"})
     else
+      extra_content = Map.drop(params, ["room_id"])
+      content = Map.merge(extra_content, %{"membership" => "join"})
+
       with {:ok, _} <- EventStore.get_room(room_id),
            {:ok, _event_id} <-
-             RoomProcess.send_event(room_id, user_id, "m.room.member", %{"membership" => "join"},
+             RoomProcess.send_event(room_id, user_id, "m.room.member", content,
                state_key: user_id
              ) do
         json(conn, %{"room_id" => room_id})

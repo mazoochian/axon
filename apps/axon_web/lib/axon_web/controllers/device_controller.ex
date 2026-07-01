@@ -32,11 +32,12 @@ defmodule AxonWeb.DeviceController do
       nil ->
         {:error, :not_found}
 
-      device ->
+      _device ->
         if display_name = params["display_name"] do
-          device
-          |> Device.changeset(%{display_name: display_name})
-          |> Repo.update!()
+          Repo.update_all(
+            from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id),
+            set: [display_name: display_name]
+          )
         end
 
         json(conn, %{})
