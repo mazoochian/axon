@@ -164,6 +164,8 @@ defmodule AxonWeb.SyncController do
     # Apply type filter to timeline
     filtered_timeline = apply_type_filter(timeline_events, tl_types)
 
+    ephemeral = build_ephemeral(room_id)
+
     %{
       "timeline" => %{
         "events" => filtered_timeline,
@@ -172,7 +174,7 @@ defmodule AxonWeb.SyncController do
       },
       "state" => %{"events" => filtered_state},
       "account_data" => %{"events" => []},
-      "ephemeral" => %{"events" => []},
+      "ephemeral" => %{"events" => ephemeral},
       "summary" => %{}
     }
   end
@@ -304,6 +306,30 @@ defmodule AxonWeb.SyncController do
     case Integer.parse(since) do
       {n, _} -> n
       :error -> 0
+    end
+  end
+
+  defp build_ephemeral(room_id) do
+    receipts =
+      Repo.all(
+        from r in "receipts",
+          where: r.room_id == ^room_id and r.receipt_type in ["m.read", "m.read.private"],
+          select: %{user_id: r.user_id, receipt_type: r.receipt_type, event_id: r.event_id, ts: r.ts}
+      )
+
+    if receipts == [] do
+      []
+    else
+      content =
+        Enum.reduce(receipts, %{}, fn r, acc ->
+          user_entry = %{"ts" => r.ts}
+          type_map = Map.get(acc, r.event_id, %{})
+          users_map = Map.get(type_map, r.receipt_type, %{})
+          updated_type_map = Map.put(type_map, r.receipt_type, Map.put(users_map, r.user_id, user_entry))
+          Map.put(acc, r.event_id, updated_type_map)
+        end)
+
+      [%{"type" => "m.receipt", "content" => content}]
     end
   end
 

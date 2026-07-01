@@ -115,11 +115,17 @@ defmodule AxonCore.UserStore do
     end
   end
 
-  @doc "Invalidates a single token."
+  @doc "Invalidates a single token and deletes the associated device."
   def logout(raw_token) do
     hash = token_hash(raw_token)
-    Repo.update_all(from(t in AccessToken, where: t.token_hash == ^hash), set: [valid: false])
-    :ok
+    case Repo.one(from t in AccessToken, where: t.token_hash == ^hash and t.valid == true, select: {t.user_id, t.device_id}) do
+      nil ->
+        :ok
+      {user_id, device_id} ->
+        Repo.update_all(from(t in AccessToken, where: t.user_id == ^user_id and t.device_id == ^device_id), set: [valid: false])
+        Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id))
+        :ok
+    end
   end
 
   @doc "Invalidates all tokens for a user (optionally scoped to a device)."

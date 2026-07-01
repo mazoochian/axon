@@ -132,7 +132,7 @@ defmodule AxonWeb.EventController do
     dir = params["dir"] || "b"
     limit = String.to_integer(params["limit"] || "10")
 
-    from_ordering = parse_token(from_token) || EventStore.room_max_stream_ordering(room_id)
+    from_ordering = parse_token(from_token) || (EventStore.room_max_stream_ordering(room_id) + 1)
 
     events = EventStore.get_messages(room_id, from_ordering, dir, limit)
 
