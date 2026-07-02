@@ -384,6 +384,28 @@ defmodule AxonCore.EventStore do
 
   def event_to_map(m) when is_map(m), do: m
 
+  @doc "Returns true if the room exists locally."
+  def room_exists?(room_id) do
+    import Ecto.Query
+    Repo.one(from r in "rooms", where: r.room_id == ^room_id, select: r.room_id) != nil
+  end
+
+  @doc "Fetch event by ID and convert to wire-format map."
+  def event_to_map_by_id(event_id) do
+    case get_event(event_id) do
+      {:ok, e} -> event_to_map(e)
+      _ -> nil
+    end
+  end
+
+  @doc "Fetch an event map by ID for use in state resolution auth chain traversal."
+  def get_event_map(event_id) do
+    case get_event(event_id) do
+      {:ok, e} -> event_to_map(e)
+      _ -> nil
+    end
+  end
+
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

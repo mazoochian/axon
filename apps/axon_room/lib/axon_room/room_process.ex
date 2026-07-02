@@ -90,6 +90,20 @@ defmodule AxonRoom.RoomProcess do
     end
   end
 
+  @doc "Returns the full room context map (for federation use)."
+  def get_room_ctx(room_id) do
+    with {:ok, pid} <- get_or_start(room_id) do
+      GenServer.call(pid, :get_room_ctx)
+    end
+  end
+
+  @doc "Returns current_state as a flat map of {type, state_key} => event_map."
+  def get_state_map(room_id) do
+    with {:ok, pid} <- get_or_start(room_id) do
+      GenServer.call(pid, :get_state_map)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Server callbacks
   # ---------------------------------------------------------------------------
@@ -133,6 +147,7 @@ defmodule AxonRoom.RoomProcess do
             event_map = EventStore.event_to_map(persisted)
             new_state = apply_and_advance(state, event_map, persisted.stream_ordering)
             broadcast(state.room_id, event_map)
+            broadcast_for_federation(state.room_id, event_map, new_state.current_state)
             {:reply, {:ok, event["event_id"]}, new_state}
 
           {:error, reason} ->
@@ -153,6 +168,21 @@ defmodule AxonRoom.RoomProcess do
 
   def handle_call(:get_position, _from, state) do
     {:reply, {state.last_event_id, state.depth}, state}
+  end
+
+  def handle_call(:get_room_ctx, _from, state) do
+    ctx = %{
+      room_id: state.room_id,
+      room_version: state.room_version,
+      last_event_id: state.last_event_id,
+      depth: state.depth,
+      current_state: state.current_state
+    }
+    {:reply, ctx, state}
+  end
+
+  def handle_call(:get_state_map, _from, state) do
+    {:reply, state.current_state, state}
   end
 
   # ---------------------------------------------------------------------------
@@ -264,6 +294,34 @@ defmodule AxonRoom.RoomProcess do
 
   defp broadcast(room_id, event_map) do
     Phoenix.PubSub.broadcast(@pubsub, "room:#{room_id}", {:new_event, room_id, event_map})
+  end
+
+  # Broadcast for federation fan-out via PubSub. axon_web subscribes and sends
+  # the event to remote servers. This avoids a cross-app dependency from
+  # axon_room to axon_federation (they're at the same supervision level).
+  defp broadcast_for_federation(_room_id, event_map, current_state) do
+    local_server = Application.get_env(:axon_web, :server_name, "localhost")
+
+    remote_servers =
+      current_state
+      |> Enum.flat_map(fn
+        {{"m.room.member", user_id}, event} ->
+          membership = get_in(event, ["content", "membership"])
+          server = user_id |> String.split(":") |> List.last()
+          if membership == "join" and server != local_server, do: [server], else: []
+
+        _ ->
+          []
+      end)
+      |> Enum.uniq()
+
+    if remote_servers != [] do
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "federation:fanout",
+        {:federate_event, event_map, remote_servers}
+      )
+    end
   end
 
   defp via(room_id), do: {:via, Horde.Registry, {AxonRoom.Registry, room_id}}
