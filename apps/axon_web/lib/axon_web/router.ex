@@ -148,6 +148,22 @@ defmodule AxonWeb.Router do
     pipe_through :api
     get "/v3/config", VersionController, :media_config
     get "/r0/config", VersionController, :media_config
+    get "/v3/download/:server_name/:media_id", MediaController, :download
+    get "/v3/download/:server_name/:media_id/:filename", MediaController, :download
+    get "/v3/thumbnail/:server_name/:media_id", MediaController, :thumbnail
+    get "/r0/download/:server_name/:media_id", MediaController, :download
+    get "/r0/download/:server_name/:media_id/:filename", MediaController, :download
+    get "/r0/thumbnail/:server_name/:media_id", MediaController, :thumbnail
+    post "/v3/upload", MediaController, :upload
+    post "/r0/upload", MediaController, :upload
+  end
+
+  # -------------------------------------------------------------------------
+  # Application Service inbound transactions (AS auth via token)
+  # -------------------------------------------------------------------------
+  scope "/_matrix/app/v1", AxonWeb do
+    pipe_through :api
+    put "/transactions/:txn_id", AppServiceController, :transaction
   end
 
   # -------------------------------------------------------------------------
@@ -257,10 +273,18 @@ defmodule AxonWeb.Router do
     post "/v3/delete_devices", DeviceController, :delete_devices
     post "/r0/delete_devices", DeviceController, :delete_devices
 
-    # Pushers (stub — no push gateway configured)
-    get "/v3/pushers", VersionController, :empty_list_pushers
-    post "/v3/pushers/set", VersionController, :empty_ok
-    get "/r0/pushers", VersionController, :empty_list_pushers
+    # Pushers
+    get "/v3/pushers", PusherController, :index
+    post "/v3/pushers/set", PusherController, :set
+    get "/r0/pushers", PusherController, :index
+    post "/r0/pushers/set", PusherController, :set
+
+    # Media upload (auth required per spec)
+    post "/v3/media/upload", MediaController, :upload
+    get  "/v1/media/download/:server_name/:media_id", MediaController, :download
+    get  "/v1/media/download/:server_name/:media_id/:filename", MediaController, :download
+    get  "/v1/media/thumbnail/:server_name/:media_id", MediaController, :thumbnail
+    get  "/v3/media/preview_url", MediaController, :url_preview
 
     # Third-party identifiers (stub)
     get "/v3/account/3pid", VersionController, :empty_list_3pid

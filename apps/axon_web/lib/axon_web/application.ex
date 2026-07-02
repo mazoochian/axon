@@ -15,6 +15,8 @@ defmodule AxonWeb.Application do
       {Task.Supervisor, name: Axon.TaskSupervisor},
       # Federation outbound fan-out (subscribes to PubSub, sends PDUs to remote servers)
       AxonWeb.FederationFanout,
+      # Application service manager (loads AS registrations, dispatches events)
+      AxonWeb.AppService.Manager,
       # Cluster auto-discovery
       {Cluster.Supervisor, [topologies, [name: Axon.ClusterSupervisor]]},
       # CS API endpoint (port 8008)

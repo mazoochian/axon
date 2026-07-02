@@ -10,7 +10,7 @@ defmodule AxonWeb.Plug.JsonBodyParser do
     |> Plug.Parsers.call(
       Plug.Parsers.init(
         parsers: [:json],
-        pass: ["application/json"],
+        pass: ["*/*"],
         json_decoder: Jason
       )
     )

@@ -148,6 +148,10 @@ defmodule AxonRoom.RoomProcess do
             new_state = apply_and_advance(state, event_map, persisted.stream_ordering)
             broadcast(state.room_id, event_map)
             broadcast_for_federation(state.room_id, event_map, new_state.current_state)
+            # Push notifications (fire-and-forget)
+            AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
+            # AppService fanout via PubSub (avoids circular dep on axon_web)
+            Phoenix.PubSub.broadcast(@pubsub, "all_events", {:new_event, state.room_id, event_map})
             {:reply, {:ok, event["event_id"]}, new_state}
 
           {:error, reason} ->

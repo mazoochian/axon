@@ -26,6 +26,7 @@ defmodule AxonRoom.MixProject do
   defp deps do
     [
       {:axon_core, in_umbrella: true},
+      {:axon_push, in_umbrella: true},
       {:horde, "~> 0.9"},
       {:phoenix_pubsub, "~> 2.1"},
       {:telemetry, "~> 1.2"}
