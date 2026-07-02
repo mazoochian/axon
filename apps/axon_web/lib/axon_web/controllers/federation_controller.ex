@@ -144,7 +144,7 @@ defmodule AxonWeb.FederationController do
     already_processed =
       Repo.one(
         from t in "federation_inbound_txns",
-          where: t.origin == ^origin and t.txn_id == ^txn_id,
+          where: t.origin == ^origin and t.txn_id == ^txn_id and t.processed == true,
           select: t.id
       )
 
@@ -169,7 +169,8 @@ defmodule AxonWeb.FederationController do
         %{
           origin: origin,
           txn_id: txn_id,
-          processed_at: DateTime.utc_now(:microsecond)
+          processed: true,
+          inserted_at: DateTime.utc_now(:microsecond)
         }
       ], on_conflict: :nothing)
 
