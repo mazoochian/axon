@@ -433,19 +433,13 @@ defmodule AxonWeb.FederationController do
   end
 
   defp apply_remote_event(pdu, room_id) do
-    version = get_room_version(room_id)
-    current_state = RoomProcess.get_state_map(room_id)
-
-    case AuthRules.check(pdu, current_state) do
-      :ok ->
-        case EventStore.insert_event(pdu, version) do
-          {:ok, _} -> :ok
-          err -> err
-        end
+    case RoomProcess.apply_remote_event(room_id, pdu) do
+      {:ok, _event_id} ->
+        :ok
 
       {:error, reason} ->
         Logger.debug("Soft-fail PDU #{pdu["event_id"]}: #{inspect(reason)}")
-        # Soft-fail: store but mark as rejected
+        # Soft-fail: don't apply to room state, but don't error the transaction either.
         :ok
     end
   end

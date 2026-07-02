@@ -2,7 +2,7 @@
 
 A Matrix homeserver written in Elixir/Erlang, targeting spec [v1.18](https://spec.matrix.org/v1.18/).
 
-Named after the neurological structure — fitting for a highly-connected, distributed message-passing system. Axon is designed to fix the fundamental runtime limitations of [Synapse](https://github.com/element-hq/synapse) (Python GIL, OS-level worker processes, Redis dependency) by using the BEAM runtime, where each Matrix room maps naturally to a GenServer process that owns its state in memory, serializes event application, and can be restarted from persistent storage on crash.
+Named after the neurological structure, Axon is designed to fix the fundamental runtime limitations of [Synapse](https://github.com/element-hq/synapse) (Python GIL, OS-level worker processes, Redis dependency) by using the BEAM runtime, where each Matrix room maps naturally to a GenServer process that owns its state in memory, serializes event application, and can be restarted from persistent storage on crash.
 
 ## Status
 
