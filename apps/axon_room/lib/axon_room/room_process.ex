@@ -13,7 +13,7 @@ defmodule AxonRoom.RoomProcess do
   require Logger
 
   alias AxonCore.EventStore
-  alias AxonRoom.{AuthRules, EventBuilder, StateApplicator}
+  alias AxonRoom.{AuthRules, EventBuilder, StateApplicator, StateResolver}
 
   @snapshot_interval 100
   @pubsub Axon.PubSub
@@ -180,7 +180,14 @@ defmodule AxonRoom.RoomProcess do
   def handle_call({:apply_remote_event, pdu}, _from, state) do
     pdu = with_prev_content(pdu, pdu["state_key"], state.current_state)
 
-    case AuthRules.check(pdu, state.current_state, state.room_version) do
+    auth_check_state =
+      if StateResolver.needs_resolution?(pdu, state.last_event_id) do
+        StateResolver.resolve_for_auth_check(pdu, state.current_state)
+      else
+        state.current_state
+      end
+
+    case AuthRules.check(pdu, auth_check_state, state.room_version) do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
 
