@@ -44,6 +44,39 @@ defmodule AxonWeb.DeviceController do
     end
   end
 
+  # POST /_matrix/client/v3/delete_devices
+  def delete_devices(conn, params) do
+    user_id = conn.assigns.current_user_id
+    auth = params["auth"]
+    device_ids = params["devices"] || []
+
+    cond do
+      is_nil(auth) ->
+        conn |> put_status(401) |> json(%{
+          "session" => gen_session(),
+          "flows" => [%{"stages" => ["m.login.password"]}, %{"stages" => ["m.login.dummy"]}],
+          "params" => %{}
+        })
+
+      validate_ui_auth(user_id, auth) == :ok || match?(%{"type" => "m.login.dummy"}, auth) ->
+        Repo.update_all(
+          from(t in AccessToken, where: t.user_id == ^user_id and t.device_id in ^device_ids),
+          set: [valid: false]
+        )
+        Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id in ^device_ids))
+        json(conn, %{})
+
+      true ->
+        conn |> put_status(401) |> json(%{
+          "session" => gen_session(),
+          "flows" => [%{"stages" => ["m.login.password"]}, %{"stages" => ["m.login.dummy"]}],
+          "params" => %{},
+          "errcode" => "M_FORBIDDEN",
+          "error" => "Invalid credentials"
+        })
+    end
+  end
+
   # DELETE /_matrix/client/v3/devices/:device_id
   # Requires User-Interactive Authentication
   def delete(conn, %{"device_id" => device_id} = params) do
