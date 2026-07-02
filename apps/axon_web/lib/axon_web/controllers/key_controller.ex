@@ -202,6 +202,7 @@ defmodule AxonWeb.KeyController do
   # ---------------------------------------------------------------------------
 
   def create_backup_version(conn, params) do
+    user_id = conn.assigns.current_user_id
     algorithm = params["algorithm"]
     auth_data = params["auth_data"]
 
@@ -210,6 +211,7 @@ defmodule AxonWeb.KeyController do
     else
       version = Integer.to_string(System.os_time(:millisecond))
       Repo.insert_all("room_key_backup_versions", [%{
+        user_id: user_id,
         version: version,
         algorithm: algorithm,
         auth_data: auth_data,
@@ -223,16 +225,17 @@ defmodule AxonWeb.KeyController do
   end
 
   def get_backup_version(conn, params) do
+    user_id = conn.assigns.current_user_id
     version = params["version"]
 
     query =
       if version do
         from v in "room_key_backup_versions",
-          where: v.version == ^version and not v.deleted,
+          where: v.user_id == ^user_id and v.version == ^version and not v.deleted,
           select: %{version: v.version, algorithm: v.algorithm, auth_data: v.auth_data, etag: v.etag, count: v.count}
       else
         from v in "room_key_backup_versions",
-          where: not v.deleted,
+          where: v.user_id == ^user_id and not v.deleted,
           order_by: [desc: v.inserted_at],
           limit: 1,
           select: %{version: v.version, algorithm: v.algorithm, auth_data: v.auth_data, etag: v.etag, count: v.count}
@@ -253,8 +256,9 @@ defmodule AxonWeb.KeyController do
   end
 
   def delete_backup_version(conn, %{"version" => version}) do
+    user_id = conn.assigns.current_user_id
     {n, _} = Repo.update_all(
-      from(v in "room_key_backup_versions", where: v.version == ^version),
+      from(v in "room_key_backup_versions", where: v.user_id == ^user_id and v.version == ^version),
       set: [deleted: true]
     )
     if n > 0, do: json(conn, %{}),
@@ -262,6 +266,7 @@ defmodule AxonWeb.KeyController do
   end
 
   def put_backup_keys(conn, params) do
+    user_id = conn.assigns.current_user_id
     version = params["version"]
     rooms = get_in(params, ["rooms"]) || %{}
 
@@ -270,6 +275,7 @@ defmodule AxonWeb.KeyController do
         sessions = room_data["sessions"] || %{}
         Enum.map(sessions, fn {session_id, session_data} ->
           %{
+            user_id: user_id,
             version: version,
             room_id: room_id,
             session_id: session_id,
@@ -286,8 +292,8 @@ defmodule AxonWeb.KeyController do
         on_conflict: {:replace, [:first_message_index, :forwarded_count, :is_verified, :session_data]},
         conflict_target: [:version, :room_id, :session_id])
 
-      count = Repo.one(from b in "room_key_backups", where: b.version == ^version, select: count(b.session_id))
-      Repo.update_all(from(v in "room_key_backup_versions", where: v.version == ^version),
+      count = Repo.one(from b in "room_key_backups", where: b.user_id == ^user_id and b.version == ^version, select: count(b.session_id))
+      Repo.update_all(from(v in "room_key_backup_versions", where: v.user_id == ^user_id and v.version == ^version),
         set: [count: count || 0, etag: Integer.to_string(System.os_time(:millisecond))])
     end
 
@@ -295,26 +301,26 @@ defmodule AxonWeb.KeyController do
   end
 
   def get_backup_keys(conn, params) do
+    user_id = conn.assigns.current_user_id
     version = params["version"]
     room_id = params["room_id"]
     session_id = params["session_id"]
 
-    rows =
-      Repo.all(
-        from b in "room_key_backups",
-          where:
-            b.version == ^version and
-              (is_nil(^room_id) or b.room_id == ^room_id) and
-              (is_nil(^session_id) or b.session_id == ^session_id),
-          select: %{
-            room_id: b.room_id,
-            session_id: b.session_id,
-            first_message_index: b.first_message_index,
-            forwarded_count: b.forwarded_count,
-            is_verified: b.is_verified,
-            session_data: b.session_data
-          }
-      )
+    base = from b in "room_key_backups",
+      where: b.user_id == ^user_id and b.version == ^version,
+      select: %{
+        room_id: b.room_id,
+        session_id: b.session_id,
+        first_message_index: b.first_message_index,
+        forwarded_count: b.forwarded_count,
+        is_verified: b.is_verified,
+        session_data: b.session_data
+      }
+
+    base = if room_id, do: from(b in base, where: b.room_id == ^room_id), else: base
+    base = if session_id, do: from(b in base, where: b.session_id == ^session_id), else: base
+
+    rows = Repo.all(base)
 
     response =
       cond do
