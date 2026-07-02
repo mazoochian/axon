@@ -99,6 +99,10 @@ defmodule AxonWeb.RoomController do
     end
   end
 
+  # PUT /_matrix/client/v3/rooms/:room_id/typing/:user_id
+  # Typing is ephemeral — we acknowledge but don't persist or fan out yet.
+  def typing(conn, _params), do: json(conn, %{})
+
   # POST /_matrix/client/v3/rooms/:room_id/forget
   def forget(conn, %{"room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
