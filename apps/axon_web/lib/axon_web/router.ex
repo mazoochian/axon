@@ -252,5 +252,23 @@ defmodule AxonWeb.Router do
     post "/v3/keys/claim", KeyController, :claim
     get "/v3/keys/changes", KeyController, :changes
     put "/v3/sendToDevice/:event_type/:txn_id", KeyController, :send_to_device
+
+    # User directory
+    post "/v3/user_directory/search", UserDirectoryController, :search
+    post "/r0/user_directory/search", UserDirectoryController, :search
+
+    # Push rules
+    get "/v3/pushrules/", PushRulesController, :index
+    get "/v3/pushrules/:scope/", PushRulesController, :get_scope
+    get "/v3/pushrules/:scope/:kind/:rule_id", PushRulesController, :get_rule
+    put "/v3/pushrules/:scope/:kind/:rule_id", PushRulesController, :put_rule
+    delete "/v3/pushrules/:scope/:kind/:rule_id", PushRulesController, :delete_rule
+    put "/v3/pushrules/:scope/:kind/:rule_id/enabled", PushRulesController, :put_rule_enabled
+    put "/v3/pushrules/:scope/:kind/:rule_id/actions", PushRulesController, :put_rule_actions
+    get "/r0/pushrules/", PushRulesController, :index
+    get "/r0/pushrules/:scope/", PushRulesController, :get_scope
+    get "/r0/pushrules/:scope/:kind/:rule_id", PushRulesController, :get_rule
+    put "/r0/pushrules/:scope/:kind/:rule_id", PushRulesController, :put_rule
+    delete "/r0/pushrules/:scope/:kind/:rule_id", PushRulesController, :delete_rule
   end
 end
