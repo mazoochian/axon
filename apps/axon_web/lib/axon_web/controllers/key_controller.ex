@@ -246,7 +246,7 @@ defmodule AxonWeb.KeyController do
     if is_nil(algorithm) || is_nil(auth_data) do
       conn |> put_status(400) |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "algorithm and auth_data required"})
     else
-      version = Integer.to_string(System.os_time(:millisecond))
+      version = Integer.to_string(System.unique_integer([:positive, :monotonic]))
       Repo.insert_all("room_key_backup_versions", [%{
         user_id: user_id,
         version: version,

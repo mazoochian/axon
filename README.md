@@ -10,9 +10,10 @@ Named after the neurological structure — fitting for a highly-connected, distr
 |---|---|---|
 | **Phase 1** — CS API | Auth, rooms, events, sync, filters, directory, E2EE keys | **Complete** — 37/50 Complement CS API tests pass (all 13 failures are Phase 3/4 scope: media, push, presence, search) |
 | **Phase 2** — Federation | State res v2, S2S API, room join, PDU fan-out | **In progress** — foundation built (key cache, HTTP client, all endpoints, outbound fan-out) |
-| **Phase 3** — Full E2EE | Cross-signing, key backup, device list tracking | Not started |
-| **Phase 4** — Media/Push | Upload/download, thumbnails, push notifications, App Services | Not started |
+| **Phase 3** — Full E2EE | Cross-signing, key backup, SSSS, device list sync, to-device delivery | **Complete** — user-scoped key backup, cross-signing UIA, device list change tracking, OTK counts in sync |
+| **Phase 4** — Media/Push | Upload/download, thumbnails, push notifications, App Services | **Complete** — local filesystem media, Sygnal-compatible push delivery, AS skeleton with PubSub fanout |
 | **Phase 5** — Advanced | Spaces, threads, reactions, room upgrades | Not started |
+| **Phase 6** — OIDC | OAuth2/OIDC login (MSC3861) for Fractal and modern clients | Not started |
 
 ## Why BEAM?
 
@@ -99,6 +100,13 @@ Core tables:
 | `account_data` / `room_account_data` | Per-user and per-room account data (JSONB) |
 | `federation_inbound_txns` | Deduplication of inbound `PUT /send/:txnId` transactions |
 | `remote_server_keys` | Persisted cache of remote server Ed25519 keys |
+| `cross_signing_keys` | Master, self-signing, user-signing cross-signing keys per user |
+| `cross_signing_signatures` | Uploaded cross-signing signature records |
+| `room_key_backup_versions` | Key backup version metadata, user-scoped |
+| `room_key_backups` | Megolm session key backups |
+| `device_list_updates` | Log of key upload events used to compute `/keys/changes` cursor |
+| `media` | Media file metadata (origin server, content-type, storage path) |
+| `pushers` | Registered push gateways per user/device |
 
 ## Getting started
 
@@ -314,6 +322,27 @@ FAIL: Presence (1 test) — Phase 3
 FAIL: Search (1 test) — Phase 4
 FAIL: Server notices (1 test) — Phase 4
 ```
+
+## Media storage
+
+Media files are stored on the local filesystem (default: `/tmp/axon_media`). Configure a custom path:
+
+```elixir
+# config/dev.exs
+config :axon_media, :storage_path, "/var/lib/axon/media"
+```
+
+Each upload generates a random 24-character base64url ID (`mxc://server/ID`). Remote media is proxied on download.
+
+## Application Services
+
+Drop a JSON registration file in the project directory and point to it:
+
+```elixir
+config :axon_web, :appservice_config_path, "appservices.json"
+```
+
+Registration format matches Synapse's schema. The manager subscribes to all room events via Phoenix.PubSub and fans out to matching ASes.
 
 ## Room versions
 
