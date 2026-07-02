@@ -4,7 +4,7 @@ defmodule AxonWeb.KeyController do
   action_fallback AxonWeb.FallbackController
 
   alias AxonCrypto.KeyServer
-  alias AxonCore.Repo
+  alias AxonCore.{EventStore, Repo}
   import Ecto.Query
 
   # ---------------------------------------------------------------------------
@@ -39,9 +39,10 @@ defmodule AxonWeb.KeyController do
     one_time_keys = params["one_time_keys"] || %{}
     fallback_keys = params["fallback_keys"] || %{}
 
-    # Store device keys
+    # Store device keys and record that this user's device list changed
     if device_keys do
       upsert_device_keys(user_id, device_id, device_keys)
+      record_device_list_update(user_id)
     end
 
     # Store one-time keys — key_id is "algorithm:key_id", e.g. "curve25519:AAAA"
@@ -126,8 +127,43 @@ defmodule AxonWeb.KeyController do
   end
 
   # GET /_matrix/client/v3/keys/changes
-  def changes(conn, _params) do
-    json(conn, %{"changed" => [], "left" => []})
+  # Returns users whose device keys changed between `from` and `to` sync tokens.
+  # Uses the dl_cursor (second part of token) to query device_list_updates by id.
+  def changes(conn, params) do
+    user_id = conn.assigns.current_user_id
+    dl_from = parse_dl_cursor(params["from"])
+    dl_to = parse_dl_cursor(params["to"])
+
+    shared_users = shared_room_user_ids(user_id)
+
+    changed =
+      if shared_users == [] do
+        []
+      else
+        Repo.all(
+          from u in "device_list_updates",
+            where:
+              u.user_id in ^shared_users and
+              u.id > ^dl_from and
+              u.id <= ^dl_to,
+            select: u.user_id,
+            distinct: true
+        )
+      end
+
+    json(conn, %{"changed" => changed, "left" => []})
+  end
+
+  # Extracts the dl_cursor (device-list position) from a sync token.
+  # Token format: "${room_ordering}_${dl_cursor}" or plain integer (legacy → dl_cursor = 0).
+  defp parse_dl_cursor(nil), do: 0
+  defp parse_dl_cursor(token) do
+    case String.split(token, "_", parts: 2) do
+      [_, dl_s] ->
+        case Integer.parse(dl_s) do {n, _} -> n; _ -> 0 end
+      [_room_s] ->
+        0
+    end
   end
 
   # POST /_matrix/client/v3/keys/device_signing/upload
@@ -164,6 +200,7 @@ defmodule AxonWeb.KeyController do
         )
       end
 
+      record_device_list_update(user_id)
       json(conn, %{})
     end
   end
@@ -491,5 +528,22 @@ defmodule AxonWeb.KeyController do
         select: {k.algorithm, count(k.id)}
     )
     |> Enum.into(%{})
+  end
+
+  defp record_device_list_update(user_id) do
+    # stream_ordering is recorded for informational purposes; queries use id (bigserial).
+    ordering = EventStore.current_max_stream_ordering()
+    Repo.insert_all("device_list_updates", [%{user_id: user_id, stream_ordering: ordering}])
+  end
+
+  defp shared_room_user_ids(user_id) do
+    Repo.all(
+      from m2 in "room_memberships",
+        join: m1 in "room_memberships",
+        on: m1.room_id == m2.room_id and m1.user_id == ^user_id and m1.membership == "join",
+        where: m2.membership == "join" and m2.user_id != ^user_id,
+        select: m2.user_id,
+        distinct: true
+    )
   end
 end
