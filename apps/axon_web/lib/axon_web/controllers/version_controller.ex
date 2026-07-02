@@ -12,8 +12,20 @@ defmodule AxonWeb.VersionController do
     })
   end
 
-  def no_oidc(conn, _params) do
-    conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "OIDC not supported"})
+  # GET /_matrix/client/v1/auth_metadata (MSC2965)
+  def auth_metadata(conn, _params) do
+    case AxonWeb.Oidc.metadata() do
+      {:ok, doc} ->
+        doc =
+          if url = Application.get_env(:axon_web, :oidc, [])[:account_management_url],
+            do: Map.put(doc, "account_management_uri", url),
+            else: doc
+
+        json(conn, doc)
+
+      {:error, _reason} ->
+        conn |> put_status(404) |> json(%{"errcode" => "M_UNRECOGNIZED", "error" => "OAuth 2.0 delegated auth not supported"})
+    end
   end
 
   def media_config(conn, _params) do

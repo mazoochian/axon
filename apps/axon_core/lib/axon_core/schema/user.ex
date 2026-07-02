@@ -6,6 +6,7 @@ defmodule AxonCore.Schema.User do
   schema "users" do
     field :localpart, :string
     field :password_hash, :string
+    field :oidc_subject, :string
     field :deactivated, :boolean, default: false
     field :admin, :boolean, default: false
 
@@ -18,9 +19,10 @@ defmodule AxonCore.Schema.User do
 
   def changeset(user, attrs) do
     user
-    |> cast(attrs, [:user_id, :localpart, :password_hash, :deactivated, :admin])
+    |> cast(attrs, [:user_id, :localpart, :password_hash, :oidc_subject, :deactivated, :admin])
     |> validate_required([:user_id, :localpart])
     |> validate_format(:user_id, ~r/^@[^:]+:.+$/, message: "must be in @localpart:server format")
     |> unique_constraint(:localpart)
+    |> unique_constraint(:oidc_subject)
   end
 end
