@@ -25,7 +25,7 @@ defmodule AxonRoom.CreateRoom do
     server_name = opts[:server_name] || Application.fetch_env!(:axon_web, :server_name)
     version = opts[:version] || @default_version
     preset = opts[:preset] || "private_chat"
-    room_id = generate_room_id(server_name)
+    room_id = opts[:room_id] || generate_room_id(server_name)
 
     is_public = preset == "public_chat" or opts[:visibility] == "public"
 
@@ -157,13 +157,15 @@ defmodule AxonRoom.CreateRoom do
     [{"m.room.topic", "", content}]
   end
 
-  defp generate_room_id(server_name) do
+  @doc "Generates a fresh random room_id for `server_name`. Public so callers (e.g. room upgrades) can pre-generate one."
+  def generate_room_id(server_name) do
     random = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
     "!#{random}:#{server_name}"
   end
 
-  defp check_version_supported(v) when v in ~w(2 3 4 5 6 7 8 9 10 11), do: :ok
-  defp check_version_supported(_), do: {:error, :unsupported_room_version}
+  @doc "Whether `v` is a supported room version string."
+  def check_version_supported(v) when v in ~w(2 3 4 5 6 7 8 9 10 11), do: :ok
+  def check_version_supported(_), do: {:error, :unsupported_room_version}
 
   defp register_alias(room_alias, room_id, creator) do
     AxonCore.Repo.insert_all("room_aliases", [
