@@ -9,14 +9,16 @@ config :axon_core, AxonCore.Repo,
   pool_size: 10
 
 config :axon_web, AxonWeb.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: 8008],
+  server: true,
+  http: [ip: {0, 0, 0, 0}, port: 8008],
   check_origin: false,
   code_reloader: false,
   debug_errors: false,
   secret_key_base: "dev_secret_key_base_000000000000000000000000000000000000000000000000"
 
 config :axon_web, AxonWeb.FederationEndpoint,
-  http: [ip: {127, 0, 0, 1}, port: 8448],
+  server: true,
+  http: [ip: {0, 0, 0, 0}, port: 8448],
   check_origin: false,
   code_reloader: false,
   debug_errors: false,
