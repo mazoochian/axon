@@ -85,15 +85,26 @@ defmodule AxonWeb.KeyController do
 
   # POST /_matrix/client/v3/keys/query
   def query(conn, params) do
-    device_keys = params["device_keys"] || %{}
+    device_keys_req = params["device_keys"] || %{}
+    user_ids = Map.keys(device_keys_req)
+    current_user_id = conn.assigns.current_user_id
 
-    result =
-      Enum.into(device_keys, %{}, fn {queried_user_id, _device_ids} ->
-        keys = get_device_keys_for_user(queried_user_id)
-        {queried_user_id, keys}
+    device_keys_result =
+      Enum.into(device_keys_req, %{}, fn {queried_user_id, _device_ids} ->
+        {queried_user_id, get_device_keys_for_user(queried_user_id)}
       end)
 
-    json(conn, %{"device_keys" => result, "failures" => %{}})
+    master_keys = get_cross_signing_keys(user_ids, "master")
+    self_signing_keys = get_cross_signing_keys(user_ids, "self_signing")
+    user_signing_keys = get_cross_signing_keys([current_user_id], "user_signing")
+
+    json(conn, %{
+      "device_keys" => device_keys_result,
+      "master_keys" => master_keys,
+      "self_signing_keys" => self_signing_keys,
+      "user_signing_keys" => user_signing_keys,
+      "failures" => %{}
+    })
   end
 
   # POST /_matrix/client/v3/keys/claim
@@ -116,8 +127,221 @@ defmodule AxonWeb.KeyController do
 
   # GET /_matrix/client/v3/keys/changes
   def changes(conn, _params) do
-    # Phase 1 stub — full implementation in Phase 3 (E2EE)
     json(conn, %{"changed" => [], "left" => []})
+  end
+
+  # POST /_matrix/client/v3/keys/device_signing/upload
+  # Requires UIA. We accept m.login.dummy or m.login.password when authenticated.
+  def upload_cross_signing(conn, params) do
+    user_id = conn.assigns.current_user_id
+    auth = params["auth"]
+
+    master_key = params["master_key"]
+    self_signing_key = params["self_signing_key"]
+    user_signing_key = params["user_signing_key"]
+
+    if is_nil(auth) do
+      conn |> put_status(401) |> json(%{
+        "session" => gen_session(),
+        "flows" => [
+          %{"stages" => ["m.login.password"]},
+          %{"stages" => ["m.login.dummy"]}
+        ],
+        "params" => %{}
+      })
+    else
+      for {key_type, key_json} <- [
+            {"master", master_key},
+            {"self_signing", self_signing_key},
+            {"user_signing", user_signing_key}
+          ],
+          not is_nil(key_json) do
+        Repo.insert_all(
+          "cross_signing_keys",
+          [%{user_id: user_id, key_type: key_type, key_json: key_json}],
+          on_conflict: {:replace, [:key_json]},
+          conflict_target: [:user_id, :key_type]
+        )
+      end
+
+      json(conn, %{})
+    end
+  end
+
+  # POST /_matrix/client/v3/keys/signatures/upload
+  def upload_signatures(conn, params) do
+    signing_user_id = conn.assigns.current_user_id
+
+    Enum.each(params, fn {target_user_id, key_map} ->
+      Enum.each(key_map, fn {target_key_id, signed_obj} ->
+        sigs = signed_obj["signatures"] || %{}
+        Enum.each(sigs, fn {_signer_user_id, key_sigs} ->
+          Enum.each(key_sigs, fn {signing_key_id, sig_value} ->
+            Repo.insert_all(
+              "cross_signing_signatures",
+              [%{
+                target_user_id: target_user_id,
+                target_key_id: target_key_id,
+                signing_user_id: signing_user_id,
+                signing_key_id: signing_key_id,
+                signature: sig_value
+              }],
+              on_conflict: {:replace, [:signature]},
+              conflict_target: [:target_user_id, :target_key_id, :signing_user_id, :signing_key_id]
+            )
+          end)
+        end)
+      end)
+    end)
+
+    json(conn, %{"failures" => %{}})
+  end
+
+  # ---------------------------------------------------------------------------
+  # Key backup
+  # ---------------------------------------------------------------------------
+
+  def create_backup_version(conn, params) do
+    algorithm = params["algorithm"]
+    auth_data = params["auth_data"]
+
+    if is_nil(algorithm) || is_nil(auth_data) do
+      conn |> put_status(400) |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "algorithm and auth_data required"})
+    else
+      version = Integer.to_string(System.os_time(:millisecond))
+      Repo.insert_all("room_key_backup_versions", [%{
+        version: version,
+        algorithm: algorithm,
+        auth_data: auth_data,
+        etag: "0",
+        count: 0,
+        inserted_at: DateTime.utc_now(:microsecond),
+        updated_at: DateTime.utc_now(:microsecond)
+      }])
+      json(conn, %{"version" => version})
+    end
+  end
+
+  def get_backup_version(conn, params) do
+    version = params["version"]
+
+    query =
+      if version do
+        from v in "room_key_backup_versions",
+          where: v.version == ^version and not v.deleted,
+          select: %{version: v.version, algorithm: v.algorithm, auth_data: v.auth_data, etag: v.etag, count: v.count}
+      else
+        from v in "room_key_backup_versions",
+          where: not v.deleted,
+          order_by: [desc: v.inserted_at],
+          limit: 1,
+          select: %{version: v.version, algorithm: v.algorithm, auth_data: v.auth_data, etag: v.etag, count: v.count}
+      end
+
+    case Repo.one(query) do
+      nil ->
+        conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "No backup version found"})
+      row ->
+        json(conn, %{
+          "version" => row.version,
+          "algorithm" => row.algorithm,
+          "auth_data" => row.auth_data,
+          "etag" => row.etag,
+          "count" => row.count
+        })
+    end
+  end
+
+  def delete_backup_version(conn, %{"version" => version}) do
+    {n, _} = Repo.update_all(
+      from(v in "room_key_backup_versions", where: v.version == ^version),
+      set: [deleted: true]
+    )
+    if n > 0, do: json(conn, %{}),
+    else: conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Version not found"})
+  end
+
+  def put_backup_keys(conn, params) do
+    version = params["version"]
+    rooms = get_in(params, ["rooms"]) || %{}
+
+    entries =
+      Enum.flat_map(rooms, fn {room_id, room_data} ->
+        sessions = room_data["sessions"] || %{}
+        Enum.map(sessions, fn {session_id, session_data} ->
+          %{
+            version: version,
+            room_id: room_id,
+            session_id: session_id,
+            first_message_index: session_data["first_message_index"],
+            forwarded_count: session_data["forwarded_count"] || 0,
+            is_verified: session_data["is_verified"] || false,
+            session_data: session_data["session_data"] || %{}
+          }
+        end)
+      end)
+
+    if entries != [] do
+      Repo.insert_all("room_key_backups", entries,
+        on_conflict: {:replace, [:first_message_index, :forwarded_count, :is_verified, :session_data]},
+        conflict_target: [:version, :room_id, :session_id])
+
+      count = Repo.one(from b in "room_key_backups", where: b.version == ^version, select: count(b.session_id))
+      Repo.update_all(from(v in "room_key_backup_versions", where: v.version == ^version),
+        set: [count: count || 0, etag: Integer.to_string(System.os_time(:millisecond))])
+    end
+
+    json(conn, %{"etag" => Integer.to_string(System.os_time(:millisecond)), "count" => length(entries)})
+  end
+
+  def get_backup_keys(conn, params) do
+    version = params["version"]
+    room_id = params["room_id"]
+    session_id = params["session_id"]
+
+    rows =
+      Repo.all(
+        from b in "room_key_backups",
+          where:
+            b.version == ^version and
+              (is_nil(^room_id) or b.room_id == ^room_id) and
+              (is_nil(^session_id) or b.session_id == ^session_id),
+          select: %{
+            room_id: b.room_id,
+            session_id: b.session_id,
+            first_message_index: b.first_message_index,
+            forwarded_count: b.forwarded_count,
+            is_verified: b.is_verified,
+            session_data: b.session_data
+          }
+      )
+
+    response =
+      cond do
+        session_id ->
+          case rows do
+            [] -> conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Key not found"})
+            [row] -> json(conn, format_backup_row(row))
+            _ -> json(conn, format_backup_row(hd(rows)))
+          end
+
+        room_id ->
+          sessions =
+            Enum.into(rows, %{}, fn row -> {row.session_id, format_backup_row(row)} end)
+          json(conn, %{"sessions" => sessions})
+
+        true ->
+          rooms =
+            rows
+            |> Enum.group_by(& &1.room_id)
+            |> Enum.into(%{}, fn {rid, rs} ->
+              sessions = Enum.into(rs, %{}, fn r -> {r.session_id, format_backup_row(r)} end)
+              {rid, %{"sessions" => sessions}}
+            end)
+          json(conn, %{"rooms" => rooms})
+      end
+
+    response
   end
 
   # PUT /_matrix/client/v3/sendToDevice/:event_type/:txn_id
@@ -231,6 +455,26 @@ defmodule AxonWeb.KeyController do
       {:ok, key} -> key
       _ -> nil
     end
+  end
+
+  defp gen_session, do: :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
+
+  defp get_cross_signing_keys(user_ids, key_type) do
+    Repo.all(
+      from k in "cross_signing_keys",
+        where: k.user_id in ^user_ids and k.key_type == ^key_type,
+        select: %{user_id: k.user_id, key_json: k.key_json}
+    )
+    |> Enum.into(%{}, fn row -> {row.user_id, row.key_json} end)
+  end
+
+  defp format_backup_row(row) do
+    %{
+      "first_message_index" => row.first_message_index,
+      "forwarded_count" => row.forwarded_count,
+      "is_verified" => row.is_verified,
+      "session_data" => row.session_data
+    }
   end
 
   defp count_otks(user_id, device_id) do

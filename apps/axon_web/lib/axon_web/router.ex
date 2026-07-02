@@ -246,12 +246,32 @@ defmodule AxonWeb.Router do
     post "/v3/rooms/:room_id/receipt/:receipt_type/:event_id", ReceiptController, :receipt
     post "/v3/rooms/:room_id/read_markers", ReceiptController, :read_markers
 
+    # Typing
+    put "/v3/rooms/:room_id/typing/:user_id", RoomController, :typing
+    put "/r0/rooms/:room_id/typing/:user_id", RoomController, :typing
+
     # E2EE
     post "/v3/keys/upload", KeyController, :upload
     post "/v3/keys/query", KeyController, :query
     post "/v3/keys/claim", KeyController, :claim
     get "/v3/keys/changes", KeyController, :changes
     put "/v3/sendToDevice/:event_type/:txn_id", KeyController, :send_to_device
+    post "/v3/keys/device_signing/upload", KeyController, :upload_cross_signing
+    post "/v3/keys/signatures/upload", KeyController, :upload_signatures
+    post "/r0/keys/device_signing/upload", KeyController, :upload_cross_signing
+    post "/r0/keys/signatures/upload", KeyController, :upload_signatures
+
+    # Key backup
+    post "/v3/room_keys/version", KeyController, :create_backup_version
+    get "/v3/room_keys/version", KeyController, :get_backup_version
+    get "/v3/room_keys/version/:version", KeyController, :get_backup_version
+    delete "/v3/room_keys/version/:version", KeyController, :delete_backup_version
+    put "/v3/room_keys/keys/:room_id/:session_id", KeyController, :put_backup_keys
+    get "/v3/room_keys/keys/:room_id/:session_id", KeyController, :get_backup_keys
+    put "/v3/room_keys/keys/:room_id", KeyController, :put_backup_keys
+    get "/v3/room_keys/keys/:room_id", KeyController, :get_backup_keys
+    put "/v3/room_keys/keys", KeyController, :put_backup_keys
+    get "/v3/room_keys/keys", KeyController, :get_backup_keys
 
     # User directory
     post "/v3/user_directory/search", UserDirectoryController, :search
