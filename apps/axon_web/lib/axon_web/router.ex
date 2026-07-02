@@ -138,6 +138,41 @@ defmodule AxonWeb.Router do
   end
 
   # -------------------------------------------------------------------------
+  # Federation API — inbound from remote servers (X-Matrix auth)
+  # -------------------------------------------------------------------------
+  pipeline :federation do
+    plug :accepts, ["json"]
+    plug :fetch_query_params
+    plug AxonWeb.Plug.FederationAuth
+  end
+
+  scope "/_matrix/federation", AxonWeb do
+    pipe_through :federation
+
+    put "/v1/send/:txn_id", FederationController, :send_transaction
+    get "/v1/make_join/:room_id/:user_id", FederationController, :make_join
+    put "/v2/send_join/:room_id/:event_id", FederationController, :send_join
+    put "/v1/send_join/:room_id/:event_id", FederationController, :send_join
+    get "/v1/make_leave/:room_id/:user_id", FederationController, :make_leave
+    put "/v2/send_leave/:room_id/:event_id", FederationController, :send_leave
+    put "/v1/send_leave/:room_id/:event_id", FederationController, :send_leave
+    get "/v1/event/:event_id", FederationController, :get_event
+    get "/v1/state/:room_id", FederationController, :get_state
+    get "/v1/state_ids/:room_id", FederationController, :get_state_ids
+    get "/v1/backfill/:room_id", FederationController, :backfill
+    post "/v1/get_missing_events/:room_id", FederationController, :get_missing_events
+    get "/v1/query/directory", FederationController, :query_directory
+    get "/v1/query/profile", FederationController, :query_profile
+  end
+
+  scope "/_matrix/key", AxonWeb do
+    pipe_through :federation
+
+    post "/v2/query", FederationController, :query_keys
+    get "/v2/query/:server_name/:key_id", FederationController, :query_keys
+  end
+
+  # -------------------------------------------------------------------------
   # Authenticated CS API
   # -------------------------------------------------------------------------
   scope "/_matrix/client", AxonWeb do

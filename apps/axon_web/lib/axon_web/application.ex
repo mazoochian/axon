@@ -11,6 +11,10 @@ defmodule AxonWeb.Application do
        server_name: Application.fetch_env!(:axon_web, :server_name)},
       # HTTP client for outbound federation requests
       {Finch, name: Axon.Finch},
+      # Task supervisor for async federation work
+      {Task.Supervisor, name: Axon.TaskSupervisor},
+      # Federation outbound fan-out (subscribes to PubSub, sends PDUs to remote servers)
+      AxonWeb.FederationFanout,
       # Cluster auto-discovery
       {Cluster.Supervisor, [topologies, [name: Axon.ClusterSupervisor]]},
       # CS API endpoint (port 8008)

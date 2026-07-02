@@ -49,26 +49,40 @@ defmodule AxonWeb.RoomController do
   # POST /_matrix/client/v3/rooms/:room_id/join
   def join(conn, %{"room_id" => room_id_or_alias} = params) do
     user_id = conn.assigns.current_user_id
+    local_server = Application.get_env(:axon_web, :server_name, "localhost")
+    server_params = params["server_name"] || []
 
-    room_id =
-      if String.starts_with?(room_id_or_alias, "#") do
-        Repo.one(from a in "room_aliases", where: a.alias == ^room_id_or_alias, select: a.room_id)
-      else
-        room_id_or_alias
-      end
+    # Resolve alias to room_id (local lookup first, then federation)
+    {room_id, hint_servers} = resolve_room(room_id_or_alias, local_server, server_params)
 
     if is_nil(room_id) do
-      conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room alias not found"})
+      conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
     else
-      extra_content = Map.drop(params, ["room_id"])
-      content = Map.merge(extra_content, %{"membership" => "join"})
+      room_server = room_id |> String.split(":") |> List.last()
+      is_local_room = room_server == local_server or EventStore.room_exists?(room_id)
 
-      with {:ok, _} <- EventStore.get_room(room_id),
-           {:ok, _event_id} <-
-             RoomProcess.send_event(room_id, user_id, "m.room.member", content,
-               state_key: user_id
-             ) do
-        json(conn, %{"room_id" => room_id})
+      if is_local_room do
+        # Local room join
+        content = %{"membership" => "join"}
+
+        with {:ok, _} <- EventStore.get_room(room_id),
+             {:ok, _event_id} <-
+               RoomProcess.send_event(room_id, user_id, "m.room.member", content,
+                 state_key: user_id
+               ) do
+          json(conn, %{"room_id" => room_id})
+        end
+      else
+        # Remote room — use federation join flow
+        via_servers = if hint_servers != [], do: hint_servers, else: [room_server]
+
+        case AxonFederation.RoomJoin.join_via_federation(room_id, user_id, via_servers) do
+          {:ok, _} ->
+            json(conn, %{"room_id" => room_id})
+
+          {:error, reason} ->
+            conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Could not join room: #{inspect(reason)}"})
+        end
       end
     end
   end
@@ -221,5 +235,45 @@ defmodule AxonWeb.RoomController do
 
       json(conn, %{"joined" => joined})
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  # Returns {room_id, hint_servers} or {nil, []}
+  defp resolve_room(room_id_or_alias, local_server, server_params) do
+    cond do
+      String.starts_with?(room_id_or_alias, "#") ->
+        # Alias — try local first
+        local_id = Repo.one(from a in "room_aliases", where: a.alias == ^room_id_or_alias, select: a.room_id)
+
+        if local_id do
+          {local_id, []}
+        else
+          # Try federation alias lookup
+          alias_server = room_id_or_alias |> String.split(":") |> List.last()
+          via = if server_params != [], do: server_params, else: [alias_server]
+          resolve_remote_alias(room_id_or_alias, via, local_server)
+        end
+
+      String.starts_with?(room_id_or_alias, "!") ->
+        {room_id_or_alias, List.wrap(server_params)}
+
+      true ->
+        {nil, []}
+    end
+  end
+
+  defp resolve_remote_alias(room_alias, via_servers, _local_server) do
+    Enum.find_value(via_servers, {nil, []}, fn server ->
+      case AxonFederation.HttpClient.get(server, "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode(room_alias)}") do
+        {:ok, %{"room_id" => room_id, "servers" => servers}} ->
+          {room_id, servers}
+
+        _ ->
+          false
+      end
+    end)
   end
 end
