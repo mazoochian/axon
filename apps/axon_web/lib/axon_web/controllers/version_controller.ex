@@ -12,6 +12,26 @@ defmodule AxonWeb.VersionController do
     })
   end
 
+  def no_oidc(conn, _params) do
+    conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "OIDC not supported"})
+  end
+
+  def media_config(conn, _params) do
+    json(conn, %{"m.upload.size" => 104_857_600})
+  end
+
+  def empty_list_pushers(conn, _params) do
+    json(conn, %{"pushers" => []})
+  end
+
+  def empty_list_3pid(conn, _params) do
+    json(conn, %{"threepids" => []})
+  end
+
+  def empty_ok(conn, _params) do
+    json(conn, %{})
+  end
+
   def capabilities(conn, _params) do
     json(conn, %{
       "capabilities" => %{

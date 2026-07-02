@@ -29,6 +29,13 @@ defmodule AxonWeb.Router do
     post "/v3/register", AuthController, :register
     get "/v3/register/available", AuthController, :register_available
 
+    # OIDC metadata — return 404 M_NOT_FOUND (no OIDC support)
+    get "/v1/auth_metadata", VersionController, :no_oidc
+
+    # Media config (no auth required)
+    get "/v3/media/config", VersionController, :media_config
+    get "/r0/media/config", VersionController, :media_config
+
     # Public profile (no auth needed per spec)
     get "/v3/profile/:user_id", ProfileController, :show
     get "/v3/profile/:user_id/displayname", ProfileController, :get_displayname
@@ -137,6 +144,12 @@ defmodule AxonWeb.Router do
     get "/v2/server/:key_id", KeyController, :server_keys
   end
 
+  scope "/_matrix/media", AxonWeb do
+    pipe_through :api
+    get "/v3/config", VersionController, :media_config
+    get "/r0/config", VersionController, :media_config
+  end
+
   # -------------------------------------------------------------------------
   # Federation API — inbound from remote servers (X-Matrix auth)
   # -------------------------------------------------------------------------
@@ -241,6 +254,18 @@ defmodule AxonWeb.Router do
     get "/v3/devices/:device_id", DeviceController, :show
     put "/v3/devices/:device_id", DeviceController, :update
     delete "/v3/devices/:device_id", DeviceController, :delete
+    post "/v3/delete_devices", DeviceController, :delete_devices
+    post "/r0/delete_devices", DeviceController, :delete_devices
+
+    # Pushers (stub — no push gateway configured)
+    get "/v3/pushers", VersionController, :empty_list_pushers
+    post "/v3/pushers/set", VersionController, :empty_ok
+    get "/r0/pushers", VersionController, :empty_list_pushers
+
+    # Third-party identifiers (stub)
+    get "/v3/account/3pid", VersionController, :empty_list_3pid
+    post "/v3/account/3pid", VersionController, :empty_ok
+    get "/r0/account/3pid", VersionController, :empty_list_3pid
 
     # Receipts & read markers
     post "/v3/rooms/:room_id/receipt/:receipt_type/:event_id", ReceiptController, :receipt
