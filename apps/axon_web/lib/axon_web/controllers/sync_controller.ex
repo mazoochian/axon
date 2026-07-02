@@ -10,12 +10,15 @@ defmodule AxonWeb.SyncController do
   # GET /_matrix/client/v3/sync
   def sync(conn, params) do
     user_id = conn.assigns.current_user_id
+    device_id = conn.assigns.current_device_id
     since = params["since"]
     timeout = min(String.to_integer(params["timeout"] || "0"), 30_000)
 
     # nil means initial sync; a string (even "0") means incremental
     is_initial_sync = is_nil(since)
-    since_ordering = parse_sync_token(since)
+    # next_batch token format: "${room_ordering}_${dl_cursor}"
+    # dl_cursor tracks the max device_list_updates.id seen so far (separate stream)
+    {since_ordering, dl_since} = parse_sync_token(since)
 
     filter = load_filter(user_id, params["filter"])
 
@@ -38,17 +41,36 @@ defmodule AxonWeb.SyncController do
         next_ordering
       end
 
-    next_batch = Integer.to_string(next_ordering)
+    # Advance the device_list cursor to the current max dl id
+    dl_next = current_dl_max_id()
+    next_batch = "#{next_ordering}_#{dl_next}"
 
     rooms_response = build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter)
     global_account_data = get_global_account_data(user_id)
 
-    json(conn, %{
+    # E2EE sync additions
+    {to_device_events, _max_tdm_id} = drain_to_device_messages(user_id, device_id)
+    otk_counts = get_otk_counts(user_id, device_id)
+    unused_fallback_types = get_unused_fallback_key_types(user_id, device_id)
+    device_lists =
+      if is_initial_sync do
+        %{"changed" => [], "left" => []}
+      else
+        get_device_list_changes(user_id, dl_since)
+      end
+
+    resp = %{
       "next_batch" => next_batch,
       "rooms" => rooms_response,
       "presence" => %{"events" => []},
-      "account_data" => %{"events" => global_account_data}
-    })
+      "account_data" => %{"events" => global_account_data},
+      "to_device" => %{"events" => to_device_events},
+      "device_one_time_keys_count" => otk_counts,
+      "device_unused_fallback_key_types" => unused_fallback_types,
+      "device_lists" => device_lists
+    }
+
+    json(conn, resp)
   end
 
   # ---------------------------------------------------------------------------
@@ -311,11 +333,18 @@ defmodule AxonWeb.SyncController do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp parse_sync_token(nil), do: 0
+  # Returns {room_ordering, dl_cursor}.
+  # Token format: "${room_ordering}_${dl_cursor}" — backward-compatible with plain integers.
+  defp parse_sync_token(nil), do: {0, 0}
   defp parse_sync_token(since) do
-    case Integer.parse(since) do
-      {n, _} -> n
-      :error -> 0
+    case String.split(since, "_", parts: 2) do
+      [room_s, dl_s] ->
+        room_n = case Integer.parse(room_s) do {n, _} -> n; _ -> 0 end
+        dl_n = case Integer.parse(dl_s) do {n, _} -> n; _ -> 0 end
+        {room_n, dl_n}
+      [room_s] ->
+        room_n = case Integer.parse(room_s) do {n, _} -> n; _ -> 0 end
+        {room_n, 0}
     end
   end
 
@@ -429,7 +458,6 @@ defmodule AxonWeb.SyncController do
     if MapSet.size(ignored_users) == 0 do
       false
     else
-      # Find the sender of the invite event
       sender = Repo.one(
         from e in "events",
           where:
@@ -442,6 +470,90 @@ defmodule AxonWeb.SyncController do
       )
       sender != nil and MapSet.member?(ignored_users, sender)
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # E2EE sync helpers
+  # ---------------------------------------------------------------------------
+
+  # Atomically fetch and delete pending to-device messages for this device.
+  # Returns {events_list, max_id_delivered}.
+  defp drain_to_device_messages(user_id, device_id) do
+    rows =
+      Repo.all(
+        from m in "to_device_messages",
+          where: m.target_user_id == ^user_id and m.target_device_id == ^device_id,
+          order_by: [asc: m.id],
+          limit: 100,
+          select: %{id: m.id, sender: m.sender, type: m.type, content: m.content}
+      )
+
+    if rows != [] do
+      ids = Enum.map(rows, & &1.id)
+      Repo.delete_all(from m in "to_device_messages", where: m.id in ^ids)
+    end
+
+    events =
+      Enum.map(rows, fn row ->
+        %{"type" => row.type, "sender" => row.sender, "content" => row.content}
+      end)
+
+    max_id = if rows == [], do: 0, else: List.last(rows).id
+    {events, max_id}
+  end
+
+  defp get_otk_counts(user_id, device_id) do
+    Repo.all(
+      from k in "one_time_keys",
+        where: k.user_id == ^user_id and k.device_id == ^device_id and k.claimed == false,
+        group_by: k.algorithm,
+        select: {k.algorithm, count(k.id)}
+    )
+    |> Enum.into(%{})
+  end
+
+  # Returns list of algorithm names for which an unused fallback key exists.
+  # Clients use this to know which algorithms still have fallback coverage.
+  defp get_unused_fallback_key_types(user_id, device_id) do
+    Repo.all(
+      from fk in "fallback_keys",
+        where: fk.user_id == ^user_id and fk.device_id == ^device_id and fk.used == false,
+        select: fk.algorithm
+    )
+  end
+
+  # Returns %{"changed" => [...], "left" => [...]}.
+  # `changed`: users sharing a room with `user_id` whose keys changed since `since_ordering`.
+  # `left`: users who were in a shared room before but have since left (simplified to [] for now).
+  # dl_since is the dl_cursor from the previous sync token (max device_list_updates.id seen).
+  defp get_device_list_changes(user_id, dl_since) do
+    shared_users =
+      Repo.all(
+        from m2 in "room_memberships",
+          join: m1 in "room_memberships",
+          on: m1.room_id == m2.room_id and m1.user_id == ^user_id and m1.membership == "join",
+          where: m2.membership == "join" and m2.user_id != ^user_id,
+          select: m2.user_id,
+          distinct: true
+      )
+
+    changed =
+      if shared_users == [] do
+        []
+      else
+        Repo.all(
+          from u in "device_list_updates",
+            where: u.user_id in ^shared_users and u.id > ^dl_since,
+            select: u.user_id,
+            distinct: true
+        )
+      end
+
+    %{"changed" => changed, "left" => []}
+  end
+
+  defp current_dl_max_id do
+    Repo.one(from u in "device_list_updates", select: max(u.id)) || 0
   end
 
   defp get_max_ordering(events_by_room, fallback) do

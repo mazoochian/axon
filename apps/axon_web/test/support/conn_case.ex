@@ -30,6 +30,8 @@ defmodule AxonWeb.ConnCase do
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(AxonCore.Repo)
+    # Shared mode lets GenServer processes (RoomProcess, etc.) use the same connection.
+    Ecto.Adapters.SQL.Sandbox.mode(AxonCore.Repo, {:shared, self()})
     on_exit(fn -> Ecto.Adapters.SQL.Sandbox.checkin(AxonCore.Repo) end)
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end
