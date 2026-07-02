@@ -41,12 +41,13 @@ defmodule AxonWeb.SyncController do
     next_batch = Integer.to_string(next_ordering)
 
     rooms_response = build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter)
+    global_account_data = get_global_account_data(user_id)
 
     json(conn, %{
       "next_batch" => next_batch,
       "rooms" => rooms_response,
       "presence" => %{"events" => []},
-      "account_data" => %{"events" => []}
+      "account_data" => %{"events" => global_account_data}
     })
   end
 
@@ -114,8 +115,13 @@ defmodule AxonWeb.SyncController do
         end
       end)
 
+    # Get ignored users for this sync user
+    ignored_users = get_ignored_users(user_id)
+
     invite_response =
-      Enum.into(invited_rooms, %{}, fn room_id ->
+      invited_rooms
+      |> Enum.reject(fn room_id -> invite_from_ignored?(room_id, user_id, ignored_users) end)
+      |> Enum.into(%{}, fn room_id ->
         invite_state = build_invite_state(room_id, user_id)
         {room_id, %{"invite_state" => %{"events" => invite_state}}}
       end)
@@ -167,9 +173,12 @@ defmodule AxonWeb.SyncController do
     ephemeral = build_ephemeral(room_id)
     room_account_data = build_room_account_data(room_id, user_id)
 
+    # Add unsigned.membership to timeline events (MSC4115)
+    timeline_with_membership = add_membership_to_timeline(filtered_timeline, room_id, user_id)
+
     %{
       "timeline" => %{
-        "events" => filtered_timeline,
+        "events" => timeline_with_membership,
         "limited" => limited,
         "prev_batch" => prev_batch
       },
@@ -340,6 +349,98 @@ defmodule AxonWeb.SyncController do
         end)
 
       [%{"type" => "m.receipt", "content" => content}]
+    end
+  end
+
+  defp add_membership_to_timeline([], _room_id, _user_id), do: []
+
+  defp add_membership_to_timeline(events, room_id, user_id) do
+    # Batch fetch stream_ordering for all events in the timeline
+    event_ids = Enum.map(events, & &1["event_id"]) |> Enum.reject(&is_nil/1)
+
+    ordering_map =
+      if event_ids == [] do
+        %{}
+      else
+        Repo.all(
+          from e in "events",
+            where: e.event_id in ^event_ids,
+            select: {e.event_id, e.stream_ordering}
+        )
+        |> Map.new()
+      end
+
+    # Get all membership changes for this user in this room, ordered by stream_ordering
+    membership_changes =
+      Repo.all(
+        from e in "events",
+          where:
+            e.room_id == ^room_id and
+            e.type == "m.room.member" and
+            e.state_key == ^user_id,
+          order_by: [asc: e.stream_ordering],
+          select: %{
+            stream_ordering: e.stream_ordering,
+            membership: fragment("?->>'membership'", e.content)
+          }
+      )
+
+    Enum.map(events, fn event ->
+      ordering = ordering_map[event["event_id"]]
+      membership = membership_at_ordering(ordering, membership_changes)
+      unsigned = Map.merge(event["unsigned"] || %{}, %{"membership" => membership})
+      Map.put(event, "unsigned", unsigned)
+    end)
+  end
+
+  defp membership_at_ordering(nil, _changes), do: "leave"
+  defp membership_at_ordering(ordering, changes) do
+    applicable = Enum.filter(changes, &(&1.stream_ordering <= ordering))
+    case List.last(applicable) do
+      nil -> "leave"
+      %{membership: m} when m in ["join", "invite", "ban"] -> m
+      _ -> "leave"
+    end
+  end
+
+  defp get_global_account_data(user_id) do
+    Repo.all(
+      from a in "account_data",
+        where: a.user_id == ^user_id,
+        select: %{type: a.type, content: a.content}
+    )
+    |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
+  end
+
+  defp get_ignored_users(user_id) do
+    case Repo.one(
+      from a in "account_data",
+        where: a.user_id == ^user_id and a.type == "m.ignored_user_list",
+        select: a.content
+    ) do
+      nil -> MapSet.new()
+      content ->
+        ignored = get_in(content, ["ignored_users"]) || %{}
+        MapSet.new(Map.keys(ignored))
+    end
+  end
+
+  defp invite_from_ignored?(room_id, _user_id, ignored_users) do
+    if MapSet.size(ignored_users) == 0 do
+      false
+    else
+      # Find the sender of the invite event
+      sender = Repo.one(
+        from e in "events",
+          where:
+            e.room_id == ^room_id and
+            e.type == "m.room.member" and
+            fragment("?->>'membership'", e.content) == "invite",
+          order_by: [desc: e.stream_ordering],
+          limit: 1,
+          select: e.sender
+      )
+      sender != nil and MapSet.member?(ignored_users, sender)
     end
   end
 

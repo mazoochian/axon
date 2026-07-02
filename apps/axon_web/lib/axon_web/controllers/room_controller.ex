@@ -28,7 +28,8 @@ defmodule AxonWeb.RoomController do
         room_alias_name: params["room_alias_name"],
         version: params["room_version"],
         creation_content: params["creation_content"],
-        initial_state: params["initial_state"] || []
+        initial_state: params["initial_state"] || [],
+        visibility: params["visibility"]
       ]
 
       with {:ok, room_id} <- CreateRoom.execute(user_id, opts) do

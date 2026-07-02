@@ -97,6 +97,7 @@ defmodule AxonWeb.Router do
     get "/r0/sync", SyncController, :sync
     put "/r0/directory/room/:room_alias", DirectoryController, :put_alias
     delete "/r0/directory/room/:room_alias", DirectoryController, :delete_alias
+    put "/r0/directory/list/room/:room_id", DirectoryController, :set_room_visibility
     post "/r0/user/:user_id/filter", FilterController, :create
     get "/r0/user/:user_id/filter/:filter_id", FilterController, :get
     get "/r0/user/:user_id/account_data/:type", AccountDataController, :get
@@ -188,6 +189,7 @@ defmodule AxonWeb.Router do
     # Directory (mutations require auth)
     put "/v3/directory/room/:room_alias", DirectoryController, :put_alias
     delete "/v3/directory/room/:room_alias", DirectoryController, :delete_alias
+    put "/v3/directory/list/room/:room_id", DirectoryController, :set_room_visibility
 
     # Filters
     post "/v3/user/:user_id/filter", FilterController, :create
