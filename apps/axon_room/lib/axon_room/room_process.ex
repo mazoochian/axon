@@ -69,6 +69,20 @@ defmodule AxonRoom.RoomProcess do
     end
   end
 
+  @doc """
+  Applies an inbound federation PDU for a room this server already
+  participates in. Runs auth check against the room's live in-memory state
+  (serialized through this GenServer, same as local sends), persists,
+  updates in-memory state, and fans the event out to local `/sync` clients.
+
+  Returns `{:ok, event_id}` or `{:error, reason}`.
+  """
+  def apply_remote_event(room_id, pdu) do
+    with {:ok, pid} <- get_or_start(room_id) do
+      GenServer.call(pid, {:apply_remote_event, pdu}, 30_000)
+    end
+  end
+
   @doc "Gets the current full state of the room (list of event maps)."
   def get_state(room_id) do
     with {:ok, pid} <- get_or_start(room_id) do
@@ -135,7 +149,9 @@ defmodule AxonRoom.RoomProcess do
       depth: state.depth
     }
 
-    event = EventBuilder.build(sender, type, content, room_ctx, opts)
+    event =
+      EventBuilder.build(sender, type, content, room_ctx, opts)
+      |> with_prev_content(Keyword.get(opts, :state_key), state.current_state)
 
     case AuthRules.check(event, state.current_state, state.room_version) do
       {:error, reason} ->
@@ -153,6 +169,33 @@ defmodule AxonRoom.RoomProcess do
             # AppService fanout via PubSub (avoids circular dep on axon_web)
             Phoenix.PubSub.broadcast(@pubsub, "all_events", {:new_event, state.room_id, event_map})
             {:reply, {:ok, event["event_id"]}, new_state}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+    end
+  end
+
+  @impl true
+  def handle_call({:apply_remote_event, pdu}, _from, state) do
+    pdu = with_prev_content(pdu, pdu["state_key"], state.current_state)
+
+    case AuthRules.check(pdu, state.current_state, state.room_version) do
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+
+      :ok ->
+        case EventStore.insert_event(pdu, state.room_version) do
+          {:ok, persisted} ->
+            event_map = EventStore.event_to_map(persisted)
+            new_state = apply_and_advance(state, event_map, persisted.stream_ordering)
+            # Fan out to local /sync clients. Not re-broadcast to federation:
+            # the origin server is responsible for pushing this PDU to every
+            # other server in the room directly (no relay-through-us).
+            broadcast(state.room_id, event_map)
+            AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
+            Phoenix.PubSub.broadcast(@pubsub, "all_events", {:new_event, state.room_id, event_map})
+            {:reply, {:ok, event_map["event_id"]}, new_state}
 
           {:error, reason} ->
             {:reply, {:error, reason}, state}
@@ -254,6 +297,23 @@ defmodule AxonRoom.RoomProcess do
       %{new_state | snapshot_counter: 0}
     else
       new_state
+    end
+  end
+
+  # Spec: unsigned.prev_content carries the content of the state event being
+  # replaced (MSC3442). Without it, clients can't distinguish a genuine join
+  # from a profile-only update (same membership, new displayname/avatar_url)
+  # and fall back to rendering "<name> joined the room" on every change.
+  defp with_prev_content(event, nil, _current_state), do: event
+
+  defp with_prev_content(event, state_key, current_state) do
+    case Map.get(current_state, {event["type"], state_key}) do
+      %{"content" => prev_content} ->
+        unsigned = Map.put(event["unsigned"] || %{}, "prev_content", prev_content)
+        Map.put(event, "unsigned", unsigned)
+
+      _ ->
+        event
     end
   end
 

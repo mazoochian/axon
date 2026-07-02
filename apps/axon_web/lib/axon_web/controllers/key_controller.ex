@@ -196,6 +196,9 @@ defmodule AxonWeb.KeyController do
 
     if is_nil(auth) do
       conn |> put_status(401) |> json(%{
+        "errcode" => "M_UNAUTHORIZED",
+        "error" => "Additional authentication required",
+        "completed" => [],
         "session" => gen_session(),
         "flows" => [
           %{"stages" => ["m.login.password"]},
@@ -204,6 +207,18 @@ defmodule AxonWeb.KeyController do
         "params" => %{}
       })
     else
+      # On key replacement (reset), purge stale signatures for this user so
+      # clients don't see old-key sigs merged into the new key response.
+      existing_key_count =
+        Repo.one(from k in "cross_signing_keys", where: k.user_id == ^user_id, select: count(k.user_id)) || 0
+
+      if existing_key_count > 0 do
+        Repo.delete_all(
+          from s in "cross_signing_signatures",
+            where: s.target_user_id == ^user_id or s.signing_user_id == ^user_id
+        )
+      end
+
       for {key_type, key_json} <- [
             {"master", master_key},
             {"self_signing", self_signing_key},
