@@ -27,7 +27,7 @@ defmodule AxonRoom.CreateRoom do
     preset = opts[:preset] || "private_chat"
     room_id = generate_room_id(server_name)
 
-    is_public = preset == "public_chat"
+    is_public = preset == "public_chat" or opts[:visibility] == "public"
 
     with :ok <- check_version_supported(version),
          {:ok, _} <- EventStore.insert_room(room_id, creator, version, is_public),
@@ -37,6 +37,7 @@ defmodule AxonRoom.CreateRoom do
       if alias_localpart = opts[:room_alias_name] do
         room_alias = "##{alias_localpart}:#{server_name}"
         register_alias(room_alias, room_id, creator)
+        RoomProcess.send_event(room_id, creator, "m.room.canonical_alias", %{"alias" => room_alias}, state_key: "")
       end
 
       # Invite initial members

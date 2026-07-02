@@ -6,40 +6,32 @@ defmodule AxonWeb.DirectoryController do
   import Ecto.Query
   alias AxonCore.Repo
 
-  # GET /_matrix/client/v3/publicRooms
+  # GET/POST /_matrix/client/v3/publicRooms
   def public_rooms(conn, params) do
     limit = String.to_integer(params["limit"] || "20")
     since = params["since"]
     search = get_in(params, ["filter", "generic_search_term"])
 
+    # Base query for public rooms
     q =
       from r in "rooms",
         where: r.is_public == true,
         limit: ^limit,
         order_by: [asc: r.room_id],
-        select: %{room_id: r.room_id}
+        select: r.room_id
 
-    q =
-      if search do
-        from r in q, where: ilike(r.room_id, ^"%#{search}%")
-      else
-        q
-      end
+    q = if since, do: from(r in q, where: r.room_id > ^since), else: q
 
-    q =
-      if since != nil do
-        from r in q, where: r.room_id > ^since
-      else
-        q
-      end
+    room_ids = Repo.all(q)
 
-    rooms = Repo.all(q)
+    # Build rich chunks with name, topic, alias, member count from state
+    chunks =
+      Enum.map(room_ids, fn room_id ->
+        build_public_room_entry(room_id, search)
+      end)
+      |> Enum.reject(&is_nil/1)
 
-    chunks = Enum.map(rooms, fn r ->
-      %{"room_id" => r.room_id, "world_readable" => false, "guest_can_join" => false}
-    end)
-
-    next_batch = if length(rooms) == limit, do: List.last(rooms).room_id, else: nil
+    next_batch = if length(room_ids) == limit, do: List.last(room_ids), else: nil
 
     resp = %{
       "chunk" => chunks,
@@ -48,6 +40,68 @@ defmodule AxonWeb.DirectoryController do
     resp = if next_batch, do: Map.put(resp, "next_batch", next_batch), else: resp
 
     json(conn, resp)
+  end
+
+  defp build_public_room_entry(room_id, search) do
+    # Get current state for name, topic, canonical_alias from current_room_state
+    state_rows = Repo.all(
+      from s in "current_room_state",
+        join: e in "events", on: e.event_id == s.event_id,
+        where: s.room_id == ^room_id and s.type in ["m.room.name", "m.room.topic", "m.room.canonical_alias", "m.room.history_visibility", "m.room.guest_access"],
+        select: %{type: s.type, content: e.content}
+    )
+
+    state_map = Enum.into(state_rows, %{}, fn r -> {r.type, r.content} end)
+
+    name = get_in(state_map, ["m.room.name", "name"])
+    topic = get_in(state_map, ["m.room.topic", "topic"])
+    canonical_alias = get_in(state_map, ["m.room.canonical_alias", "alias"])
+    history_visibility = get_in(state_map, ["m.room.history_visibility", "history_visibility"]) || "shared"
+    guest_access = get_in(state_map, ["m.room.guest_access", "guest_access"]) || "forbidden"
+
+    # Apply search filter on name and topic
+    if search do
+      search_lower = String.downcase(search)
+      name_match = name && String.contains?(String.downcase(name), search_lower)
+      topic_match = topic && String.contains?(String.downcase(topic), search_lower)
+      alias_match = canonical_alias && String.contains?(String.downcase(canonical_alias), search_lower)
+      id_match = String.contains?(String.downcase(room_id), search_lower)
+      if not (name_match || topic_match || alias_match || id_match), do: nil, else: build_entry(room_id, name, topic, canonical_alias, history_visibility, guest_access)
+    else
+      build_entry(room_id, name, topic, canonical_alias, history_visibility, guest_access)
+    end
+  end
+
+  defp build_entry(room_id, name, topic, canonical_alias, history_visibility, guest_access) do
+    num_joined = Repo.one(
+      from m in "room_memberships",
+        where: m.room_id == ^room_id and m.membership == "join",
+        select: count(m.user_id)
+    ) || 0
+
+    entry = %{
+      "room_id" => room_id,
+      "world_readable" => history_visibility == "world_readable",
+      "guest_can_join" => guest_access == "can_join",
+      "num_joined_members" => num_joined
+    }
+    entry = if name, do: Map.put(entry, "name", name), else: entry
+    entry = if topic, do: Map.put(entry, "topic", topic), else: entry
+    entry = if canonical_alias, do: Map.put(entry, "canonical_alias", canonical_alias), else: entry
+    entry
+  end
+
+  # PUT /_matrix/client/v3/directory/list/room/:room_id
+  def set_room_visibility(conn, %{"room_id" => room_id} = params) do
+    visibility = params["visibility"]
+    is_public = visibility == "public"
+
+    Repo.update_all(
+      from(r in "rooms", where: r.room_id == ^room_id),
+      set: [is_public: is_public]
+    )
+
+    json(conn, %{})
   end
 
   # GET /_matrix/client/v3/directory/room/:room_alias

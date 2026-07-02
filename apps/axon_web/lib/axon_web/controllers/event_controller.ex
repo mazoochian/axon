@@ -7,22 +7,37 @@ defmodule AxonWeb.EventController do
   alias AxonCore.{EventStore, Repo}
   alias AxonRoom.RoomProcess
 
+  @max_event_size 65_535
+
   # PUT /_matrix/client/v3/rooms/:room_id/send/:event_type/:txn_id
   def send_event(conn, %{"room_id" => room_id, "event_type" => event_type, "txn_id" => txn_id} = params) do
     user_id = conn.assigns.current_user_id
     device_id = conn.assigns.current_device_id
-    content = Map.drop(params, ~w(room_id event_type txn_id))
 
-    # Idempotency check
-    case check_txn_idempotency(user_id, device_id, txn_id) do
-      {:already_sent, event_id} ->
-        json(conn, %{"event_id" => event_id})
+    # Reject non-object JSON bodies (body parsed as non-map → "_json" key set by Plug)
+    if Map.has_key?(params, "_json") do
+      conn |> put_status(400) |> json(%{"errcode" => "M_BAD_JSON", "error" => "Request body must be a JSON object"})
+    else
+      content = Map.drop(params, ~w(room_id event_type txn_id))
 
-      :new ->
-        with {:ok, event_id} <- RoomProcess.send_event(room_id, user_id, event_type, content) do
-          record_txn(user_id, device_id, txn_id, event_id)
-          json(conn, %{"event_id" => event_id})
-        end
+      # Reject events exceeding 65535 bytes
+      case check_event_size(content) do
+        :too_large ->
+          conn |> put_status(413) |> json(%{"errcode" => "M_TOO_LARGE", "error" => "Event too large"})
+
+        :ok ->
+          # Idempotency check
+          case check_txn_idempotency(user_id, device_id, txn_id) do
+            {:already_sent, event_id} ->
+              json(conn, %{"event_id" => event_id})
+
+            :new ->
+              with {:ok, event_id} <- RoomProcess.send_event(room_id, user_id, event_type, content) do
+                record_txn(user_id, device_id, txn_id, event_id)
+                json(conn, %{"event_id" => event_id})
+              end
+          end
+      end
     end
   end
 
@@ -31,12 +46,31 @@ defmodule AxonWeb.EventController do
   def send_state_event(conn, %{"room_id" => room_id, "event_type" => event_type} = params) do
     user_id = conn.assigns.current_user_id
     state_key = params["state_key"] || ""
-    content = Map.drop(params, ~w(room_id event_type state_key))
 
-    with :ok <- validate_state_event(event_type, content, room_id),
-         {:ok, event_id} <-
-           RoomProcess.send_event(room_id, user_id, event_type, content, state_key: state_key) do
-      json(conn, %{"event_id" => event_id})
+    # Reject non-object JSON bodies
+    if Map.has_key?(params, "_json") do
+      conn |> put_status(400) |> json(%{"errcode" => "M_BAD_JSON", "error" => "Request body must be a JSON object"})
+    else
+      content = Map.drop(params, ~w(room_id event_type state_key))
+
+      case check_event_size(content) do
+        :too_large ->
+          conn |> put_status(413) |> json(%{"errcode" => "M_TOO_LARGE", "error" => "Event too large"})
+
+        :ok ->
+          with :ok <- validate_state_event(event_type, content, room_id),
+               {:ok, event_id} <-
+                 RoomProcess.send_event(room_id, user_id, event_type, content, state_key: state_key) do
+            json(conn, %{"event_id" => event_id})
+          end
+      end
+    end
+  end
+
+  defp check_event_size(content) do
+    case Jason.encode(content) do
+      {:ok, json} when byte_size(json) > @max_event_size -> :too_large
+      _ -> :ok
     end
   end
 
@@ -103,13 +137,96 @@ defmodule AxonWeb.EventController do
 
   # GET /_matrix/client/v3/rooms/:room_id/event/:event_id
   def get_event(conn, %{"room_id" => room_id, "event_id" => event_id}) do
+    user_id = conn.assigns.current_user_id
+
     with {:ok, event} <- EventStore.get_event(event_id) do
       if event.room_id != room_id do
         {:error, :not_found}
       else
-        json(conn, EventStore.event_to_map(event))
+        if can_access_event?(user_id, room_id, event) do
+          json(conn, EventStore.event_to_map(event))
+        else
+          {:error, :not_found}
+        end
       end
     end
+  end
+
+  defp can_access_event?(user_id, room_id, event) do
+    # Get history_visibility from current state
+    history_visibility =
+      Repo.one(
+        from s in "current_room_state",
+          join: e in "events", on: e.event_id == s.event_id,
+          where: s.room_id == ^room_id and s.type == "m.room.history_visibility" and s.state_key == "",
+          select: fragment("?->>'history_visibility'", e.content)
+      ) || "shared"
+
+    if history_visibility == "world_readable" do
+      true
+    else
+      # Check the user's membership
+      membership =
+        Repo.one(
+          from m in "room_memberships",
+            where: m.room_id == ^room_id and m.user_id == ^user_id,
+            select: m.membership
+        )
+
+      case {history_visibility, membership} do
+        {_, nil} ->
+          false
+
+        {"shared", "join"} ->
+          true
+
+        {"joined", "join"} ->
+          # Only allow if event was sent AFTER the user joined
+          join_ordering = get_user_membership_ordering(user_id, room_id, "join")
+          join_ordering != nil and event.stream_ordering >= join_ordering
+
+        {"invited", "join"} ->
+          # Find invite stream_ordering that preceded the current join
+          join_ordering = get_user_membership_ordering(user_id, room_id, "join")
+          invite_ordering = get_user_invite_before_join(user_id, room_id, join_ordering)
+          effective_ordering = invite_ordering || join_ordering
+          effective_ordering != nil and event.stream_ordering >= effective_ordering
+
+        _ ->
+          false
+      end
+    end
+  end
+
+  defp get_user_membership_ordering(user_id, room_id, membership) do
+    Repo.one(
+      from e in "events",
+        where:
+          e.room_id == ^room_id and
+          e.type == "m.room.member" and
+          e.state_key == ^user_id and
+          fragment("?->>'membership'", e.content) == ^membership,
+        order_by: [desc: e.stream_ordering],
+        limit: 1,
+        select: e.stream_ordering
+    )
+  end
+
+  defp get_user_invite_before_join(user_id, room_id, join_ordering) do
+    if is_nil(join_ordering), do: nil,
+    else:
+      Repo.one(
+        from e in "events",
+          where:
+            e.room_id == ^room_id and
+            e.type == "m.room.member" and
+            e.state_key == ^user_id and
+            fragment("?->>'membership'", e.content) == "invite" and
+            e.stream_ordering < ^join_ordering,
+          order_by: [desc: e.stream_ordering],
+          limit: 1,
+          select: e.stream_ordering
+      )
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/messages

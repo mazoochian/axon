@@ -294,8 +294,10 @@ defmodule AxonRoom.AuthRules do
   end
 
   # When no power_levels event exists yet, the room creator has implicit level 100.
+  # An empty PL event {} still exists → creator does NOT get implicit 100 in that case.
   defp effective_power(user_id, pl, current_state) do
-    if map_size(pl) == 0 and room_creator?(user_id, current_state),
+    has_pl_event = Map.has_key?(current_state, {"m.room.power_levels", ""})
+    if not has_pl_event and room_creator?(user_id, current_state),
       do: 100,
       else: sender_power(user_id, pl)
   end
