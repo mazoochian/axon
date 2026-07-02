@@ -43,6 +43,8 @@ defmodule AxonWeb.AccountDataController do
       on_conflict: {:replace, [:content]},
       conflict_target: [:user_id, :type])
 
+      Repo.insert_all("account_data_stream", [%{user_id: user_id, type: type}])
+
       json(conn, %{})
     end
   end

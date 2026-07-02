@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Compile the project and run migrations. Use this in CI or before deploying.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+echo "==> Installing dependencies"
+mix deps.get
+
+echo "==> Compiling"
+MIX_ENV=prod mix compile
+
+echo "==> Running migrations"
+MIX_ENV=prod mix ecto.migrate
+
+echo "==> Build complete"
