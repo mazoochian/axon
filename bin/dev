@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Start Axon in development mode (CS API :8008, federation :8448).
+# Runs migrations automatically before starting.
+#
+# Usage:
+#   ./bin/dev
+#   AXON_SERVER_NAME=192.168.2.189 ./bin/dev
+#   ./bin/dev 2>&1 | tee axon.log
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+export MIX_ENV=dev
+export AXON_SERVER_NAME="${AXON_SERVER_NAME:-$(hostname -I | awk '{print $1}')}"
+
+echo "==> Server name: $AXON_SERVER_NAME"
+
+echo "==> Running migrations"
+mix ecto.migrate
+
+echo "==> Starting Axon (CS API :8008, federation :8448)"
+exec mix run --no-halt

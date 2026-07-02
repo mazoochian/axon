@@ -16,9 +16,9 @@ defmodule AxonWeb.SyncController do
 
     # nil means initial sync; a string (even "0") means incremental
     is_initial_sync = is_nil(since)
-    # next_batch token format: "${room_ordering}_${dl_cursor}"
-    # dl_cursor tracks the max device_list_updates.id seen so far (separate stream)
-    {since_ordering, dl_since} = parse_sync_token(since)
+    # next_batch token format: "${room_ordering}_${dl_cursor}_${ad_cursor}"
+    # dl_cursor tracks device_list_updates.id; ad_cursor tracks account_data_stream.id
+    {since_ordering, dl_since, ad_since} = parse_sync_token(since)
 
     filter = load_filter(user_id, params["filter"])
 
@@ -41,12 +41,13 @@ defmodule AxonWeb.SyncController do
         next_ordering
       end
 
-    # Advance the device_list cursor to the current max dl id
+    # Advance cursors to current maxes
     dl_next = current_dl_max_id()
-    next_batch = "#{next_ordering}_#{dl_next}"
+    ad_next = current_ad_max_id()
+    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}"
 
     rooms_response = build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter)
-    global_account_data = get_global_account_data(user_id)
+    global_account_data = get_global_account_data(user_id, is_initial_sync, ad_since)
 
     # E2EE sync additions
     {to_device_events, _max_tdm_id} = drain_to_device_messages(user_id, device_id)
@@ -333,19 +334,17 @@ defmodule AxonWeb.SyncController do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  # Returns {room_ordering, dl_cursor}.
-  # Token format: "${room_ordering}_${dl_cursor}" — backward-compatible with plain integers.
-  defp parse_sync_token(nil), do: {0, 0}
+  # Returns {room_ordering, dl_cursor, ad_cursor}.
+  # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}"
+  # Old 2-part tokens default ad_cursor to 0 (return all account_data on next sync).
+  defp parse_sync_token(nil), do: {0, 0, 0}
   defp parse_sync_token(since) do
-    case String.split(since, "_", parts: 2) do
-      [room_s, dl_s] ->
-        room_n = case Integer.parse(room_s) do {n, _} -> n; _ -> 0 end
-        dl_n = case Integer.parse(dl_s) do {n, _} -> n; _ -> 0 end
-        {room_n, dl_n}
-      [room_s] ->
-        room_n = case Integer.parse(room_s) do {n, _} -> n; _ -> 0 end
-        {room_n, 0}
-    end
+    parse_int = fn s -> case Integer.parse(s) do {n, _} -> n; _ -> 0 end end
+    parts = String.split(since, "_")
+    room_n = parse_int.(Enum.at(parts, 0, "0"))
+    dl_n   = parse_int.(Enum.at(parts, 1, "0"))
+    ad_n   = parse_int.(Enum.at(parts, 2, "0"))
+    {room_n, dl_n, ad_n}
   end
 
   defp build_room_account_data(room_id, user_id) do
@@ -432,13 +431,36 @@ defmodule AxonWeb.SyncController do
     end
   end
 
-  defp get_global_account_data(user_id) do
+  # Initial sync: return all account_data for the user.
+  # Incremental sync: return only types that changed since ad_since (account_data_stream cursor).
+  defp get_global_account_data(user_id, _is_initial = true, _ad_since) do
     Repo.all(
       from a in "account_data",
         where: a.user_id == ^user_id,
         select: %{type: a.type, content: a.content}
     )
     |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
+  end
+
+  defp get_global_account_data(user_id, _is_initial = false, ad_since) do
+    changed_types =
+      Repo.all(
+        from s in "account_data_stream",
+          where: s.user_id == ^user_id and s.id > ^ad_since,
+          select: s.type,
+          distinct: true
+      )
+
+    if changed_types == [] do
+      []
+    else
+      Repo.all(
+        from a in "account_data",
+          where: a.user_id == ^user_id and a.type in ^changed_types,
+          select: %{type: a.type, content: a.content}
+      )
+      |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
+    end
   end
 
   defp get_ignored_users(user_id) do
@@ -537,23 +559,27 @@ defmodule AxonWeb.SyncController do
           distinct: true
       )
 
+    # The user must see their own device-list changes (new logins, cross-signing
+    # uploads) so their other devices re-query keys — spec requires self in `changed`.
+    candidate_users = [user_id | shared_users]
+
     changed =
-      if shared_users == [] do
-        []
-      else
-        Repo.all(
-          from u in "device_list_updates",
-            where: u.user_id in ^shared_users and u.id > ^dl_since,
-            select: u.user_id,
-            distinct: true
-        )
-      end
+      Repo.all(
+        from u in "device_list_updates",
+          where: u.user_id in ^candidate_users and u.id > ^dl_since,
+          select: u.user_id,
+          distinct: true
+      )
 
     %{"changed" => changed, "left" => []}
   end
 
   defp current_dl_max_id do
     Repo.one(from u in "device_list_updates", select: max(u.id)) || 0
+  end
+
+  defp current_ad_max_id do
+    Repo.one(from s in "account_data_stream", select: max(s.id)) || 0
   end
 
   defp get_max_ordering(events_by_room, fallback) do

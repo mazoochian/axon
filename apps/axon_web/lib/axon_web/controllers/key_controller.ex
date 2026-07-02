@@ -62,16 +62,19 @@ defmodule AxonWeb.KeyController do
       ], on_conflict: :nothing)
     end)
 
-    # Store fallback keys (one per algorithm, keyed by algorithm name)
-    Enum.each(fallback_keys, fn {algorithm, key_json} ->
-      key_id = "#{algorithm}:fallback"
+    # Store fallback keys (one per algorithm, keyed by "algorithm:key_id" format).
+    # Extract just the algorithm name ("signed_curve25519") from the full key id
+    # ("signed_curve25519:AAAAAAAAAAA") so the algorithm column stays correct and
+    # each new upload overwrites the previous fallback for that algorithm.
+    Enum.each(fallback_keys, fn {full_key_id, key_json} ->
+      algorithm = full_key_id |> String.split(":", parts: 2) |> hd()
 
       Repo.insert_all("fallback_keys", [
         %{
           user_id: user_id,
           device_id: device_id,
           algorithm: algorithm,
-          key_id: key_id,
+          key_id: full_key_id,
           key_json: key_json,
           used: false
         }
@@ -90,14 +93,31 @@ defmodule AxonWeb.KeyController do
     user_ids = Map.keys(device_keys_req)
     current_user_id = conn.assigns.current_user_id
 
+    sigs_by_target = get_cross_signing_signatures(user_ids, current_user_id)
+
     device_keys_result =
       Enum.into(device_keys_req, %{}, fn {queried_user_id, _device_ids} ->
-        {queried_user_id, get_device_keys_for_user(queried_user_id)}
+        devices =
+          queried_user_id
+          |> get_device_keys_for_user()
+          |> Map.new(fn {device_id, key_json} ->
+            {device_id, merge_signatures(key_json, queried_user_id, device_id, sigs_by_target)}
+          end)
+
+        {queried_user_id, devices}
       end)
 
-    master_keys = get_cross_signing_keys(user_ids, "master")
-    self_signing_keys = get_cross_signing_keys(user_ids, "self_signing")
-    user_signing_keys = get_cross_signing_keys([current_user_id], "user_signing")
+    master_keys =
+      get_cross_signing_keys(user_ids, "master")
+      |> merge_cross_signing_key_signatures(sigs_by_target)
+
+    self_signing_keys =
+      get_cross_signing_keys(user_ids, "self_signing")
+      |> merge_cross_signing_key_signatures(sigs_by_target)
+
+    user_signing_keys =
+      get_cross_signing_keys([current_user_id], "user_signing")
+      |> merge_cross_signing_key_signatures(sigs_by_target)
 
     json(conn, %{
       "device_keys" => device_keys_result,
@@ -134,22 +154,20 @@ defmodule AxonWeb.KeyController do
     dl_from = parse_dl_cursor(params["from"])
     dl_to = parse_dl_cursor(params["to"])
 
-    shared_users = shared_room_user_ids(user_id)
+    # Include the user themselves: their own device-list changes (new logins,
+    # cross-signing uploads) must be visible to their other devices.
+    candidate_users = [user_id | shared_room_user_ids(user_id)]
 
     changed =
-      if shared_users == [] do
-        []
-      else
-        Repo.all(
-          from u in "device_list_updates",
-            where:
-              u.user_id in ^shared_users and
-              u.id > ^dl_from and
-              u.id <= ^dl_to,
-            select: u.user_id,
-            distinct: true
-        )
-      end
+      Repo.all(
+        from u in "device_list_updates",
+          where:
+            u.user_id in ^candidate_users and
+            u.id > ^dl_from and
+            u.id <= ^dl_to,
+          select: u.user_id,
+          distinct: true
+      )
 
     json(conn, %{"changed" => changed, "left" => []})
   end
@@ -509,6 +527,61 @@ defmodule AxonWeb.KeyController do
         select: %{user_id: k.user_id, key_json: k.key_json}
     )
     |> Enum.into(%{}, fn row -> {row.user_id, row.key_json} end)
+  end
+
+  # Signatures uploaded via /keys/signatures/upload, grouped by their target.
+  # Visibility: a user's signatures on their own keys/devices are public;
+  # signatures the requester made on other users' keys are private to them.
+  defp get_cross_signing_signatures(user_ids, current_user_id) do
+    Repo.all(
+      from s in "cross_signing_signatures",
+        where:
+          s.target_user_id in ^user_ids and
+            (s.signing_user_id == s.target_user_id or s.signing_user_id == ^current_user_id),
+        select: %{
+          target_user_id: s.target_user_id,
+          target_key_id: s.target_key_id,
+          signing_user_id: s.signing_user_id,
+          signing_key_id: s.signing_key_id,
+          signature: s.signature
+        }
+    )
+    |> Enum.group_by(fn s -> {s.target_user_id, s.target_key_id} end)
+  end
+
+  # Devices are targeted by device_id; cross-signing keys by their key id
+  # (e.g. "ed25519:<base64>"), matching what clients send to /signatures/upload.
+  defp merge_signatures(key_json, target_user_id, target_key_id, sigs_by_target) do
+    case Map.get(sigs_by_target, {target_user_id, target_key_id}) do
+      nil ->
+        key_json
+
+      rows ->
+        merged =
+          Enum.reduce(rows, key_json["signatures"] || %{}, fn row, acc ->
+            Map.update(
+              acc,
+              row.signing_user_id,
+              %{row.signing_key_id => row.signature},
+              &Map.put(&1, row.signing_key_id, row.signature)
+            )
+          end)
+
+        Map.put(key_json, "signatures", merged)
+    end
+  end
+
+  defp merge_cross_signing_key_signatures(keys_by_user, sigs_by_target) do
+    Map.new(keys_by_user, fn {user_id, key_json} ->
+      merged =
+        (key_json["keys"] || %{})
+        |> Map.keys()
+        |> Enum.reduce(key_json, fn key_id, acc ->
+          merge_signatures(acc, user_id, key_id, sigs_by_target)
+        end)
+
+      {user_id, merged}
+    end)
   end
 
   defp format_backup_row(row) do
