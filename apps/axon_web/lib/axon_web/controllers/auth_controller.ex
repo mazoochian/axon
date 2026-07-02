@@ -8,6 +8,14 @@ defmodule AxonWeb.AuthController do
 
   # POST /_matrix/client/v3/register
   def register(conn, params) do
+    if AxonWeb.Oidc.enabled?() do
+      oidc_disabled_response(conn, "Registration is handled by the configured Authorization Server")
+    else
+      do_register(conn, params)
+    end
+  end
+
+  defp do_register(conn, params) do
     kind = params["kind"] || "user"
 
     if kind == "guest" do
@@ -191,6 +199,14 @@ defmodule AxonWeb.AuthController do
 
   # POST /_matrix/client/v3/login
   def login(conn, params) do
+    if AxonWeb.Oidc.enabled?() do
+      oidc_disabled_response(conn, "Login is handled by the configured Authorization Server")
+    else
+      do_login(conn, params)
+    end
+  end
+
+  defp do_login(conn, params) do
     type = params["type"]
 
     case type do
@@ -227,9 +243,12 @@ defmodule AxonWeb.AuthController do
 
   # GET /_matrix/client/v3/login (list supported login types)
   def login_types(conn, _params) do
-    json(conn, %{
-      "flows" => [%{"type" => "m.login.password"}]
-    })
+    flows = if AxonWeb.Oidc.enabled?(), do: [], else: [%{"type" => "m.login.password"}]
+    json(conn, %{"flows" => flows})
+  end
+
+  defp oidc_disabled_response(conn, message) do
+    conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => message})
   end
 
   # POST /_matrix/client/v3/logout

@@ -145,6 +145,70 @@ defmodule AxonCore.UserStore do
   end
 
   # ---------------------------------------------------------------------------
+  # Delegated OAuth2/OIDC auth (MSC3861) — no locally-issued token; the
+  # client's token is validated by the Authorization Server via introspection,
+  # and we just need to map its subject to a local user record.
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Resolves an introspected OAuth2 token to `{user_id, device_id}`, creating
+  the local user/device on first use if needed.
+
+  Looked up primarily by `oidc_subject` (stable across username changes) —
+  a brand-new user is provisioned with `localpart` only if no user has that
+  subject yet. Refuses to attach the subject to an existing account that
+  isn't already linked to it (or is linked to a *different* subject), so an
+  OIDC-side username claim can't silently take over an unrelated local
+  (password-based) or other-subject account.
+
+  Returns `{:ok, {user_id, device_id}}` or `{:error, reason}`.
+  """
+  def authenticate_via_oidc(subject, localpart, device_id, server_name) do
+    with {:ok, user_id} <- find_or_create_oidc_user(subject, localpart, server_name) do
+      ensure_device(user_id, device_id, nil)
+      {:ok, {user_id, device_id}}
+    end
+  end
+
+  defp find_or_create_oidc_user(subject, localpart, server_name) do
+    case Repo.get_by(User, oidc_subject: subject) do
+      %User{deactivated: true} ->
+        {:error, :deactivated}
+
+      %User{user_id: user_id} ->
+        {:ok, user_id}
+
+      nil ->
+        provision_oidc_user(subject, localpart, server_name)
+    end
+  end
+
+  defp provision_oidc_user(subject, localpart, server_name) do
+    user_id = "@#{localpart}:#{server_name}"
+
+    case Repo.get(User, user_id) do
+      nil ->
+        %User{}
+        |> User.changeset(%{user_id: user_id, localpart: localpart, oidc_subject: subject})
+        |> Repo.insert()
+        |> case do
+          {:ok, user} ->
+            Repo.insert(UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: localpart}))
+            {:ok, user.user_id}
+
+          {:error, _changeset} ->
+            {:error, :provisioning_failed}
+        end
+
+      %User{oidc_subject: nil} ->
+        {:error, :localpart_taken_by_local_account}
+
+      %User{} ->
+        {:error, :localpart_taken_by_other_subject}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Profile
   # ---------------------------------------------------------------------------
 

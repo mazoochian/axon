@@ -4,6 +4,19 @@ import Config
 config :axon_web,
   server_name: System.get_env("AXON_SERVER_NAME", "localhost")
 
+# Delegated OAuth 2.0 / OIDC auth (MSC3861 / MSC2965) — off by default.
+# When enabled, this homeserver acts purely as an OAuth2 resource server:
+# it does not mint its own access tokens or accept m.login.password/register;
+# clients discover the external Authorization Server via auth_metadata and
+# talk to it directly, and Axon validates their tokens via introspection.
+config :axon_web, :oidc,
+  enabled: false,
+  issuer: nil,
+  client_id: nil,
+  client_secret: nil,
+  client_auth_method: "client_secret_basic",
+  account_management_url: nil
+
 # Ecto repo
 config :axon_core, AxonCore.Repo,
   adapter: Ecto.Adapters.Postgres,

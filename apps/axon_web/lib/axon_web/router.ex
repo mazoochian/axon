@@ -29,8 +29,9 @@ defmodule AxonWeb.Router do
     post "/v3/register", AuthController, :register
     get "/v3/register/available", AuthController, :register_available
 
-    # OIDC metadata — return 404 M_NOT_FOUND (no OIDC support)
-    get "/v1/auth_metadata", VersionController, :no_oidc
+    # OAuth2/OIDC discovery (MSC2965) — returns the AS's metadata when
+    # delegated auth is configured, else 404 M_UNRECOGNIZED
+    get "/v1/auth_metadata", VersionController, :auth_metadata
 
     # Media config (no auth required)
     get "/v3/media/config", VersionController, :media_config

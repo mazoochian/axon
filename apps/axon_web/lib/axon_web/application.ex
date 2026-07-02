@@ -11,6 +11,8 @@ defmodule AxonWeb.Application do
        server_name: Application.fetch_env!(:axon_web, :server_name)},
       # HTTP client for outbound federation requests
       {Finch, name: Axon.Finch},
+      # Caches the delegated OIDC Authorization Server's discovery document
+      AxonWeb.Oidc.Discovery,
       # Task supervisor for async federation work
       {Task.Supervisor, name: Axon.TaskSupervisor},
       # Federation outbound fan-out (subscribes to PubSub, sends PDUs to remote servers)

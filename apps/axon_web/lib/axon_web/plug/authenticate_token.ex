@@ -26,13 +26,25 @@ defmodule AxonWeb.Plug.AuthenticateToken do
             |> assign(:current_token, raw_token)
 
           :error ->
-            conn
-            |> put_status(401)
-            |> Phoenix.Controller.json(%{
-              "errcode" => "M_UNKNOWN_TOKEN",
-              "error" => "Invalid access token"
-            })
-            |> halt()
+            # Not one of our locally-issued tokens — if delegated OIDC auth
+            # (MSC3861) is enabled, it may be a token from the external
+            # Authorization Server; validate via introspection.
+            case AxonWeb.Oidc.enabled?() and AxonWeb.Oidc.introspect(raw_token) do
+              {:ok, {user_id, device_id}} ->
+                conn
+                |> assign(:current_user_id, user_id)
+                |> assign(:current_device_id, device_id)
+                |> assign(:current_token, raw_token)
+
+              _ ->
+                conn
+                |> put_status(401)
+                |> Phoenix.Controller.json(%{
+                  "errcode" => "M_UNKNOWN_TOKEN",
+                  "error" => "Invalid access token"
+                })
+                |> halt()
+            end
         end
     end
   end

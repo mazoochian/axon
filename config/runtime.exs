@@ -20,4 +20,14 @@ if config_env() == :prod do
   config :axon_web, AxonWeb.FederationEndpoint,
     server: true,
     secret_key_base: System.get_env("SECRET_KEY_BASE") || String.duplicate("a", 64)
+
+  if System.get_env("OIDC_ISSUER") do
+    config :axon_web, :oidc,
+      enabled: true,
+      issuer: System.get_env("OIDC_ISSUER"),
+      client_id: System.get_env("OIDC_CLIENT_ID"),
+      client_secret: System.get_env("OIDC_CLIENT_SECRET"),
+      client_auth_method: System.get_env("OIDC_CLIENT_AUTH_METHOD", "client_secret_basic"),
+      account_management_url: System.get_env("OIDC_ACCOUNT_MANAGEMENT_URL")
+  end
 end
