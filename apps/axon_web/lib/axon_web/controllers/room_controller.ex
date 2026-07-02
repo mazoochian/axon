@@ -5,7 +5,7 @@ defmodule AxonWeb.RoomController do
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
-  alias AxonRoom.{CreateRoom, RoomProcess}
+  alias AxonRoom.{CreateRoom, RoomProcess, RoomUpgrade}
 
   # POST /_matrix/client/v3/createRoom
   def create(conn, params) do
@@ -130,6 +130,31 @@ defmodule AxonWeb.RoomController do
         )
         json(conn, %{})
     end
+  end
+
+  # POST /_matrix/client/v3/rooms/:room_id/upgrade
+  def upgrade(conn, %{"room_id" => room_id, "new_version" => new_version}) when is_binary(new_version) do
+    user_id = conn.assigns.current_user_id
+    server_name = Application.fetch_env!(:axon_web, :server_name)
+
+    with :ok <- RoomUpgrade.ensure_joined(room_id, user_id),
+         :ok <- RoomUpgrade.ensure_can_tombstone(room_id, user_id),
+         {:ok, new_room_id} <- RoomUpgrade.execute(room_id, user_id, new_version, server_name) do
+      json(conn, %{"replacement_room" => new_room_id})
+    else
+      {:error, :not_joined} ->
+        conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not joined to this room"})
+
+      {:error, :insufficient_power_level} ->
+        conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Insufficient power level to upgrade room"})
+
+      {:error, :unsupported_room_version} ->
+        conn |> put_status(400) |> json(%{"errcode" => "M_UNSUPPORTED_ROOM_VERSION", "error" => "Unsupported room version"})
+    end
+  end
+
+  def upgrade(conn, _params) do
+    conn |> put_status(400) |> json(%{"errcode" => "M_BAD_JSON", "error" => "new_version is required"})
   end
 
   # POST /_matrix/client/v3/rooms/:room_id/invite

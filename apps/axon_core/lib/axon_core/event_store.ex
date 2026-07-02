@@ -280,11 +280,14 @@ defmodule AxonCore.EventStore do
     bundled
   end
 
+  @specially_aggregated_rel_types ["m.annotation", "m.thread"]
+
   defp put_relations_bundle(room_id, event_map, children, user_id) do
     relations =
       %{}
       |> put_annotation_bundle(children)
       |> put_thread_bundle(room_id, children, user_id)
+      |> put_generic_count_bundle(children)
 
     if relations == %{} do
       event_map
@@ -327,6 +330,20 @@ defmodule AxonCore.EventStore do
           "current_user_participated" => user_id != nil and Enum.any?(thread_events, &(&1.sender == user_id))
         })
     end
+  end
+
+  # Spec fallback for relation types without a special aggregation format
+  # (e.g. m.reference, used by MSC3381 polls to link responses/end to the
+  # poll start event): bundle just a count. Real vote tallying is left to
+  # clients, which fetch m.poll.response/m.poll.end via GET .../relations —
+  # this matches how Synapse handles polls (no server-side tally).
+  defp put_generic_count_bundle(relations, children) do
+    children
+    |> Enum.reject(&(&1.rel_type in @specially_aggregated_rel_types or is_nil(&1.rel_type)))
+    |> Enum.group_by(& &1.rel_type)
+    |> Enum.reduce(relations, fn {rel_type, events}, acc ->
+      Map.put(acc, rel_type, %{"count" => length(events)})
+    end)
   end
 
   # ---------------------------------------------------------------------------

@@ -235,6 +235,7 @@ defmodule AxonWeb.Router do
     get "/v3/rooms/:room_id/joined_members", RoomController, :joined_members
     get "/v3/rooms/:room_id/aliases", DirectoryController, :list_room_aliases
     post "/v3/rooms/:room_id/forget", RoomController, :forget
+    post "/v3/rooms/:room_id/upgrade", RoomController, :upgrade
 
     # Events
     put "/v3/rooms/:room_id/send/:event_type/:txn_id", EventController, :send_event
