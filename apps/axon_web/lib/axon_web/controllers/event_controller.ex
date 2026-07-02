@@ -144,7 +144,8 @@ defmodule AxonWeb.EventController do
         {:error, :not_found}
       else
         if can_access_event?(user_id, room_id, event) do
-          json(conn, EventStore.event_to_map(event))
+          bundled = EventStore.bundle_relations_one(room_id, EventStore.event_to_map(event), user_id: user_id)
+          json(conn, bundled)
         else
           {:error, :not_found}
         end
@@ -259,12 +260,66 @@ defmodule AxonWeb.EventController do
         do: from_ordering,
         else: (if dir == "b", do: hd(events).stream_ordering, else: List.last(events).stream_ordering)
 
+    chunk =
+      events
+      |> Enum.map(&EventStore.event_to_map/1)
+      |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
+
     json(conn, %{
       "start" => start_token,
       "end" => Integer.to_string(end_ordering),
-      "chunk" => Enum.map(events, &EventStore.event_to_map/1),
+      "chunk" => chunk,
       "state" => []
     })
+    end
+  end
+
+  # GET /_matrix/client/v1/rooms/:room_id/relations/:event_id
+  # GET /_matrix/client/v1/rooms/:room_id/relations/:event_id/:rel_type
+  # GET /_matrix/client/v1/rooms/:room_id/relations/:event_id/:rel_type/:event_type
+  def get_relations(conn, %{"room_id" => room_id, "event_id" => event_id} = params) do
+    user_id = conn.assigns.current_user_id
+
+    membership =
+      Repo.one(
+        from m in "room_memberships",
+          where: m.room_id == ^room_id and m.user_id == ^user_id,
+          select: %{membership: m.membership, forgotten: m.forgotten}
+      )
+
+    if membership == nil or membership.forgotten do
+      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+    else
+      dir = params["dir"] || "b"
+      limit = String.to_integer(params["limit"] || "10")
+      from_token = params["from"]
+      from_ordering = parse_token(from_token) || (EventStore.room_max_stream_ordering(room_id) + 1)
+
+      events =
+        EventStore.get_relations(
+          room_id,
+          event_id,
+          params["rel_type"],
+          params["event_type"],
+          from_ordering,
+          dir,
+          limit
+        )
+
+      chunk =
+        events
+        |> Enum.map(&EventStore.event_to_map/1)
+        |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
+
+      next_batch =
+        case events do
+          [] -> nil
+          _ -> List.last(events).stream_ordering |> Integer.to_string()
+        end
+
+      resp = %{"chunk" => chunk}
+      resp = if next_batch, do: Map.put(resp, "next_batch", next_batch), else: resp
+      json(conn, resp)
     end
   end
 

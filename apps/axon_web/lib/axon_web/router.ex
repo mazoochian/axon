@@ -247,6 +247,14 @@ defmodule AxonWeb.Router do
     get "/v3/rooms/:room_id/messages", EventController, :get_messages
     put "/v3/rooms/:room_id/redact/:event_id/:txn_id", EventController, :redact
 
+    # Relations (reactions, threads) — Phase 5
+    get "/v1/rooms/:room_id/relations/:event_id", EventController, :get_relations
+    get "/v1/rooms/:room_id/relations/:event_id/:rel_type", EventController, :get_relations
+    get "/v1/rooms/:room_id/relations/:event_id/:rel_type/:event_type", EventController, :get_relations
+
+    # Spaces — Phase 5
+    get "/v1/rooms/:room_id/hierarchy", SpaceController, :hierarchy
+
     # Sync
     get "/v3/sync", SyncController, :sync
 
