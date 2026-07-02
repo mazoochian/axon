@@ -10,8 +10,8 @@ defmodule AxonWeb.FederationController do
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
   alias AxonCrypto.{EventHash, KeyServer}
-  alias AxonRoom.{AuthRules, EventBuilder, RoomProcess, StateResV2}
-  alias AxonFederation.{HttpClient, KeyCache}
+  alias AxonRoom.{AuthRules, RoomProcess}
+  alias AxonFederation.KeyCache
   require Logger
 
   # ---------------------------------------------------------------------------
