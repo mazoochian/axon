@@ -198,10 +198,12 @@ defmodule AxonWeb.SyncController do
 
     # Add unsigned.membership to timeline events (MSC4115)
     timeline_with_membership = add_membership_to_timeline(filtered_timeline, room_id, user_id)
+    # Bundle reaction/thread aggregations (unsigned.m.relations)
+    timeline_with_relations = EventStore.bundle_relations(room_id, timeline_with_membership, user_id: user_id)
 
     %{
       "timeline" => %{
-        "events" => timeline_with_membership,
+        "events" => timeline_with_relations,
         "limited" => limited,
         "prev_batch" => prev_batch
       },

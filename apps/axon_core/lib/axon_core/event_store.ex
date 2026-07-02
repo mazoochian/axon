@@ -184,6 +184,38 @@ defmodule AxonCore.EventStore do
     Repo.all(query)
   end
 
+  @doc """
+  Paginate events related to `target_event_id` (for GET /rooms/:id/relations/:eventId).
+  `rel_type` and `event_type` are optional filters, `nil` means "any".
+  """
+  def get_relations(room_id, target_event_id, rel_type, event_type, from_ordering, dir, limit \\ 10) do
+    base =
+      from e in Event,
+        where:
+          e.room_id == ^room_id and not e.rejected and not e.soft_failed and
+            fragment("?->'m.relates_to'->>'event_id'", e.content) == ^target_event_id
+
+    base = if rel_type, do: from(e in base, where: fragment("?->'m.relates_to'->>'rel_type'", e.content) == ^rel_type), else: base
+    base = if event_type, do: from(e in base, where: e.type == ^event_type), else: base
+
+    query =
+      case dir do
+        "f" ->
+          from e in base,
+            where: e.stream_ordering > ^from_ordering,
+            order_by: [asc: e.stream_ordering],
+            limit: ^limit
+
+        _ ->
+          from e in base,
+            where: e.stream_ordering < ^from_ordering,
+            order_by: [desc: e.stream_ordering],
+            limit: ^limit
+      end
+
+    Repo.all(query)
+  end
+
   @doc "Returns the current max stream_ordering across all events."
   def current_max_stream_ordering do
     Repo.one(from e in Event, select: max(e.stream_ordering)) || 0
@@ -196,6 +228,105 @@ defmodule AxonCore.EventStore do
         where: e.room_id == ^room_id,
         select: max(e.stream_ordering)
     ) || 0
+  end
+
+  # ---------------------------------------------------------------------------
+  # Relations (reactions, threads) — Phase 5
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Adds `unsigned.m.relations` bundles (m.annotation chunk, m.thread summary)
+  to each event map in `event_maps` that has children, in a single query.
+
+  Spec: https://spec.matrix.org/latest/client-server-api/#event-relationships
+  """
+  def bundle_relations(room_id, event_maps, opts \\ [])
+  def bundle_relations(_room_id, [], _opts), do: []
+
+  def bundle_relations(room_id, event_maps, opts) do
+    user_id = Keyword.get(opts, :user_id)
+    target_ids = Enum.map(event_maps, & &1["event_id"])
+
+    children_by_target =
+      from(e in Event,
+        where:
+          e.room_id == ^room_id and not e.rejected and not e.soft_failed and
+            fragment("?->'m.relates_to'->>'event_id'", e.content) in ^target_ids,
+        select: %{
+          event_id: e.event_id,
+          sender: e.sender,
+          type: e.type,
+          content: e.content,
+          origin_server_ts: e.origin_server_ts,
+          stream_ordering: e.stream_ordering,
+          target_event_id: fragment("?->'m.relates_to'->>'event_id'", e.content),
+          rel_type: fragment("?->'m.relates_to'->>'rel_type'", e.content)
+        }
+      )
+      |> Repo.all()
+      |> Enum.group_by(& &1.target_event_id)
+
+    Enum.map(event_maps, fn event_map ->
+      case Map.get(children_by_target, event_map["event_id"]) do
+        nil -> event_map
+        children -> put_relations_bundle(room_id, event_map, children, user_id)
+      end
+    end)
+  end
+
+  @doc "Bundles relations for a single event map (see `bundle_relations/3`)."
+  def bundle_relations_one(room_id, event_map, opts \\ []) do
+    [bundled] = bundle_relations(room_id, [event_map], opts)
+    bundled
+  end
+
+  defp put_relations_bundle(room_id, event_map, children, user_id) do
+    relations =
+      %{}
+      |> put_annotation_bundle(children)
+      |> put_thread_bundle(room_id, children, user_id)
+
+    if relations == %{} do
+      event_map
+    else
+      unsigned = Map.put(event_map["unsigned"] || %{}, "m.relations", relations)
+      Map.put(event_map, "unsigned", unsigned)
+    end
+  end
+
+  defp put_annotation_bundle(relations, children) do
+    chunk =
+      children
+      |> Enum.filter(&(&1.rel_type == "m.annotation"))
+      |> Enum.group_by(fn c -> {c.type, get_in(c.content, ["m.relates_to", "key"])} end)
+      |> Enum.map(fn {{type, key}, events} -> %{"type" => type, "key" => key, "count" => length(events)} end)
+
+    if chunk == [], do: relations, else: Map.put(relations, "m.annotation", %{"chunk" => chunk})
+  end
+
+  defp put_thread_bundle(relations, room_id, children, user_id) do
+    case Enum.filter(children, &(&1.rel_type == "m.thread")) do
+      [] ->
+        relations
+
+      thread_events ->
+        latest = Enum.max_by(thread_events, & &1.stream_ordering)
+
+        latest_event_map = %{
+          "event_id" => latest.event_id,
+          "room_id" => room_id,
+          "sender" => latest.sender,
+          "type" => latest.type,
+          "content" => latest.content,
+          "origin_server_ts" => latest.origin_server_ts
+        }
+
+        Map.put(relations, "m.thread", %{
+          "latest_event" => latest_event_map,
+          "count" => length(thread_events),
+          "current_user_participated" => user_id != nil and Enum.any?(thread_events, &(&1.sender == user_id))
+        })
+    end
   end
 
   # ---------------------------------------------------------------------------
