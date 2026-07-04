@@ -3,7 +3,7 @@ defmodule AxonWeb.KeyController do
 
   action_fallback(AxonWeb.FallbackController)
 
-  alias AxonCrypto.{EventHash, KeyServer}
+  alias AxonCrypto.KeyServer
   alias AxonCore.{KeyStore, Repo, UserStore}
   alias AxonFederation.HttpClient
   import Ecto.Query
@@ -265,19 +265,16 @@ defmodule AxonWeb.KeyController do
         store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key)
         json(conn, %{})
 
-      # MSC3967: a request that leaves the master key untouched and is
-      # validly signed by the master key already on file doesn't need a
-      # fresh UIA challenge -- the signature itself proves the caller
-      # controls the identity. Without this, clients that upload the master
-      # key under one UIA challenge and then sign+upload self_signing_key /
-      # user_signing_key in a *separate* follow-up request (which is the
-      # normal flow for matrix-js-sdk / matrix-rust-sdk / Element) get stuck:
-      # that follow-up has no "auth" block, so it fell into the branch below
-      # and was rejected with a fresh 401, leaving the identity half-created
-      # (master key stored, self_signing/user_signing never uploaded).
-      is_nil(auth) and is_nil(master_key) and
-          signed_by_existing_master_key?(user_id, self_signing_key, user_signing_key) ->
-        store_cross_signing_keys(user_id, nil, self_signing_key, user_signing_key)
+      # MSC3967 (stable spec): UIA is skipped when either (a) the user has no
+      # existing master key yet -- first-time cross-signing setup, nothing to
+      # protect -- or (b) every key present in this request is byte-identical
+      # to what's already stored, i.e. a pure idempotent retry (the client's
+      # original 200 OK was lost in transit and it resent the same upload).
+      # If anything is new or different, UIA is still required -- this is a
+      # plain equality check against the DB, not a signature check, matching
+      # Synapse's implementation.
+      is_nil(auth) and uia_exempt?(user_id, master_key, self_signing_key, user_signing_key) ->
+        store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key)
         json(conn, %{})
 
       is_nil(auth) ->
@@ -315,38 +312,33 @@ defmodule AxonWeb.KeyController do
     end
   end
 
-  # Whether at least one of self_signing_key/user_signing_key was supplied,
-  # and every key supplied is validly signed by the master key already on
-  # file for user_id (there must already be one -- this never applies to
-  # first-time identity creation, which still requires normal UIA).
-  defp signed_by_existing_master_key?(_user_id, nil, nil), do: false
-
-  defp signed_by_existing_master_key?(user_id, self_signing_key, user_signing_key) do
+  # MSC3967 exemption check. No existing master key -> always exempt (nothing
+  # yet to protect). Otherwise exempt only if every key present in the
+  # request equals what's already on file for that key_type -- any new or
+  # changed key forces the normal UIA path.
+  defp uia_exempt?(user_id, master_key, self_signing_key, user_signing_key) do
     case KeyStore.cross_signing_keys([user_id], "master")[user_id] do
       nil ->
-        false
+        true
 
-      master_key_json ->
-        [self_signing_key, user_signing_key]
-        |> Enum.reject(&is_nil/1)
-        |> Enum.all?(&valid_master_signature?(user_id, master_key_json, &1))
+      existing_master ->
+        unchanged?(master_key, existing_master) and
+          unchanged?(
+            self_signing_key,
+            KeyStore.cross_signing_keys([user_id], "self_signing")[user_id]
+          ) and
+          unchanged?(
+            user_signing_key,
+            KeyStore.cross_signing_keys([user_id], "user_signing")[user_id]
+          )
     end
   end
 
-  defp valid_master_signature?(user_id, master_key_json, key_json) do
-    with {master_key_id, master_pubkey_b64} <- sole_key(master_key_json),
-         {:ok, master_pubkey} <- Base.decode64(master_pubkey_b64, padding: false) do
-      EventHash.verify_signature(key_json, user_id, master_key_id, master_pubkey) == :ok
-    else
-      _ -> false
-    end
-  end
-
-  defp sole_key(%{"keys" => keys}) when map_size(keys) == 1 do
-    keys |> Map.to_list() |> hd()
-  end
-
-  defp sole_key(_), do: :error
+  # A key omitted from the request (nil) never introduces a *new* key, so
+  # it's always "unchanged". Otherwise the uploaded key must exactly match
+  # what's already stored.
+  defp unchanged?(nil, _existing), do: true
+  defp unchanged?(uploaded, existing), do: uploaded == existing
 
   defp store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key) do
     # On key replacement (reset), purge stale signatures for this user so
@@ -718,7 +710,10 @@ defmodule AxonWeb.KeyController do
       is_nil(device_id) || is_nil(device_data) ->
         conn
         |> put_status(400)
-        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "device_id and device_data required"})
+        |> json(%{
+          "errcode" => "M_MISSING_PARAM",
+          "error" => "device_id and device_data required"
+        })
 
       is_nil(device_keys) ->
         conn
@@ -909,7 +904,13 @@ defmodule AxonWeb.KeyController do
   # so this cleanup stays in one place (also used by logout / device deletion).
   defp purge_device(user_id, device_id), do: KeyStore.purge_device(user_id, device_id)
 
-  defp respond_with_dehydrated_events(conn, device_id, since_token, limit_param, always_include_next_batch) do
+  defp respond_with_dehydrated_events(
+         conn,
+         device_id,
+         since_token,
+         limit_param,
+         always_include_next_batch
+       ) do
     user_id = conn.assigns.current_user_id
 
     case get_dehydrated_row(user_id) do
@@ -922,7 +923,10 @@ defmodule AxonWeb.KeyController do
         case parse_since(since_token) do
           {:ok, since_id} ->
             limit = parse_limit(limit_param)
-            {events, last_id, to_token} = fetch_dehydrated_events(user_id, device_id, since_id, limit)
+
+            {events, last_id, to_token} =
+              fetch_dehydrated_events(user_id, device_id, since_id, limit)
+
             limited = last_id != to_token
 
             body =

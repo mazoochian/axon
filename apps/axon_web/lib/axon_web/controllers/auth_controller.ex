@@ -69,7 +69,7 @@ defmodule AxonWeb.AuthController do
               opts = [
                 server_name: server_name(),
                 device_id: params["device_id"],
-                display_name: params["initial_device_display_name"]
+                display_name: username
               ]
 
               with {:ok, result} <- UserStore.register(String.downcase(username), password, opts) do
