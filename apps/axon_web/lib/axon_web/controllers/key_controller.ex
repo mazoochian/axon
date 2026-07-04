@@ -48,49 +48,10 @@ defmodule AxonWeb.KeyController do
     end
 
     # Store one-time keys — key_id is "algorithm:key_id", e.g. "curve25519:AAAA"
-    Enum.each(one_time_keys, fn {key_id, key_json} ->
-      algorithm = key_id |> String.split(":", parts: 2) |> hd()
-
-      Repo.insert_all(
-        "one_time_keys",
-        [
-          %{
-            user_id: user_id,
-            device_id: device_id,
-            algorithm: algorithm,
-            key_id: key_id,
-            key_json: key_json,
-            claimed: false,
-            inserted_at: DateTime.utc_now(:microsecond)
-          }
-        ],
-        on_conflict: :nothing
-      )
-    end)
+    store_one_time_keys(user_id, device_id, one_time_keys)
 
     # Store fallback keys (one per algorithm, keyed by "algorithm:key_id" format).
-    # Extract just the algorithm name ("signed_curve25519") from the full key id
-    # ("signed_curve25519:AAAAAAAAAAA") so the algorithm column stays correct and
-    # each new upload overwrites the previous fallback for that algorithm.
-    Enum.each(fallback_keys, fn {full_key_id, key_json} ->
-      algorithm = full_key_id |> String.split(":", parts: 2) |> hd()
-
-      Repo.insert_all(
-        "fallback_keys",
-        [
-          %{
-            user_id: user_id,
-            device_id: device_id,
-            algorithm: algorithm,
-            key_id: full_key_id,
-            key_json: key_json,
-            used: false
-          }
-        ],
-        on_conflict: {:replace, [:key_id, :key_json, :used]},
-        conflict_target: [:user_id, :device_id, :algorithm]
-      )
-    end)
+    store_fallback_keys(user_id, device_id, fallback_keys)
 
     # Count remaining OTKs per algorithm
     counts = count_otks(user_id, device_id)
@@ -677,6 +638,108 @@ defmodule AxonWeb.KeyController do
   end
 
   # ---------------------------------------------------------------------------
+  # Dehydrated devices (MSC3814) — lets a client stash an extra, SSSS-encrypted
+  # device server-side ahead of time so that when it's down to its last active
+  # device, key backup / secret storage setup ("Key Storage") can pull Megolm
+  # sessions from it instead of needing another logged-in device present.
+  # ---------------------------------------------------------------------------
+
+  # GET /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device
+  def get_dehydrated_device(conn, _params) do
+    user_id = conn.assigns.current_user_id
+
+    case get_dehydrated_row(user_id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "No dehydrated device available"})
+
+      row ->
+        json(conn, %{"device_id" => row.device_id, "device_data" => row.device_data})
+    end
+  end
+
+  # PUT /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device
+  def put_dehydrated_device(conn, params) do
+    user_id = conn.assigns.current_user_id
+    device_id = params["device_id"]
+    device_data = params["device_data"]
+    device_keys = params["device_keys"]
+
+    cond do
+      is_nil(device_id) || is_nil(device_data) ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "device_id and device_data required"})
+
+      is_nil(device_keys) ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_MISSING_PARAM",
+          "error" => "Device key(s) not found, these must be provided."
+        })
+
+      true ->
+        # Each user has at most one dehydrated device — replacing it discards the old one.
+        if old = get_dehydrated_row(user_id) do
+          purge_device(user_id, old.device_id)
+        end
+
+        UserStore.ensure_device(user_id, device_id, params["initial_device_display_name"])
+        upsert_device_keys(user_id, device_id, device_keys)
+        store_one_time_keys(user_id, device_id, params["one_time_keys"] || %{})
+        store_fallback_keys(user_id, device_id, params["fallback_keys"] || %{})
+        record_device_list_update(user_id)
+
+        Repo.insert_all(
+          "dehydrated_devices",
+          [
+            %{
+              user_id: user_id,
+              device_id: device_id,
+              device_data: device_data,
+              inserted_at: DateTime.utc_now(:microsecond),
+              updated_at: DateTime.utc_now(:microsecond)
+            }
+          ],
+          on_conflict: {:replace, [:device_id, :device_data, :updated_at]},
+          conflict_target: [:user_id]
+        )
+
+        json(conn, %{"device_id" => device_id})
+    end
+  end
+
+  # DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device
+  def delete_dehydrated_device(conn, _params) do
+    user_id = conn.assigns.current_user_id
+
+    case get_dehydrated_row(user_id) do
+      nil ->
+        conn
+        |> put_status(404)
+        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "No dehydrated device available"})
+
+      row ->
+        purge_device(user_id, row.device_id)
+        Repo.delete_all(from(d in "dehydrated_devices", where: d.user_id == ^user_id))
+        json(conn, %{"device_id" => row.device_id})
+    end
+  end
+
+  # GET /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/:device_id/events
+  def get_dehydrated_device_events(conn, %{"device_id" => device_id} = params) do
+    respond_with_dehydrated_events(conn, device_id, params["from"], params["limit"], false)
+  end
+
+  # POST .../dehydrated_device/:device_id/events — deprecated pre-final-MSC3814
+  # draft shape, kept only for older clients that still send it.
+  def post_dehydrated_device_events(conn, %{"device_id" => device_id} = params) do
+    respond_with_dehydrated_events(conn, device_id, params["next_batch"], params["limit"], true)
+  end
+
+  # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
@@ -738,4 +801,180 @@ defmodule AxonWeb.KeyController do
       )
     )
   end
+
+  defp store_one_time_keys(user_id, device_id, one_time_keys) do
+    Enum.each(one_time_keys, fn {key_id, key_json} ->
+      algorithm = key_id |> String.split(":", parts: 2) |> hd()
+
+      Repo.insert_all(
+        "one_time_keys",
+        [
+          %{
+            user_id: user_id,
+            device_id: device_id,
+            algorithm: algorithm,
+            key_id: key_id,
+            key_json: key_json,
+            claimed: false,
+            inserted_at: DateTime.utc_now(:microsecond)
+          }
+        ],
+        on_conflict: :nothing
+      )
+    end)
+  end
+
+  # Extracts just the algorithm name ("signed_curve25519") from the full key id
+  # ("signed_curve25519:AAAAAAAAAAA") so the algorithm column stays correct and
+  # each new upload overwrites the previous fallback for that algorithm.
+  defp store_fallback_keys(user_id, device_id, fallback_keys) do
+    Enum.each(fallback_keys, fn {full_key_id, key_json} ->
+      algorithm = full_key_id |> String.split(":", parts: 2) |> hd()
+
+      Repo.insert_all(
+        "fallback_keys",
+        [
+          %{
+            user_id: user_id,
+            device_id: device_id,
+            algorithm: algorithm,
+            key_id: full_key_id,
+            key_json: key_json,
+            used: false
+          }
+        ],
+        on_conflict: {:replace, [:key_id, :key_json, :used]},
+        conflict_target: [:user_id, :device_id, :algorithm]
+      )
+    end)
+  end
+
+  defp get_dehydrated_row(user_id) do
+    Repo.one(
+      from(d in "dehydrated_devices",
+        where: d.user_id == ^user_id,
+        select: %{device_id: d.device_id, device_data: d.device_data}
+      )
+    )
+  end
+
+  # Tears down everything tied to a superseded/removed dehydrated device: its
+  # device row, its keys, and any to-device messages already queued for it
+  # (nothing will ever rehydrate that device_id again, so nothing should keep
+  # addressing it).
+  defp purge_device(user_id, device_id) do
+    Repo.delete_all(from(d in "devices", where: d.user_id == ^user_id and d.device_id == ^device_id))
+
+    Repo.delete_all(
+      from(k in "device_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
+    )
+
+    Repo.delete_all(
+      from(k in "one_time_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
+    )
+
+    Repo.delete_all(
+      from(k in "fallback_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
+    )
+
+    Repo.delete_all(
+      from(m in "to_device_messages",
+        where: m.target_user_id == ^user_id and m.target_device_id == ^device_id
+      )
+    )
+  end
+
+  defp respond_with_dehydrated_events(conn, device_id, since_token, limit_param, always_include_next_batch) do
+    user_id = conn.assigns.current_user_id
+
+    case get_dehydrated_row(user_id) do
+      nil ->
+        conn
+        |> put_status(403)
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "No dehydrated device exists"})
+
+      %{device_id: ^device_id} ->
+        case parse_since(since_token) do
+          {:ok, since_id} ->
+            limit = parse_limit(limit_param)
+            {events, last_id, to_token} = fetch_dehydrated_events(user_id, device_id, since_id, limit)
+            limited = last_id != to_token
+
+            body =
+              if limited or always_include_next_batch do
+                %{"events" => events, "next_batch" => Integer.to_string(last_id)}
+              else
+                %{"events" => events}
+              end
+
+            json(conn, body)
+
+          :error ->
+            conn
+            |> put_status(400)
+            |> json(%{
+              "errcode" => "M_INVALID_PARAM",
+              "error" => "from parameter has an invalid format"
+            })
+        end
+
+      _other ->
+        conn
+        |> put_status(403)
+        |> json(%{
+          "errcode" => "M_FORBIDDEN",
+          "error" => "You may only fetch messages for your dehydrated device"
+        })
+    end
+  end
+
+  # Fetches to-device messages queued for the dehydrated device between
+  # `since_id` (exclusive) and a token snapshotted at the start of the call
+  # (inclusive), so a message arriving mid-scan is deferred to the next batch
+  # rather than racily included or dropped. Returns `to_token` as `last_id`
+  # whenever fewer than `limit` rows were found — meaning the scan reached the
+  # snapshot boundary — which signals "no more messages" even though no actual
+  # row carries that id.
+  defp fetch_dehydrated_events(user_id, device_id, since_id, limit) do
+    to_token = Repo.one(from(m in "to_device_messages", select: max(m.id))) || 0
+
+    rows =
+      Repo.all(
+        from(m in "to_device_messages",
+          where:
+            m.target_user_id == ^user_id and m.target_device_id == ^device_id and
+              m.id > ^since_id and m.id <= ^to_token,
+          order_by: [asc: m.id],
+          limit: ^limit,
+          select: %{id: m.id, sender: m.sender, type: m.type, content: m.content}
+        )
+      )
+
+    last_id = if length(rows) == limit, do: List.last(rows).id, else: to_token
+
+    events =
+      Enum.map(rows, fn r -> %{"type" => r.type, "sender" => r.sender, "content" => r.content} end)
+
+    {events, last_id, to_token}
+  end
+
+  defp parse_since(nil), do: {:ok, 0}
+
+  defp parse_since(token) do
+    case Integer.parse(token) do
+      {n, ""} -> {:ok, n}
+      _ -> :error
+    end
+  end
+
+  defp parse_limit(limit) when is_integer(limit) and limit > 0, do: limit
+
+  defp parse_limit(limit) when is_binary(limit) do
+    case Integer.parse(limit) do
+      {n, ""} when n > 0 -> n
+      _ -> 100
+    end
+  end
+
+  defp parse_limit(_), do: 100
 end
