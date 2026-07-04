@@ -2,21 +2,14 @@
 
 A Matrix homeserver written in Elixir/Erlang, targeting spec [v1.18](https://spec.matrix.org/v1.18/).
 
+> Disclaimer: This is an educational project for me. I am using this project as a chance to: 
+> - Learn the Matrix protocol 
+> - Learn to work with AI optimally for my normal worflows
+> - Learn Erlang/Elixir. 
+>
+> This is in no way a production-ready server. USE AT YOUR OWN RISK.
+
 Named after the neurological structure, Axon is designed to fix the fundamental runtime limitations of [Synapse](https://github.com/element-hq/synapse) (Python GIL, OS-level worker processes, Redis dependency) by using the BEAM runtime, where each Matrix room maps naturally to a GenServer process that owns its state in memory, serializes event application, and can be restarted from persistent storage on crash.
-
-## Status
-
-| Phase | Scope | Status |
-|---|---|---|
-| **Phase 1** — CS API | Auth, rooms, events, sync, filters, directory, E2EE keys | **Complete** |
-| **Phase 2** — Federation | State res v2, S2S API, room join/knock, restricted joins, cross-server E2EE, PDU fan-out | **Complete** — join, knock, and restricted-room (MSC3083) flows all work over federation; `/keys/query` and `/keys/claim` fall back to `/_matrix/federation/v1/user/keys/*` for remote users |
-| **Phase 3** — Full E2EE | Cross-signing, key backup, SSSS, device list sync, to-device delivery | **Complete** — user-scoped key backup, cross-signing UIA, device list change tracking, OTK counts in sync |
-| **Phase 4** — Media/Push | Upload/download, real thumbnails, push notifications, App Services | **Complete** — local filesystem media, ImageMagick-backed thumbnailing (cached on disk), Sygnal-compatible push delivery, AS skeleton with PubSub fanout |
-| **Phase 5** — Advanced | Spaces, threads, reactions, room upgrades | **Complete** |
-| **Phase 6** — OIDC | OAuth2/OIDC login (MSC3861) for Fractal and modern clients | **Complete** |
-| **Phase 7** — Presence & search | Presence tracking, room message search, content reporting, guest access | **Complete** — in-memory (ETS) presence with idle/offline auto-decay, Postgres full-text message search, `/report`, `m.room.guest_access` enforcement |
-
-Complement CS API pass rate: run `mix ecto.migrate` then the Complement suite below for current numbers — the last full run (pre-Phase 7) was 37/50, with all failures in areas Phase 7 now covers (media thumbnails, presence, search) plus a few not yet re-verified against Complement specifically (server notices are still unimplemented; see "Known gaps" below).
 
 ### Known gaps
 
@@ -64,28 +57,7 @@ axon_room  axon_federation  axon_sync
           axon_web          (depends on all above)
 ```
 
-### Supervision tree
-
-```
-AxonWeb.Application
-├── AxonCrypto.KeyServer          # Ed25519 signing keypair for this server
-├── Finch (Axon.Finch)            # HTTP client pool for outbound federation
-├── Task.Supervisor               # Async tasks (fan-out, snapshots)
-├── AxonWeb.FederationFanout      # Sends PDUs to remote servers on PubSub event
-├── AxonCore.Repo                 # PostgreSQL via Ecto
-├── AxonRoom.Registry             # Horde.Registry: room_id → pid
-├── AxonRoom.Supervisor           # Horde.DynamicSupervisor: per-room GenServers
-├── AxonRoom.TaskSupervisor       # Async room tasks (snapshots)
-├── AxonFederation.KeyCache       # ETS-backed cache of remote server signing keys
-├── AxonSync.Manager              # Long-poll sync connections
-├── Cluster.Supervisor            # libcluster node auto-discovery
-├── AxonWeb.Endpoint              # CS API — port 8008
-└── AxonWeb.FederationEndpoint    # S2S API — port 8448
-```
-
 ### Key design decisions
-
-**PostgreSQL over Cassandra**: Matrix state resolution requires recursive auth chain traversal (a single recursive CTE in Postgres; N serial round-trips in Cassandra). Atomic event + state updates also require cross-partition ACID, which Cassandra cannot provide. Postgres handles all Matrix query patterns natively and Ecto integration is first-class.
 
 **Event store is append-only**: `events` rows are never updated or deleted. `current_room_state` is a materialized view. `room_state_snapshots` are taken every 100 events to bound replay time on process restart.
 
