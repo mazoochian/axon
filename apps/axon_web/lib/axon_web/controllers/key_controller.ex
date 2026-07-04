@@ -453,7 +453,8 @@ defmodule AxonWeb.KeyController do
       |> put_status(400)
       |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "algorithm and auth_data required"})
     else
-      version = Integer.to_string(System.unique_integer([:positive, :monotonic]))
+      %{rows: [[version]]} = Repo.query!("SELECT nextval('room_key_backup_version_seq')")
+      version = Integer.to_string(version)
 
       Repo.insert_all("room_key_backup_versions", [
         %{
