@@ -287,7 +287,8 @@ defmodule AxonCore.UserStore do
     end
   end
 
-  defp ensure_device(user_id, device_id, display_name) do
+  @doc "Registers `device_id` for `user_id` if it doesn't already exist. Returns `{:ok, device}`."
+  def ensure_device(user_id, device_id, display_name) do
     case Repo.get_by(Device, user_id: user_id, device_id: device_id) do
       nil ->
         Repo.insert(%Device{

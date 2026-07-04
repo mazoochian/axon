@@ -365,6 +365,38 @@ defmodule AxonWeb.Router do
     put("/v3/room_keys/keys", KeyController, :put_backup_keys)
     get("/v3/room_keys/keys", KeyController, :get_backup_keys)
 
+    # Dehydrated devices (MSC3814) — server-side stash used to bootstrap
+    # "Key Storage" when the client has no other logged-in device to hand.
+    get(
+      "/unstable/org.matrix.msc3814.v1/dehydrated_device",
+      KeyController,
+      :get_dehydrated_device
+    )
+
+    put(
+      "/unstable/org.matrix.msc3814.v1/dehydrated_device",
+      KeyController,
+      :put_dehydrated_device
+    )
+
+    delete(
+      "/unstable/org.matrix.msc3814.v1/dehydrated_device",
+      KeyController,
+      :delete_dehydrated_device
+    )
+
+    get(
+      "/unstable/org.matrix.msc3814.v1/dehydrated_device/:device_id/events",
+      KeyController,
+      :get_dehydrated_device_events
+    )
+
+    post(
+      "/unstable/org.matrix.msc3814.v1/dehydrated_device/:device_id/events",
+      KeyController,
+      :post_dehydrated_device_events
+    )
+
     # User directory
     post("/v3/user_directory/search", UserDirectoryController, :search)
     post("/r0/user_directory/search", UserDirectoryController, :search)

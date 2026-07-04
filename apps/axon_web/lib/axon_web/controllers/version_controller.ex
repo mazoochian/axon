@@ -8,7 +8,9 @@ defmodule AxonWeb.VersionController do
         "v1.7", "v1.8", "v1.9", "v1.10", "v1.11", "v1.12",
         "v1.13", "v1.14", "v1.15", "v1.16", "v1.17", "v1.18"
       ],
-      "unstable_features" => %{}
+      "unstable_features" => %{
+        "org.matrix.msc3814" => true
+      }
     })
   end
 
