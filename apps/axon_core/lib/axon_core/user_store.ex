@@ -2,7 +2,7 @@ defmodule AxonCore.UserStore do
   @moduledoc "Registration, authentication, and profile management."
 
   import Ecto.Query
-  alias AxonCore.Repo
+  alias AxonCore.{KeyStore, Repo}
   alias AxonCore.Schema.{User, UserProfile, Device, AccessToken}
 
   @token_bytes 32
@@ -130,7 +130,7 @@ defmodule AxonCore.UserStore do
     end
   end
 
-  @doc "Invalidates a single token and deletes the associated device."
+  @doc "Invalidates a single token and deletes the associated device (and its key material)."
   def logout(raw_token) do
     hash = token_hash(raw_token)
 
@@ -149,9 +149,11 @@ defmodule AxonCore.UserStore do
           set: [valid: false]
         )
 
-        Repo.delete_all(
-          from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id)
-        )
+        # Purges device_keys/one_time_keys/fallback_keys too -- not just the
+        # `devices` row -- so a logged-out session's identity keys don't keep
+        # getting served by /keys/query forever.
+        KeyStore.purge_device(user_id, device_id)
+        KeyStore.record_device_list_update(user_id)
 
         :ok
     end

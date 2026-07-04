@@ -3,8 +3,8 @@ defmodule AxonWeb.KeyController do
 
   action_fallback(AxonWeb.FallbackController)
 
-  alias AxonCrypto.KeyServer
-  alias AxonCore.{EventStore, KeyStore, Repo, UserStore}
+  alias AxonCrypto.{EventHash, KeyServer}
+  alias AxonCore.{KeyStore, Repo, UserStore}
   alias AxonFederation.HttpClient
   import Ecto.Query
   require Logger
@@ -265,6 +265,21 @@ defmodule AxonWeb.KeyController do
         store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key)
         json(conn, %{})
 
+      # MSC3967: a request that leaves the master key untouched and is
+      # validly signed by the master key already on file doesn't need a
+      # fresh UIA challenge -- the signature itself proves the caller
+      # controls the identity. Without this, clients that upload the master
+      # key under one UIA challenge and then sign+upload self_signing_key /
+      # user_signing_key in a *separate* follow-up request (which is the
+      # normal flow for matrix-js-sdk / matrix-rust-sdk / Element) get stuck:
+      # that follow-up has no "auth" block, so it fell into the branch below
+      # and was rejected with a fresh 401, leaving the identity half-created
+      # (master key stored, self_signing/user_signing never uploaded).
+      is_nil(auth) and is_nil(master_key) and
+          signed_by_existing_master_key?(user_id, self_signing_key, user_signing_key) ->
+        store_cross_signing_keys(user_id, nil, self_signing_key, user_signing_key)
+        json(conn, %{})
+
       is_nil(auth) ->
         conn
         |> put_status(401)
@@ -299,6 +314,39 @@ defmodule AxonWeb.KeyController do
         })
     end
   end
+
+  # Whether at least one of self_signing_key/user_signing_key was supplied,
+  # and every key supplied is validly signed by the master key already on
+  # file for user_id (there must already be one -- this never applies to
+  # first-time identity creation, which still requires normal UIA).
+  defp signed_by_existing_master_key?(_user_id, nil, nil), do: false
+
+  defp signed_by_existing_master_key?(user_id, self_signing_key, user_signing_key) do
+    case KeyStore.cross_signing_keys([user_id], "master")[user_id] do
+      nil ->
+        false
+
+      master_key_json ->
+        [self_signing_key, user_signing_key]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.all?(&valid_master_signature?(user_id, master_key_json, &1))
+    end
+  end
+
+  defp valid_master_signature?(user_id, master_key_json, key_json) do
+    with {master_key_id, master_pubkey_b64} <- sole_key(master_key_json),
+         {:ok, master_pubkey} <- Base.decode64(master_pubkey_b64, padding: false) do
+      EventHash.verify_signature(key_json, user_id, master_key_id, master_pubkey) == :ok
+    else
+      _ -> false
+    end
+  end
+
+  defp sole_key(%{"keys" => keys}) when map_size(keys) == 1 do
+    keys |> Map.to_list() |> hd()
+  end
+
+  defp sole_key(_), do: :error
 
   defp store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key) do
     # On key replacement (reset), purge stale signatures for this user so
@@ -784,11 +832,7 @@ defmodule AxonWeb.KeyController do
     |> Enum.into(%{})
   end
 
-  defp record_device_list_update(user_id) do
-    # stream_ordering is recorded for informational purposes; queries use id (bigserial).
-    ordering = EventStore.current_max_stream_ordering()
-    Repo.insert_all("device_list_updates", [%{user_id: user_id, stream_ordering: ordering}])
-  end
+  defp record_device_list_update(user_id), do: KeyStore.record_device_list_update(user_id)
 
   defp shared_room_user_ids(user_id) do
     Repo.all(
@@ -861,28 +905,9 @@ defmodule AxonWeb.KeyController do
   # Tears down everything tied to a superseded/removed dehydrated device: its
   # device row, its keys, and any to-device messages already queued for it
   # (nothing will ever rehydrate that device_id again, so nothing should keep
-  # addressing it).
-  defp purge_device(user_id, device_id) do
-    Repo.delete_all(from(d in "devices", where: d.user_id == ^user_id and d.device_id == ^device_id))
-
-    Repo.delete_all(
-      from(k in "device_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
-    )
-
-    Repo.delete_all(
-      from(k in "one_time_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
-    )
-
-    Repo.delete_all(
-      from(k in "fallback_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
-    )
-
-    Repo.delete_all(
-      from(m in "to_device_messages",
-        where: m.target_user_id == ^user_id and m.target_device_id == ^device_id
-      )
-    )
-  end
+  # addressing it). Delegates to the shared AxonCore.KeyStore.purge_device/2
+  # so this cleanup stays in one place (also used by logout / device deletion).
+  defp purge_device(user_id, device_id), do: KeyStore.purge_device(user_id, device_id)
 
   defp respond_with_dehydrated_events(conn, device_id, since_token, limit_param, always_include_next_batch) do
     user_id = conn.assigns.current_user_id

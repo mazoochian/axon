@@ -4,6 +4,13 @@ defmodule AxonCrypto.KeyServer do
 
   On start it generates (or loads from config) the server's signing key.
   All event signing goes through this process.
+
+  TODO: `init/1` currently always generates a fresh keypair in memory and
+  never persists or reloads it — the server's signing identity changes on
+  every restart. This invalidates cached `/_matrix/key/v2/server` responses
+  and any signatures other servers verified against the old key. Fix by
+  persisting the keypair (DB or config-supplied) and loading it here if
+  present instead of unconditionally calling generate_keypair/0.
   """
 
   use GenServer
