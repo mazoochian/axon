@@ -126,9 +126,23 @@ defmodule AxonWeb.Plug.FederationAuth do
     # Attempt to read the cached raw body (set by Plug.Parsers with cache_body)
     case conn.assigns[:raw_body] do
       nil ->
-        # Fall back to reading from body params if already parsed
+        # Fall back to reading from body params if already parsed. Plug.Parsers
+        # resolves body_params to `%{}` for EVERY request that passes through
+        # it — including bodyless GETs — never leaving it genuinely Unfetched
+        # by the time this plug runs. So `body_params == %{}` is ambiguous:
+        # it means either "no body was sent at all" (a GET) or "a body was
+        # sent and it happened to be the empty JSON object `{}`" (a POST/PUT
+        # with an intentionally empty payload) — and per spec those sign
+        # differently: "content" is omitted from the signable entirely when
+        # there's no body, but included (as {}) when there genuinely is one.
+        # A request that actually carried a body always sent a content-type
+        # header for it; one that didn't, never does — use that as the
+        # disambiguator rather than trusting body_params' emptiness alone.
+        has_content_type? = get_req_header(conn, "content-type") != []
+
         case conn.body_params do
           %Plug.Conn.Unfetched{} -> ""
+          params when map_size(params) == 0 and not has_content_type? -> ""
           params -> Jason.encode!(params)
         end
 

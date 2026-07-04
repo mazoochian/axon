@@ -118,8 +118,9 @@ defmodule AxonCrypto.KeyServer do
     {:reply, signed, state}
   end
 
-  # Generates a new Ed25519 keypair. Returns {key_id, public_key_bytes, private_key_bytes}.
-  defp generate_keypair do
+  @doc "Generates a new Ed25519 keypair. Returns {key_id, public_key_bytes, private_key_bytes}."
+  @spec generate_keypair() :: {String.t(), binary(), binary()}
+  def generate_keypair do
     {public_key, private_key} = :crypto.generate_key(:eddsa, :ed25519)
     key_id = "ed25519:" <> (Base.url_encode64(public_key, padding: false) |> binary_part(0, 6))
     {key_id, public_key, private_key}

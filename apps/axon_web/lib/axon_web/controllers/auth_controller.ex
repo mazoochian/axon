@@ -1,7 +1,7 @@
 defmodule AxonWeb.AuthController do
   use Phoenix.Controller, formats: [:json]
 
-  action_fallback AxonWeb.FallbackController
+  action_fallback(AxonWeb.FallbackController)
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{UserStore, Repo}
@@ -9,7 +9,10 @@ defmodule AxonWeb.AuthController do
   # POST /_matrix/client/v3/register
   def register(conn, params) do
     if AxonWeb.Oidc.enabled?() do
-      oidc_disabled_response(conn, "Registration is handled by the configured Authorization Server")
+      oidc_disabled_response(
+        conn,
+        "Registration is handled by the configured Authorization Server"
+      )
     else
       do_register(conn, params)
     end
@@ -21,8 +24,11 @@ defmodule AxonWeb.AuthController do
     if kind == "guest" do
       localpart = "guest_#{:crypto.strong_rand_bytes(6) |> Base.url_encode64(padding: false)}"
 
-      with {:ok, result} <- UserStore.register(localpart, nil, server_name: server_name()) do
-        conn |> put_status(200) |> json(%{
+      with {:ok, result} <-
+             UserStore.register(localpart, nil, server_name: server_name(), is_guest: true) do
+        conn
+        |> put_status(200)
+        |> json(%{
           "user_id" => result.user_id,
           "access_token" => result.access_token,
           "device_id" => result.device_id
@@ -33,24 +39,32 @@ defmodule AxonWeb.AuthController do
       password = params["password"]
 
       if username && !valid_localpart?(username) do
-        conn |> put_status(400) |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
       else
         user_id = username && "@#{String.downcase(username)}:#{server_name()}"
 
         if user_id && user_exists?(user_id) do
-          conn |> put_status(400) |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
+          conn
+          |> put_status(400)
+          |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
         else
           auth = params["auth"]
 
           if is_nil(auth) do
-            conn |> put_status(401) |> json(%{
+            conn
+            |> put_status(401)
+            |> json(%{
               "flows" => [%{"stages" => ["m.login.dummy"]}],
               "session" => gen_session(),
               "params" => %{}
             })
           else
             unless username do
-              conn |> put_status(400) |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
+              conn
+              |> put_status(400)
+              |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
             else
               opts = [
                 server_name: server_name(),
@@ -59,7 +73,9 @@ defmodule AxonWeb.AuthController do
               ]
 
               with {:ok, result} <- UserStore.register(String.downcase(username), password, opts) do
-                conn |> put_status(200) |> json(%{
+                conn
+                |> put_status(200)
+                |> json(%{
                   "user_id" => result.user_id,
                   "access_token" => result.access_token,
                   "device_id" => result.device_id
@@ -78,13 +94,19 @@ defmodule AxonWeb.AuthController do
 
     cond do
       is_nil(username) ->
-        conn |> put_status(400) |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
 
       !valid_localpart?(username) ->
-        conn |> put_status(400) |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
 
       user_exists?("@#{String.downcase(username)}:#{server_name()}") ->
-        conn |> put_status(400) |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
 
       true ->
         json(conn, %{"available" => true})
@@ -93,16 +115,31 @@ defmodule AxonWeb.AuthController do
 
   # POST /_matrix/client/v3/account/password
   def change_password(conn, params) do
+    if AxonWeb.Oidc.enabled?() do
+      oidc_disabled_response(
+        conn,
+        "Password is managed by the configured Authorization Server"
+      )
+    else
+      do_change_password(conn, params)
+    end
+  end
+
+  defp do_change_password(conn, params) do
     user_id = conn.assigns.current_user_id
     new_password = params["new_password"]
     auth = params["auth"]
     logout_devices = Map.get(params, "logout_devices", true)
 
     if is_nil(new_password) do
-      conn |> put_status(400) |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "new_password required"})
+      conn
+      |> put_status(400)
+      |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "new_password required"})
     else
       if is_nil(auth) do
-        conn |> put_status(401) |> json(%{
+        conn
+        |> put_status(401)
+        |> json(%{
           "session" => gen_session(),
           "flows" => [%{"stages" => ["m.login.password"]}],
           "params" => %{}
@@ -110,11 +147,17 @@ defmodule AxonWeb.AuthController do
       else
         if validate_ui_auth(user_id, auth) == :ok do
           new_hash = Argon2.hash_pwd_salt(new_password)
-          Repo.update_all(from(u in "users", where: u.user_id == ^user_id), set: [password_hash: new_hash])
+
+          Repo.update_all(from(u in "users", where: u.user_id == ^user_id),
+            set: [password_hash: new_hash]
+          )
+
           if logout_devices, do: UserStore.logout_all(user_id, conn.assigns.current_token)
           json(conn, %{})
         else
-          conn |> put_status(401) |> json(%{
+          conn
+          |> put_status(401)
+          |> json(%{
             "session" => gen_session(),
             "flows" => [%{"stages" => ["m.login.password"]}],
             "params" => %{},
@@ -127,31 +170,49 @@ defmodule AxonWeb.AuthController do
   end
 
   # POST /_matrix/client/v3/account/deactivate
+  # Requires User-Interactive Authentication — bypassed when delegated OIDC
+  # auth (MSC3861) is enabled, since a valid, currently-active
+  # Authorization-Server-issued token is proof enough.
   def deactivate(conn, params) do
     user_id = conn.assigns.current_user_id
     auth = params["auth"]
 
-    if is_nil(auth) do
-      conn |> put_status(401) |> json(%{
-        "session" => gen_session(),
-        "flows" => [%{"stages" => ["m.login.password"]}],
-        "params" => %{}
-      })
-    else
-      if validate_ui_auth(user_id, auth) == :ok do
-        Repo.update_all(from(u in "users", where: u.user_id == ^user_id), set: [deactivated: true])
-        UserStore.logout_all(user_id)
-        json(conn, %{"id_server_unbind_result" => "success"})
-      else
-        conn |> put_status(401) |> json(%{
+    cond do
+      AxonWeb.Oidc.enabled?() ->
+        do_deactivate(conn, user_id)
+
+      is_nil(auth) ->
+        conn
+        |> put_status(401)
+        |> json(%{
+          "session" => gen_session(),
+          "flows" => [%{"stages" => ["m.login.password"]}],
+          "params" => %{}
+        })
+
+      validate_ui_auth(user_id, auth) == :ok ->
+        do_deactivate(conn, user_id)
+
+      true ->
+        conn
+        |> put_status(401)
+        |> json(%{
           "session" => gen_session(),
           "flows" => [%{"stages" => ["m.login.password"]}],
           "params" => %{},
           "errcode" => "M_FORBIDDEN",
           "error" => "Invalid credentials"
         })
-      end
     end
+  end
+
+  defp do_deactivate(conn, user_id) do
+    Repo.update_all(from(u in "users", where: u.user_id == ^user_id),
+      set: [deactivated: true]
+    )
+
+    UserStore.logout_all(user_id)
+    json(conn, %{"id_server_unbind_result" => "success"})
   end
 
   @synapse_shared_secret "complement"
@@ -172,13 +233,16 @@ defmodule AxonWeb.AuthController do
 
     cond do
       is_nil(username) || !valid_localpart?(username) ->
-        conn |> put_status(400) |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
 
       mac != compute_synapse_mac(nonce, username, password, is_admin) ->
         conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Invalid MAC"})
 
       true ->
         opts = [server_name: server_name()]
+
         case UserStore.register(String.downcase(username), password, opts) do
           {:ok, result} ->
             json(conn, %{
@@ -189,10 +253,14 @@ defmodule AxonWeb.AuthController do
             })
 
           {:error, :user_in_use} ->
-            conn |> put_status(400) |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
+            conn
+            |> put_status(400)
+            |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
 
           {:error, _} ->
-            conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
+            conn
+            |> put_status(500)
+            |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
         end
     end
   end
@@ -216,7 +284,9 @@ defmodule AxonWeb.AuthController do
         password = params["password"]
 
         unless user && password do
-          conn |> put_status(400) |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user and password required"})
+          conn
+          |> put_status(400)
+          |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user and password required"})
         else
           opts = [
             server_name: server_name(),
@@ -276,7 +346,7 @@ defmodule AxonWeb.AuthController do
   defp valid_localpart?(localpart), do: Regex.match?(~r/^[a-z0-9._\-=\/]+$/i, localpart)
 
   defp user_exists?(user_id) do
-    Repo.one(from u in "users", where: u.user_id == ^user_id, select: u.user_id) != nil
+    Repo.one(from(u in "users", where: u.user_id == ^user_id, select: u.user_id)) != nil
   end
 
   defp gen_session, do: :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)

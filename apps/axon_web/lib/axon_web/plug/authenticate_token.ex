@@ -20,6 +20,8 @@ defmodule AxonWeb.Plug.AuthenticateToken do
       raw_token ->
         case UserStore.validate_token(raw_token) do
           {:ok, {user_id, device_id}} ->
+            AxonSync.Presence.bump_activity(user_id)
+
             conn
             |> assign(:current_user_id, user_id)
             |> assign(:current_device_id, device_id)
@@ -31,6 +33,8 @@ defmodule AxonWeb.Plug.AuthenticateToken do
             # Authorization Server; validate via introspection.
             case AxonWeb.Oidc.enabled?() and AxonWeb.Oidc.introspect(raw_token) do
               {:ok, {user_id, device_id}} ->
+                AxonSync.Presence.bump_activity(user_id)
+
                 conn
                 |> assign(:current_user_id, user_id)
                 |> assign(:current_device_id, device_id)

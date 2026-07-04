@@ -47,7 +47,7 @@ defmodule AxonWeb.VersionController do
   def capabilities(conn, _params) do
     json(conn, %{
       "capabilities" => %{
-        "m.change_password" => %{"enabled" => true},
+        "m.change_password" => %{"enabled" => not AxonWeb.Oidc.enabled?()},
         "m.room_versions" => %{
           "default" => "11",
           "available" => %{

@@ -8,8 +8,7 @@ defmodule AxonPush.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: AxonPush.Worker.start_link(arg)
-      # {AxonPush.Worker, arg}
+      {Task.Supervisor, name: AxonPush.TaskSupervisor}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

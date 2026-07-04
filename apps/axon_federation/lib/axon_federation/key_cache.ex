@@ -39,6 +39,13 @@ defmodule AxonFederation.KeyCache do
     end
   end
 
+  @doc "Clears all cached keys. For test isolation between fake remote servers."
+  @spec clear() :: :ok
+  def clear do
+    :ets.delete_all_objects(@table)
+    :ok
+  end
+
   # GenServer callbacks
 
   @impl true
@@ -89,25 +96,7 @@ defmodule AxonFederation.KeyCache do
   end
 
   defp resolve_key_url(server_name) do
-    # Try /.well-known/matrix/server first, fall back to :8448
-    case fetch_well_known(server_name) do
-      {:ok, host} -> "https://#{host}/_matrix/key/v2/server"
-      :error -> "https://#{server_name}:8448/_matrix/key/v2/server"
-    end
-  end
-
-  defp fetch_well_known(server_name) do
-    url = "https://#{server_name}/.well-known/matrix/server"
-
-    case do_get(url) do
-      {:ok, body} ->
-        case Jason.decode(body) do
-          {:ok, %{"m.server" => host}} -> {:ok, host}
-          _ -> :error
-        end
-
-      _ -> :error
-    end
+    AxonFederation.ServerResolver.resolve(server_name) <> "/_matrix/key/v2/server"
   end
 
   defp do_get(url) do

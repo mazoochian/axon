@@ -16,12 +16,15 @@ defmodule AxonWeb.Phase4Test do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -74,7 +77,8 @@ defmodule AxonWeb.Phase4Test do
 
     test "download a locally uploaded file" do
       user = register("media_dl_#{System.unique_integer([:positive])}")
-      data = <<0, 1, 2, 3, 4, 5>>  # some binary
+      # some binary
+      data = <<0, 1, 2, 3, 4, 5>>
 
       upload_conn =
         authed(user.token)
@@ -95,9 +99,15 @@ defmodule AxonWeb.Phase4Test do
       assert hd(get_resp_header(dl_conn, "content-type")) =~ "application/octet-stream"
     end
 
-    test "thumbnail request serves the original file" do
+    test "thumbnail request generates a resized image" do
       user = register("media_thumb_#{System.unique_integer([:positive])}")
-      data = "fake image bytes"
+
+      source_path =
+        Path.join(System.tmp_dir!(), "axon_test_thumb_#{System.unique_integer([:positive])}.jpg")
+
+      {_, 0} = System.cmd("convert", ["-size", "200x200", "xc:blue", source_path])
+      data = File.read!(source_path)
+      File.rm(source_path)
 
       upload_conn =
         authed(user.token)
@@ -110,7 +120,34 @@ defmodule AxonWeb.Phase4Test do
 
       thumb_conn =
         build_conn()
-        |> get("/_matrix/media/v3/thumbnail/localhost/#{media_id}?width=64&height=64&method=scale")
+        |> get(
+          "/_matrix/media/v3/thumbnail/localhost/#{media_id}?width=64&height=64&method=scale"
+        )
+
+      assert thumb_conn.status == 200
+      assert hd(get_resp_header(thumb_conn, "content-type")) =~ "image/jpeg"
+      # A real, distinct (resized) image comes back — not a passthrough of the original.
+      assert thumb_conn.resp_body != data
+    end
+
+    test "thumbnail request for a non-image falls back to the original file" do
+      user = register("media_thumb_nonimage_#{System.unique_integer([:positive])}")
+      data = "not an image"
+
+      upload_conn =
+        authed(user.token)
+        |> put_req_header("content-type", "application/octet-stream")
+        |> post("/_matrix/client/v3/media/upload", data)
+
+      assert upload_conn.status == 200
+      mxc_uri = decode(upload_conn)["content_uri"]
+      ["mxc:", "", _server, media_id] = String.split(mxc_uri, "/")
+
+      thumb_conn =
+        build_conn()
+        |> get(
+          "/_matrix/media/v3/thumbnail/localhost/#{media_id}?width=64&height=64&method=scale"
+        )
 
       assert thumb_conn.status == 200
       assert thumb_conn.resp_body == data
@@ -161,7 +198,10 @@ defmodule AxonWeb.Phase4Test do
           "device_display_name" => "My Phone",
           "pushkey" => "https://push.example.com/notify/abc123",
           "lang" => "en",
-          "data" => %{"url" => "https://push.example.com/_matrix/push/v1/notify", "format" => "event_id_only"}
+          "data" => %{
+            "url" => "https://push.example.com/_matrix/push/v1/notify",
+            "format" => "event_id_only"
+          }
         })
 
       assert set_conn.status == 200
@@ -182,16 +222,24 @@ defmodule AxonWeb.Phase4Test do
 
       authed(user.token)
       |> jp("/_matrix/client/v3/pushers/set", %{
-        "kind" => "http", "app_id" => "com.example", "app_display_name" => "v1",
-        "device_display_name" => "Phone", "pushkey" => pushkey, "lang" => "en",
+        "kind" => "http",
+        "app_id" => "com.example",
+        "app_display_name" => "v1",
+        "device_display_name" => "Phone",
+        "pushkey" => pushkey,
+        "lang" => "en",
         "data" => %{"url" => "https://push.example.com/v1"}
       })
       |> then(fn c -> assert c.status == 200 end)
 
       authed(user.token)
       |> jp("/_matrix/client/v3/pushers/set", %{
-        "kind" => "http", "app_id" => "com.example", "app_display_name" => "v2",
-        "device_display_name" => "Phone", "pushkey" => pushkey, "lang" => "fr",
+        "kind" => "http",
+        "app_id" => "com.example",
+        "app_display_name" => "v2",
+        "device_display_name" => "Phone",
+        "pushkey" => pushkey,
+        "lang" => "fr",
         "data" => %{"url" => "https://push.example.com/v2"}
       })
       |> then(fn c -> assert c.status == 200 end)
@@ -209,8 +257,12 @@ defmodule AxonWeb.Phase4Test do
 
       authed(user.token)
       |> jp("/_matrix/client/v3/pushers/set", %{
-        "kind" => "http", "app_id" => "com.example.del", "app_display_name" => "App",
-        "device_display_name" => "Phone", "pushkey" => pushkey, "lang" => "en",
+        "kind" => "http",
+        "app_id" => "com.example.del",
+        "app_display_name" => "App",
+        "device_display_name" => "Phone",
+        "pushkey" => pushkey,
+        "lang" => "en",
         "data" => %{"url" => "https://push.example.com/notify"}
       })
       |> then(fn c -> assert c.status == 200 end)
@@ -243,6 +295,7 @@ defmodule AxonWeb.Phase4Test do
         "sender" => "@alice:localhost",
         "content" => %{"msgtype" => "m.text", "body" => "hello"}
       }
+
       # room_id here won't match a real room, so member_count query returns 0
       # but the plain message underride rule has no room_member_count condition
       result = RuleEvaluator.should_notify?(event, "!fake:localhost", "@bob:localhost", rules)
@@ -255,7 +308,15 @@ defmodule AxonWeb.Phase4Test do
         "sender" => "@bot:localhost",
         "content" => %{"msgtype" => "m.notice", "body" => "automated notice"}
       }
-      result = RuleEvaluator.should_notify?(event, "!fake:localhost", "@bob:localhost", AxonPush.DefaultRules.rules())
+
+      result =
+        RuleEvaluator.should_notify?(
+          event,
+          "!fake:localhost",
+          "@bob:localhost",
+          AxonPush.DefaultRules.rules()
+        )
+
       assert result == :dont_notify
     end
 
@@ -266,15 +327,25 @@ defmodule AxonWeb.Phase4Test do
       # Set a display name
       authed(user.token)
       |> put_req_header("content-type", "application/json")
-      |> put("/_matrix/client/v3/profile/#{user.user_id}/displayname",
-         Jason.encode!(%{"displayname" => "TestUser"}))
+      |> put(
+        "/_matrix/client/v3/profile/#{user.user_id}/displayname",
+        Jason.encode!(%{"displayname" => "TestUser"})
+      )
 
       event = %{
         "type" => "m.room.message",
         "sender" => "@alice:localhost",
         "content" => %{"msgtype" => "m.text", "body" => "Hey TestUser how are you?"}
       }
-      result = RuleEvaluator.should_notify?(event, "!fake:localhost", user.user_id, AxonPush.DefaultRules.rules())
+
+      result =
+        RuleEvaluator.should_notify?(
+          event,
+          "!fake:localhost",
+          user.user_id,
+          AxonPush.DefaultRules.rules()
+        )
+
       assert match?({:notify, actions} when is_list(actions), result)
     end
 
@@ -285,7 +356,15 @@ defmodule AxonWeb.Phase4Test do
         "sender" => "@alice:localhost",
         "content" => %{"msgtype" => "m.text", "body" => "hello"}
       }
-      result = RuleEvaluator.should_notify?(event, "!fake:localhost", "@bob:localhost", AxonPush.DefaultRules.rules())
+
+      result =
+        RuleEvaluator.should_notify?(
+          event,
+          "!fake:localhost",
+          "@bob:localhost",
+          AxonPush.DefaultRules.rules()
+        )
+
       # Should still notify because master rule is disabled
       assert match?({:notify, _}, result)
     end
@@ -300,8 +379,10 @@ defmodule AxonWeb.Phase4Test do
       conn =
         build_conn()
         |> put_req_header("content-type", "application/json")
-        |> put("/_matrix/app/v1/transactions/txn1?access_token=invalid_token",
-           Jason.encode!(%{"events" => []}))
+        |> put(
+          "/_matrix/app/v1/transactions/txn1?access_token=invalid_token",
+          Jason.encode!(%{"events" => []})
+        )
 
       assert conn.status == 403
       assert decode(conn)["errcode"] == "M_FORBIDDEN"

@@ -3,7 +3,7 @@ defmodule AxonWeb.MediaController do
 
   require Logger
 
-  alias AxonMedia.Store
+  alias AxonMedia.{Store, Thumbnailer}
 
   # POST /_matrix/media/v3/upload  (also /_matrix/client/v3/media/upload)
   def upload(conn, params) do
@@ -31,6 +31,7 @@ defmodule AxonWeb.MediaController do
 
           {:error, reason} ->
             Logger.error("Media upload failed: #{inspect(reason)}")
+
             conn
             |> put_status(500)
             |> json(%{"errcode" => "M_UNKNOWN", "error" => "Upload failed"})
@@ -48,6 +49,7 @@ defmodule AxonWeb.MediaController do
 
       {:error, reason} ->
         Logger.error("Body read error: #{inspect(reason)}")
+
         conn
         |> put_status(500)
         |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to read body"})
@@ -66,13 +68,12 @@ defmodule AxonWeb.MediaController do
     end
   end
 
-  # GET /_matrix/media/v3/thumbnail/:server_name/:media_id
-  # For Phase 4, return the original file (no resize).
-  def thumbnail(conn, %{"server_name" => origin_server, "media_id" => media_id} = _params) do
+  # GET /_matrix/media/v3/thumbnail/:server_name/:media_id?width=&height=&method=
+  def thumbnail(conn, %{"server_name" => origin_server, "media_id" => media_id} = params) do
     if origin_server == Application.fetch_env!(:axon_web, :server_name) do
-      serve_local(conn, media_id)
+      serve_local_thumbnail(conn, media_id, params)
     else
-      proxy_remote(conn, origin_server, media_id)
+      proxy_remote_thumbnail(conn, origin_server, media_id, params)
     end
   end
 
@@ -102,9 +103,57 @@ defmodule AxonWeb.MediaController do
     end
   end
 
+  defp serve_local_thumbnail(conn, media_id, params) do
+    case Store.get_meta(media_id) do
+      %{content_type: content_type, storage_path: path} when is_binary(path) ->
+        case Thumbnailer.generate(
+               media_id,
+               path,
+               content_type,
+               params["width"],
+               params["height"],
+               params["method"]
+             ) do
+          {:ok, {ct, data}} ->
+            conn
+            |> put_resp_content_type(ct)
+            |> put_resp_header("content-disposition", "inline")
+            |> send_resp(200, data)
+
+          {:error, :unsupported_content_type} ->
+            # Not a thumbnailable image (e.g. a PDF) — fall back to the original.
+            serve_local(conn, media_id)
+
+          {:error, reason} ->
+            Logger.error("Thumbnail generation failed for #{media_id}: #{inspect(reason)}")
+
+            conn
+            |> put_status(500)
+            |> json(%{"errcode" => "M_UNKNOWN", "error" => "Thumbnail generation failed"})
+        end
+
+      _ ->
+        conn
+        |> put_status(404)
+        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+    end
+  end
+
   defp proxy_remote(conn, origin_server, media_id) do
     url = "https://#{origin_server}/_matrix/media/v3/download/#{origin_server}/#{media_id}"
+    proxy_get(conn, url)
+  end
 
+  defp proxy_remote_thumbnail(conn, origin_server, media_id, params) do
+    query = URI.encode_query(Map.take(params, ["width", "height", "method", "animated"]))
+
+    url =
+      "https://#{origin_server}/_matrix/media/v3/thumbnail/#{origin_server}/#{media_id}?#{query}"
+
+    proxy_get(conn, url)
+  end
+
+  defp proxy_get(conn, url) do
     req = Finch.build(:get, url)
 
     case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do
@@ -128,6 +177,7 @@ defmodule AxonWeb.MediaController do
 
       {:error, reason} ->
         Logger.warning("Remote media fetch failed for #{url}: #{inspect(reason)}")
+
         conn
         |> put_status(502)
         |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to fetch remote media"})

@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     libncurses6 \
     locales \
+    imagemagick \
     && rm -rf /var/lib/apt/lists/*
 
 RUN sed -i 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen

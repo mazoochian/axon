@@ -27,7 +27,9 @@ defmodule AxonFederation.RoomJoin do
 
     Enum.find_value(via_servers, {:error, :all_servers_failed}, fn server ->
       case try_join(room_id, user_id, server, version_query) do
-        {:ok, result} -> {:ok, result}
+        {:ok, result} ->
+          {:ok, result}
+
         {:error, reason} ->
           Logger.warning("Federation join via #{server} failed: #{inspect(reason)}")
           false
@@ -36,7 +38,8 @@ defmodule AxonFederation.RoomJoin do
   end
 
   defp try_join(room_id, user_id, server, version_query) do
-    path = "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(user_id)}?#{version_query}"
+    path =
+      "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(user_id)}?#{version_query}"
 
     with {:ok, make_join_resp} <- HttpClient.get(server, path),
          {:ok, template, room_version} <- extract_template(make_join_resp),
@@ -50,16 +53,20 @@ defmodule AxonFederation.RoomJoin do
   defp extract_template(%{"event" => template, "room_version" => version}) do
     {:ok, template, version}
   end
+
   defp extract_template(%{"event" => template}), do: {:ok, template, "11"}
   defp extract_template(_), do: {:error, :invalid_make_join_response}
 
   defp build_and_sign_join(template, user_id) do
-    # Fill in required fields that we control
+    # Fill in required fields that we control. The resident server's
+    # make_join response may already carry extra content — e.g.
+    # join_authorised_via_users_server for a restricted-room join it
+    # vouched for — which must survive into the signed event.
     join_event =
       template
       |> Map.put("sender", user_id)
       |> Map.put("state_key", user_id)
-      |> Map.put("content", %{"membership" => "join"})
+      |> Map.update("content", %{"membership" => "join"}, &Map.put(&1, "membership", "join"))
       |> Map.put("origin", KeyServer.server_name())
       |> Map.put("origin_server_ts", System.os_time(:millisecond))
 
@@ -86,23 +93,34 @@ defmodule AxonFederation.RoomJoin do
     auth_chain = resp["auth_chain"] || []
 
     # Create or verify room exists locally
-    Repo.insert_all("rooms", [
-      %{
-        room_id: room_id,
-        version: room_version,
-        creator: join_event["sender"],
-        is_public: false,
-        created_at: DateTime.utc_now(:microsecond)
-      }
-    ], on_conflict: :nothing)
+    now = DateTime.utc_now(:microsecond)
+
+    Repo.insert_all(
+      "rooms",
+      [
+        %{
+          room_id: room_id,
+          version: room_version,
+          creator: join_event["sender"],
+          is_public: false,
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
+      on_conflict: :nothing
+    )
 
     # Store all auth chain events first (they are referenced by state events)
     all_events = (auth_chain ++ state_events) |> Enum.uniq_by(& &1["event_id"])
 
     Enum.each(all_events, fn event ->
       case EventStore.insert_event(event, room_version) do
-        {:ok, _} -> :ok
-        {:error, :already_exists} -> :ok
+        {:ok, _} ->
+          :ok
+
+        {:error, :already_exists} ->
+          :ok
+
         {:error, reason} ->
           Logger.warning("Failed to insert event #{event["event_id"]}: #{inspect(reason)}")
       end
@@ -110,8 +128,12 @@ defmodule AxonFederation.RoomJoin do
 
     # Store the join event itself
     case EventStore.insert_event(join_event, room_version) do
-      {:ok, _} -> :ok
-      {:error, :already_exists} -> :ok
+      {:ok, _} ->
+        :ok
+
+      {:error, :already_exists} ->
+        :ok
+
       {:error, reason} ->
         Logger.warning("Failed to insert join event: #{inspect(reason)}")
     end

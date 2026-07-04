@@ -28,7 +28,7 @@ defmodule AxonWeb.ProfileController do
       conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot set another user's profile"})
     else
       with {:ok, _} <- UserStore.update_profile(user_id, %{displayname: displayname}) do
-        Task.start(fn -> propagate_profile_to_rooms(user_id) end)
+        Task.Supervisor.start_child(Axon.TaskSupervisor, fn -> propagate_profile_to_rooms(user_id) end)
         json(conn, %{})
       end
     end
@@ -49,7 +49,7 @@ defmodule AxonWeb.ProfileController do
       conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot set another user's profile"})
     else
       with {:ok, _} <- UserStore.update_profile(user_id, %{avatar_url: avatar_url}) do
-        Task.start(fn -> propagate_profile_to_rooms(user_id) end)
+        Task.Supervisor.start_child(Axon.TaskSupervisor, fn -> propagate_profile_to_rooms(user_id) end)
         json(conn, %{})
       end
     end

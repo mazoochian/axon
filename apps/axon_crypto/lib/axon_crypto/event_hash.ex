@@ -7,6 +7,18 @@ defmodule AxonCrypto.EventHash do
 
   alias AxonCrypto.CanonicalJSON
 
+  # "event_id" is never part of any of these hashable/signable computations:
+  # for room versions 3+ it isn't a real event field at all (it's derived —
+  # see reference_hash/1 below), and even where a caller's event map happens
+  # to already carry one (e.g. AxonCore.EventStore.event_to_map/1 always
+  # adds it for internal/API convenience), the ORIGINAL signature was
+  # computed before "event_id" existed on the map. Not excluding it here
+  # made every signature axon itself produces fail its own re-verification
+  # the moment "event_id" was present — which is always, for any event
+  # that's round-tripped through the DB — and would do the same for any
+  # other spec-compliant server trying to verify axon's outbound PDUs.
+  @non_content_fields ["unsigned", "signatures", "event_id"]
+
   @doc """
   Computes the content hash of an event (for the `hashes.sha256` field).
 
@@ -15,7 +27,7 @@ defmodule AxonCrypto.EventHash do
   @spec content_hash(map()) :: binary()
   def content_hash(event) do
     event
-    |> Map.drop(["unsigned", "signatures", "hashes"])
+    |> Map.drop(["hashes" | @non_content_fields])
     |> CanonicalJSON.encode_to_binary()
     |> sha256_b64url()
   end
@@ -29,7 +41,7 @@ defmodule AxonCrypto.EventHash do
   def reference_hash(event) do
     hash =
       event
-      |> Map.drop(["unsigned"])
+      |> Map.drop(["unsigned", "event_id"])
       |> CanonicalJSON.encode_to_binary()
       |> sha256_b64url()
 
@@ -46,7 +58,7 @@ defmodule AxonCrypto.EventHash do
   def sign_event(event, server_name, key_id, private_key) do
     signable =
       event
-      |> Map.drop(["unsigned", "signatures"])
+      |> Map.drop(@non_content_fields)
       |> CanonicalJSON.encode_to_binary()
 
     sig_bytes = :crypto.sign(:eddsa, :none, signable, [private_key, :ed25519])
@@ -72,7 +84,7 @@ defmodule AxonCrypto.EventHash do
          {:ok, sig_bytes} <- Base.decode64(sig_b64, padding: false) do
       signable =
         event
-        |> Map.drop(["unsigned", "signatures"])
+        |> Map.drop(@non_content_fields)
         |> CanonicalJSON.encode_to_binary()
 
       if :crypto.verify(:eddsa, :none, signable, sig_bytes, [public_key, :ed25519]) do

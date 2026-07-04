@@ -95,28 +95,8 @@ defmodule AxonFederation.HttpClient do
   # ---------------------------------------------------------------------------
 
   defp build_url(server_name, path) do
-    base = resolve_base_url(server_name)
+    base = AxonFederation.ServerResolver.resolve(server_name)
     base <> path
-  end
-
-  defp resolve_base_url(server_name) do
-    # Check /.well-known/matrix/server; fall back to :8448
-    well_known_url = "https://#{server_name}/.well-known/matrix/server"
-
-    req = Finch.build(:get, well_known_url, [{"user-agent", @user_agent}])
-
-    case Finch.request(req, Axon.Finch, receive_timeout: 5_000) do
-      {:ok, %{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"m.server" => host}} -> "https://#{host}"
-          _ -> "https://#{server_name}:8448"
-        end
-
-      _ ->
-        "https://#{server_name}:8448"
-    end
-  rescue
-    _ -> "https://#{server_name}:8448"
   end
 
   # ---------------------------------------------------------------------------

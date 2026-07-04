@@ -4,6 +4,7 @@ defmodule AxonWeb.SyncController do
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
   alias AxonSync.Manager, as: SyncManager
+  alias AxonSync.Presence
 
   @default_timeline_limit 100
 
@@ -16,9 +17,10 @@ defmodule AxonWeb.SyncController do
 
     # nil means initial sync; a string (even "0") means incremental
     is_initial_sync = is_nil(since)
-    # next_batch token format: "${room_ordering}_${dl_cursor}_${ad_cursor}"
-    # dl_cursor tracks device_list_updates.id; ad_cursor tracks account_data_stream.id
-    {since_ordering, dl_since, ad_since} = parse_sync_token(since)
+    # next_batch token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}"
+    # dl_cursor tracks device_list_updates.id; ad_cursor tracks account_data_stream.id;
+    # pr_cursor tracks AxonSync.Presence's version counter.
+    {since_ordering, dl_since, ad_since, pr_since} = parse_sync_token(since)
 
     filter = load_filter(user_id, params["filter"])
 
@@ -44,15 +46,20 @@ defmodule AxonWeb.SyncController do
     # Advance cursors to current maxes
     dl_next = current_dl_max_id()
     ad_next = current_ad_max_id()
-    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}"
+    pr_next = Presence.current_version()
+    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}_#{pr_next}"
 
-    rooms_response = build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter)
+    rooms_response =
+      build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter)
+
     global_account_data = get_global_account_data(user_id, is_initial_sync, ad_since)
+    presence_events = get_presence_events(user_id, is_initial_sync, pr_since)
 
     # E2EE sync additions
     {to_device_events, _max_tdm_id} = drain_to_device_messages(user_id, device_id)
     otk_counts = get_otk_counts(user_id, device_id)
     unused_fallback_types = get_unused_fallback_key_types(user_id, device_id)
+
     device_lists =
       if is_initial_sync do
         %{"changed" => [], "left" => []}
@@ -63,7 +70,7 @@ defmodule AxonWeb.SyncController do
     resp = %{
       "next_batch" => next_batch,
       "rooms" => rooms_response,
-      "presence" => %{"events" => []},
+      "presence" => %{"events" => presence_events},
       "account_data" => %{"events" => global_account_data},
       "to_device" => %{"events" => to_device_events},
       "device_one_time_keys_count" => otk_counts,
@@ -89,9 +96,10 @@ defmodule AxonWeb.SyncController do
       {:error, _} ->
         # treat as filter_id
         case Repo.one(
-               from f in "user_filters",
+               from(f in "user_filters",
                  where: f.filter_id == ^filter_param and f.user_id == ^user_id,
                  select: f.filter
+               )
              ) do
           nil -> %{}
           json_str -> Jason.decode!(json_str)
@@ -129,11 +137,18 @@ defmodule AxonWeb.SyncController do
         if not is_initial_sync and not has_new_events do
           acc
         else
-          room_data = build_room_data(
-            room_id, user_id, room_events,
-            is_initial_sync, since_ordering,
-            tl_limit, tl_types, state_types
-          )
+          room_data =
+            build_room_data(
+              room_id,
+              user_id,
+              room_events,
+              is_initial_sync,
+              since_ordering,
+              tl_limit,
+              tl_types,
+              state_types
+            )
+
           Map.put(acc, room_id, room_data)
         end
       end)
@@ -149,24 +164,49 @@ defmodule AxonWeb.SyncController do
         {room_id, %{"invite_state" => %{"events" => invite_state}}}
       end)
 
-    left_rooms = EventStore.get_left_rooms_since(user_id, since_ordering, exclude_forgotten: is_initial_sync)
+    left_rooms =
+      EventStore.get_left_rooms_since(user_id, since_ordering, exclude_forgotten: is_initial_sync)
+
     leave_response =
       Enum.into(left_rooms, %{}, fn room_id ->
         leave_events = Map.get(events_by_room, room_id, [])
-        {room_id, %{
-          "timeline" => %{"events" => Enum.map(leave_events, &EventStore.event_to_map/1), "limited" => false},
-          "state" => %{"events" => []}
-        }}
+
+        {room_id,
+         %{
+           "timeline" => %{
+             "events" => Enum.map(leave_events, &EventStore.event_to_map/1),
+             "limited" => false
+           },
+           "state" => %{"events" => []}
+         }}
+      end)
+
+    knocked_rooms = EventStore.get_knocked_rooms(user_id)
+
+    knock_response =
+      Enum.into(knocked_rooms, %{}, fn room_id ->
+        {room_id,
+         %{"knock_state" => %{"events" => EventStore.get_knock_preview_state(room_id, user_id)}}}
       end)
 
     %{
       "join" => join_response,
       "invite" => invite_response,
+      "knock" => knock_response,
       "leave" => leave_response
     }
   end
 
-  defp build_room_data(room_id, user_id, room_events, is_initial_sync, since_ordering, tl_limit, tl_types, state_types) do
+  defp build_room_data(
+         room_id,
+         user_id,
+         room_events,
+         is_initial_sync,
+         since_ordering,
+         tl_limit,
+         tl_types,
+         state_types
+       ) do
     # Did this user newly join this room in this sync window?
     newly_joined =
       not is_initial_sync and
@@ -182,7 +222,14 @@ defmodule AxonWeb.SyncController do
           build_initial_room_data(room_id, room_events, tl_limit, since_ordering)
 
         newly_joined ->
-          build_newly_joined_room_data(room_id, user_id, room_events, tl_limit, tl_types, since_ordering)
+          build_newly_joined_room_data(
+            room_id,
+            user_id,
+            room_events,
+            tl_limit,
+            tl_types,
+            since_ordering
+          )
 
         true ->
           build_incremental_room_data(room_events, tl_limit, since_ordering)
@@ -199,7 +246,8 @@ defmodule AxonWeb.SyncController do
     # Add unsigned.membership to timeline events (MSC4115)
     timeline_with_membership = add_membership_to_timeline(filtered_timeline, room_id, user_id)
     # Bundle reaction/thread aggregations (unsigned.m.relations)
-    timeline_with_relations = EventStore.bundle_relations(room_id, timeline_with_membership, user_id: user_id)
+    timeline_with_relations =
+      EventStore.bundle_relations(room_id, timeline_with_membership, user_id: user_id)
 
     %{
       "timeline" => %{
@@ -217,30 +265,42 @@ defmodule AxonWeb.SyncController do
   # Initial sync: state = full current state, timeline = most recent events
   defp build_initial_room_data(room_id, room_events, tl_limit, _since_ordering) do
     full_state = EventStore.get_current_state(room_id) |> Enum.map(&EventStore.event_to_map/1)
+
     {limited, tl_events} =
       if length(room_events) > tl_limit do
         {true, Enum.take(room_events, -tl_limit)}
       else
         {false, room_events}
       end
-    prev = if limited and tl_events != [] do
-      Integer.to_string(hd(tl_events).stream_ordering - 1)
-    else
-      "0"
-    end
+
+    prev =
+      if limited and tl_events != [] do
+        Integer.to_string(hd(tl_events).stream_ordering - 1)
+      else
+        "0"
+      end
+
     {full_state, Enum.map(tl_events, &EventStore.event_to_map/1), limited, prev}
   end
 
   # Newly joined room: state = full room state, timeline = events after join (limited=true for history)
-  defp build_newly_joined_room_data(room_id, user_id, room_events, tl_limit, _tl_types, since_ordering) do
+  defp build_newly_joined_room_data(
+         room_id,
+         user_id,
+         room_events,
+         tl_limit,
+         _tl_types,
+         since_ordering
+       ) do
     full_state = EventStore.get_current_state(room_id) |> Enum.map(&EventStore.event_to_map/1)
 
     # Find the join event ordering
-    join_event = Enum.find(room_events, fn e ->
-      e.type == "m.room.member" and
-        e.state_key == user_id and
-        get_in(e.content, ["membership"]) == "join"
-    end)
+    join_event =
+      Enum.find(room_events, fn e ->
+        e.type == "m.room.member" and
+          e.state_key == user_id and
+          get_in(e.content, ["membership"]) == "join"
+      end)
 
     # Events after the join (exclude state events from timeline; the join itself goes in state)
     events_after_join =
@@ -261,13 +321,15 @@ defmodule AxonWeb.SyncController do
         {true, events_after_join}
       end
 
-    _ = since_ordering  # suppress unused warning
+    # suppress unused warning
+    _ = since_ordering
 
-    prev = if tl_events != [] do
-      Integer.to_string(hd(tl_events).stream_ordering - 1)
-    else
-      if join_event, do: Integer.to_string(join_event.stream_ordering), else: "0"
-    end
+    prev =
+      if tl_events != [] do
+        Integer.to_string(hd(tl_events).stream_ordering - 1)
+      else
+        if join_event, do: Integer.to_string(join_event.stream_ordering), else: "0"
+      end
 
     {full_state, Enum.map(tl_events, &EventStore.event_to_map/1), limited, prev}
   end
@@ -285,6 +347,7 @@ defmodule AxonWeb.SyncController do
     state_events =
       if limited do
         cutoff = hd(tl_events).stream_ordering
+
         room_events
         |> Enum.filter(&(&1.stream_ordering < cutoff and &1.state_key != nil))
         |> Enum.map(&EventStore.event_to_map/1)
@@ -294,11 +357,12 @@ defmodule AxonWeb.SyncController do
 
     _ = since_ordering
 
-    prev = if limited and tl_events != [] do
-      Integer.to_string(hd(tl_events).stream_ordering - 1)
-    else
-      "0"
-    end
+    prev =
+      if limited and tl_events != [] do
+        Integer.to_string(hd(tl_events).stream_ordering - 1)
+      else
+        "0"
+      end
 
     {state_events, Enum.map(tl_events, &EventStore.event_to_map/1), limited, prev}
   end
@@ -307,15 +371,8 @@ defmodule AxonWeb.SyncController do
   # Invite state builder
   # ---------------------------------------------------------------------------
 
-  @invite_state_types ~w(m.room.join_rules m.room.canonical_alias m.room.avatar m.room.name m.room.create m.room.encryption)
-
   defp build_invite_state(room_id, user_id) do
-    current_state = EventStore.get_current_state(room_id)
-
-    stripped =
-      current_state
-      |> Enum.filter(fn e -> e.type in @invite_state_types end)
-      |> Enum.map(&stripped_event/1)
+    stripped = EventStore.stripped_state_events(room_id)
 
     case EventStore.get_state_event(room_id, "m.room.member", user_id) do
       {:ok, invite_event} -> stripped ++ [stripped_event(invite_event)]
@@ -336,24 +393,34 @@ defmodule AxonWeb.SyncController do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  # Returns {room_ordering, dl_cursor, ad_cursor}.
-  # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}"
-  # Old 2-part tokens default ad_cursor to 0 (return all account_data on next sync).
-  defp parse_sync_token(nil), do: {0, 0, 0}
+  # Returns {room_ordering, dl_cursor, ad_cursor, pr_cursor}.
+  # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}"
+  # Older, shorter tokens default the missing cursor(s) to 0 (return
+  # everything for that stream on the next sync).
+  defp parse_sync_token(nil), do: {0, 0, 0, 0}
+
   defp parse_sync_token(since) do
-    parse_int = fn s -> case Integer.parse(s) do {n, _} -> n; _ -> 0 end end
+    parse_int = fn s ->
+      case Integer.parse(s) do
+        {n, _} -> n
+        _ -> 0
+      end
+    end
+
     parts = String.split(since, "_")
     room_n = parse_int.(Enum.at(parts, 0, "0"))
-    dl_n   = parse_int.(Enum.at(parts, 1, "0"))
-    ad_n   = parse_int.(Enum.at(parts, 2, "0"))
-    {room_n, dl_n, ad_n}
+    dl_n = parse_int.(Enum.at(parts, 1, "0"))
+    ad_n = parse_int.(Enum.at(parts, 2, "0"))
+    pr_n = parse_int.(Enum.at(parts, 3, "0"))
+    {room_n, dl_n, ad_n, pr_n}
   end
 
   defp build_room_account_data(room_id, user_id) do
     Repo.all(
-      from r in "room_account_data",
+      from(r in "room_account_data",
         where: r.room_id == ^room_id and r.user_id == ^user_id,
         select: %{type: r.type, content: r.content}
+      )
     )
     |> Enum.map(fn r -> %{"type" => r.type, "content" => r.content} end)
   end
@@ -361,9 +428,15 @@ defmodule AxonWeb.SyncController do
   defp build_ephemeral(room_id) do
     receipts =
       Repo.all(
-        from r in "receipts",
+        from(r in "receipts",
           where: r.room_id == ^room_id and r.receipt_type in ["m.read", "m.read.private"],
-          select: %{user_id: r.user_id, receipt_type: r.receipt_type, event_id: r.event_id, ts: r.ts}
+          select: %{
+            user_id: r.user_id,
+            receipt_type: r.receipt_type,
+            event_id: r.event_id,
+            ts: r.ts
+          }
+        )
       )
 
     if receipts == [] do
@@ -374,7 +447,10 @@ defmodule AxonWeb.SyncController do
           user_entry = %{"ts" => r.ts}
           type_map = Map.get(acc, r.event_id, %{})
           users_map = Map.get(type_map, r.receipt_type, %{})
-          updated_type_map = Map.put(type_map, r.receipt_type, Map.put(users_map, r.user_id, user_entry))
+
+          updated_type_map =
+            Map.put(type_map, r.receipt_type, Map.put(users_map, r.user_id, user_entry))
+
           Map.put(acc, r.event_id, updated_type_map)
         end)
 
@@ -393,9 +469,10 @@ defmodule AxonWeb.SyncController do
         %{}
       else
         Repo.all(
-          from e in "events",
+          from(e in "events",
             where: e.event_id in ^event_ids,
             select: {e.event_id, e.stream_ordering}
+          )
         )
         |> Map.new()
       end
@@ -403,16 +480,17 @@ defmodule AxonWeb.SyncController do
     # Get all membership changes for this user in this room, ordered by stream_ordering
     membership_changes =
       Repo.all(
-        from e in "events",
+        from(e in "events",
           where:
             e.room_id == ^room_id and
-            e.type == "m.room.member" and
-            e.state_key == ^user_id,
+              e.type == "m.room.member" and
+              e.state_key == ^user_id,
           order_by: [asc: e.stream_ordering],
           select: %{
             stream_ordering: e.stream_ordering,
             membership: fragment("?->>'membership'", e.content)
           }
+        )
       )
 
     Enum.map(events, fn event ->
@@ -424,8 +502,10 @@ defmodule AxonWeb.SyncController do
   end
 
   defp membership_at_ordering(nil, _changes), do: "leave"
+
   defp membership_at_ordering(ordering, changes) do
     applicable = Enum.filter(changes, &(&1.stream_ordering <= ordering))
+
     case List.last(applicable) do
       nil -> "leave"
       %{membership: m} when m in ["join", "invite", "ban"] -> m
@@ -437,9 +517,10 @@ defmodule AxonWeb.SyncController do
   # Incremental sync: return only types that changed since ad_since (account_data_stream cursor).
   defp get_global_account_data(user_id, _is_initial = true, _ad_since) do
     Repo.all(
-      from a in "account_data",
+      from(a in "account_data",
         where: a.user_id == ^user_id,
         select: %{type: a.type, content: a.content}
+      )
     )
     |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
   end
@@ -447,19 +528,21 @@ defmodule AxonWeb.SyncController do
   defp get_global_account_data(user_id, _is_initial = false, ad_since) do
     changed_types =
       Repo.all(
-        from s in "account_data_stream",
+        from(s in "account_data_stream",
           where: s.user_id == ^user_id and s.id > ^ad_since,
           select: s.type,
           distinct: true
+        )
       )
 
     if changed_types == [] do
       []
     else
       Repo.all(
-        from a in "account_data",
+        from(a in "account_data",
           where: a.user_id == ^user_id and a.type in ^changed_types,
           select: %{type: a.type, content: a.content}
+        )
       )
       |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
     end
@@ -467,11 +550,14 @@ defmodule AxonWeb.SyncController do
 
   defp get_ignored_users(user_id) do
     case Repo.one(
-      from a in "account_data",
-        where: a.user_id == ^user_id and a.type == "m.ignored_user_list",
-        select: a.content
-    ) do
-      nil -> MapSet.new()
+           from(a in "account_data",
+             where: a.user_id == ^user_id and a.type == "m.ignored_user_list",
+             select: a.content
+           )
+         ) do
+      nil ->
+        MapSet.new()
+
       content ->
         ignored = get_in(content, ["ignored_users"]) || %{}
         MapSet.new(Map.keys(ignored))
@@ -482,16 +568,19 @@ defmodule AxonWeb.SyncController do
     if MapSet.size(ignored_users) == 0 do
       false
     else
-      sender = Repo.one(
-        from e in "events",
-          where:
-            e.room_id == ^room_id and
-            e.type == "m.room.member" and
-            fragment("?->>'membership'", e.content) == "invite",
-          order_by: [desc: e.stream_ordering],
-          limit: 1,
-          select: e.sender
-      )
+      sender =
+        Repo.one(
+          from(e in "events",
+            where:
+              e.room_id == ^room_id and
+                e.type == "m.room.member" and
+                fragment("?->>'membership'", e.content) == "invite",
+            order_by: [desc: e.stream_ordering],
+            limit: 1,
+            select: e.sender
+          )
+        )
+
       sender != nil and MapSet.member?(ignored_users, sender)
     end
   end
@@ -505,16 +594,17 @@ defmodule AxonWeb.SyncController do
   defp drain_to_device_messages(user_id, device_id) do
     rows =
       Repo.all(
-        from m in "to_device_messages",
+        from(m in "to_device_messages",
           where: m.target_user_id == ^user_id and m.target_device_id == ^device_id,
           order_by: [asc: m.id],
           limit: 100,
           select: %{id: m.id, sender: m.sender, type: m.type, content: m.content}
+        )
       )
 
     if rows != [] do
       ids = Enum.map(rows, & &1.id)
-      Repo.delete_all(from m in "to_device_messages", where: m.id in ^ids)
+      Repo.delete_all(from(m in "to_device_messages", where: m.id in ^ids))
     end
 
     events =
@@ -528,10 +618,11 @@ defmodule AxonWeb.SyncController do
 
   defp get_otk_counts(user_id, device_id) do
     Repo.all(
-      from k in "one_time_keys",
+      from(k in "one_time_keys",
         where: k.user_id == ^user_id and k.device_id == ^device_id and k.claimed == false,
         group_by: k.algorithm,
         select: {k.algorithm, count(k.id)}
+      )
     )
     |> Enum.into(%{})
   end
@@ -540,9 +631,10 @@ defmodule AxonWeb.SyncController do
   # Clients use this to know which algorithms still have fallback coverage.
   defp get_unused_fallback_key_types(user_id, device_id) do
     Repo.all(
-      from fk in "fallback_keys",
+      from(fk in "fallback_keys",
         where: fk.user_id == ^user_id and fk.device_id == ^device_id and fk.used == false,
         select: fk.algorithm
+      )
     )
   end
 
@@ -551,37 +643,58 @@ defmodule AxonWeb.SyncController do
   # `left`: users who were in a shared room before but have since left (simplified to [] for now).
   # dl_since is the dl_cursor from the previous sync token (max device_list_updates.id seen).
   defp get_device_list_changes(user_id, dl_since) do
-    shared_users =
-      Repo.all(
-        from m2 in "room_memberships",
-          join: m1 in "room_memberships",
-          on: m1.room_id == m2.room_id and m1.user_id == ^user_id and m1.membership == "join",
-          where: m2.membership == "join" and m2.user_id != ^user_id,
-          select: m2.user_id,
-          distinct: true
-      )
-
     # The user must see their own device-list changes (new logins, cross-signing
     # uploads) so their other devices re-query keys — spec requires self in `changed`.
-    candidate_users = [user_id | shared_users]
+    candidate_users = [user_id | shared_room_user_ids(user_id)]
 
     changed =
       Repo.all(
-        from u in "device_list_updates",
+        from(u in "device_list_updates",
           where: u.user_id in ^candidate_users and u.id > ^dl_since,
           select: u.user_id,
           distinct: true
+        )
       )
 
     %{"changed" => changed, "left" => []}
   end
 
+  defp shared_room_user_ids(user_id) do
+    Repo.all(
+      from(m2 in "room_memberships",
+        join: m1 in "room_memberships",
+        on: m1.room_id == m2.room_id and m1.user_id == ^user_id and m1.membership == "join",
+        where: m2.membership == "join" and m2.user_id != ^user_id,
+        select: m2.user_id,
+        distinct: true
+      )
+    )
+  end
+
+  # Presence for the user themselves plus anyone sharing a joined room with
+  # them. Initial sync returns everyone's current state; incremental sync
+  # returns only those whose presence changed since pr_since.
+  defp get_presence_events(user_id, is_initial_sync, pr_since) do
+    candidate_users = [user_id | shared_room_user_ids(user_id)]
+
+    presence_by_user =
+      if is_initial_sync do
+        Enum.into(candidate_users, %{}, fn uid -> {uid, Presence.get(uid)} end)
+      else
+        Presence.changes_since(candidate_users, pr_since)
+      end
+
+    Enum.map(presence_by_user, fn {uid, presence} ->
+      %{"type" => "m.presence", "sender" => uid, "content" => presence}
+    end)
+  end
+
   defp current_dl_max_id do
-    Repo.one(from u in "device_list_updates", select: max(u.id)) || 0
+    Repo.one(from(u in "device_list_updates", select: max(u.id))) || 0
   end
 
   defp current_ad_max_id do
-    Repo.one(from s in "account_data_stream", select: max(s.id)) || 0
+    Repo.one(from(s in "account_data_stream", select: max(s.id))) || 0
   end
 
   defp get_max_ordering(events_by_room, fallback) do

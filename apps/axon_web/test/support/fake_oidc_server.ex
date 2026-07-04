@@ -15,8 +15,17 @@ defmodule AxonWeb.FakeOidcServer do
   plug :dispatch
 
   @valid_token "fake-as-valid-token"
+  @valid_token_no_device_scope "fake-as-valid-token-no-device-scope"
 
   def valid_token, do: @valid_token
+
+  @doc """
+  A token whose introspection response has no urn:matrix:client:device:<id>
+  scope, as a real AS/client pairing that hasn't implemented MSC2967 device
+  scopes yet would return. Used to exercise Axon's stable-fallback device_id
+  behavior in AxonWeb.Oidc.
+  """
+  def valid_token_no_device_scope, do: @valid_token_no_device_scope
 
   def child_spec(opts) do
     port = Keyword.fetch!(opts, :port)
@@ -52,6 +61,14 @@ defmodule AxonWeb.FakeOidcServer do
           "sub" => "oidc-subject-abc123",
           "username" => "alice_oidc",
           "scope" => "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:OIDCDEV1"
+        })
+
+      @valid_token_no_device_scope ->
+        json(conn, %{
+          "active" => true,
+          "sub" => "oidc-subject-nodevice",
+          "username" => "bob_oidc",
+          "scope" => "urn:matrix:org.matrix.msc2967.client:api:*"
         })
 
       _ ->
