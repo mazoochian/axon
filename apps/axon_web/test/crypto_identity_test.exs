@@ -28,15 +28,19 @@ defmodule AxonWeb.CryptoIdentityTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
+
     %{
       token: body["access_token"],
       device_id: body["device_id"],
@@ -218,43 +222,71 @@ defmodule AxonWeb.CryptoIdentityTest do
         # Default key pointer
         conn =
           authed(token)
-          |> jpu("/_matrix/client/v3/user/#{uid}/account_data/m.secret_storage.default_key",
-            %{"key" => key_id})
+          |> jpu(
+            "/_matrix/client/v3/user/#{uid}/account_data/m.secret_storage.default_key",
+            %{"key" => key_id}
+          )
+
         assert conn.status == 200
 
         # Key description
         conn =
           authed(token)
-          |> jpu("/_matrix/client/v3/user/#{uid}/account_data/m.secret_storage.key.#{key_id}",
+          |> jpu(
+            "/_matrix/client/v3/user/#{uid}/account_data/m.secret_storage.key.#{key_id}",
             %{
               "algorithm" => "m.secret_storage.v1.aes-hmac-sha2",
               "name" => "Default Key"
-            })
+            }
+          )
+
         assert conn.status == 200
 
         # Master key SSSS encryption
         conn =
           authed(token)
-          |> jpu("/_matrix/client/v3/user/#{uid}/account_data/m.cross_signing.master",
-            %{"encrypted" => %{key_id => %{"iv" => "testiv", "ciphertext" => "testcipher", "mac" => "testmac"}}})
+          |> jpu(
+            "/_matrix/client/v3/user/#{uid}/account_data/m.cross_signing.master",
+            %{
+              "encrypted" => %{
+                key_id => %{"iv" => "testiv", "ciphertext" => "testcipher", "mac" => "testmac"}
+              }
+            }
+          )
+
         assert conn.status == 200
 
         conn =
           authed(token)
-          |> jpu("/_matrix/client/v3/user/#{uid}/account_data/m.cross_signing.self_signing",
-            %{"encrypted" => %{key_id => %{"iv" => "testiv2", "ciphertext" => "testcipher2", "mac" => "testmac2"}}})
+          |> jpu(
+            "/_matrix/client/v3/user/#{uid}/account_data/m.cross_signing.self_signing",
+            %{
+              "encrypted" => %{
+                key_id => %{"iv" => "testiv2", "ciphertext" => "testcipher2", "mac" => "testmac2"}
+              }
+            }
+          )
+
         assert conn.status == 200
 
         conn =
           authed(token)
-          |> jpu("/_matrix/client/v3/user/#{uid}/account_data/m.cross_signing.user_signing",
-            %{"encrypted" => %{key_id => %{"iv" => "testiv3", "ciphertext" => "testcipher3", "mac" => "testmac3"}}})
+          |> jpu(
+            "/_matrix/client/v3/user/#{uid}/account_data/m.cross_signing.user_signing",
+            %{
+              "encrypted" => %{
+                key_id => %{"iv" => "testiv3", "ciphertext" => "testcipher3", "mac" => "testmac3"}
+              }
+            }
+          )
+
         assert conn.status == 200
 
         # Read back default key pointer to verify
         conn =
           authed(token)
           |> get("/_matrix/client/v3/user/#{uid}/account_data/m.secret_storage.default_key")
+
         assert conn.status == 200
         assert decode(conn)["key"] == key_id
       end
@@ -308,8 +340,11 @@ defmodule AxonWeb.CryptoIdentityTest do
       for {%{token: token, user_id: uid}, ver} <- [{alice, alice_version}, {bob, bob_version}] do
         conn =
           authed(token)
-          |> jpu("/_matrix/client/v3/user/#{uid}/account_data/m.megolm_backup.v1",
-            %{"version" => ver, "algorithm" => "m.megolm_backup.v1.curve25519-aes-sha2"})
+          |> jpu(
+            "/_matrix/client/v3/user/#{uid}/account_data/m.megolm_backup.v1",
+            %{"version" => ver, "algorithm" => "m.megolm_backup.v1.curve25519-aes-sha2"}
+          )
+
         assert conn.status == 200
       end
 
@@ -374,7 +409,9 @@ defmodule AxonWeb.CryptoIdentityTest do
       # Step 9: Retrieve the session key from backup
       conn =
         authed(alice.token)
-        |> get("/_matrix/client/v3/room_keys/keys/#{URI.encode("!test_room:#{@server}")}/test_session_id_abc123?version=#{alice_version}")
+        |> get(
+          "/_matrix/client/v3/room_keys/keys/#{URI.encode("!test_room:#{@server}")}/test_session_id_abc123?version=#{alice_version}"
+        )
 
       assert conn.status == 200
       key_data = decode(conn)
@@ -385,7 +422,9 @@ defmodule AxonWeb.CryptoIdentityTest do
       # Bob cannot read Alice's backup keys (different user_id filter)
       conn =
         authed(bob.token)
-        |> get("/_matrix/client/v3/room_keys/keys/#{URI.encode("!test_room:#{@server}")}/test_session_id_abc123?version=#{alice_version}")
+        |> get(
+          "/_matrix/client/v3/room_keys/keys/#{URI.encode("!test_room:#{@server}")}/test_session_id_abc123?version=#{alice_version}"
+        )
 
       # Should be 404 since version belongs to alice, bob sees empty
       assert conn.status == 404
@@ -411,102 +450,135 @@ defmodule AxonWeb.CryptoIdentityTest do
       assert decode(conn)["errcode"] == "M_FORBIDDEN"
     end
 
-    test "MSC3967: self_signing_key/user_signing_key signed by the on-file master key skip UIA" do
-      user = register("msc3967_#{System.unique_integer([:positive])}")
+    test "MSC3967: first-time upload of master+self+user signing keys together skips UIA" do
+      user = register("msc3967_first_#{System.unique_integer([:positive])}")
 
-      {master_pub, master_priv} = :crypto.generate_key(:eddsa, :ed25519)
-      master_pub_b64 = Base.encode64(master_pub, padding: false)
-      master_key_id = "ed25519:msc3967_master"
-
-      master_key = %{
-        "keys" => %{master_key_id => master_pub_b64},
-        "usage" => ["master"],
-        "user_id" => user.user_id
-      }
-
-      # Step 1: establish the master key -- this still requires normal UIA.
-      challenge =
-        authed(user.token)
-        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{"master_key" => master_key})
-
-      assert challenge.status == 401
-
-      established =
+      # Brand-new account, no master key on file yet -- per MSC3967 this
+      # entire first upload succeeds with no "auth" block at all, since
+      # there's nothing yet to protect (the access token is proof enough).
+      conn =
         authed(user.token)
         |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
-          "auth" => %{"type" => "m.login.dummy"},
-          "master_key" => master_key
+          "master_key" => %{
+            "keys" => %{"ed25519:msc3967_first_master" => "master_pub"},
+            "usage" => ["master"],
+            "user_id" => user.user_id
+          },
+          "self_signing_key" => %{
+            "keys" => %{"ed25519:msc3967_first_self" => "self_pub"},
+            "usage" => ["self_signing"],
+            "user_id" => user.user_id
+          },
+          "user_signing_key" => %{
+            "keys" => %{"ed25519:msc3967_first_user" => "user_pub"},
+            "usage" => ["user_signing"],
+            "user_id" => user.user_id
+          }
         })
 
-      assert established.status == 200
-
-      # Step 2: a *separate* follow-up request uploading self_signing_key +
-      # user_signing_key, each validly signed by the master key above, with
-      # NO "auth" block at all. Real clients (matrix-js-sdk, matrix-rust-sdk)
-      # do exactly this per MSC3967 -- it must succeed without a fresh
-      # password prompt, since the signature already proves ownership.
-      self_signing_key = sign_with_master(%{
-        "keys" => %{"ed25519:msc3967_self" => "self_pub"},
-        "usage" => ["self_signing"],
-        "user_id" => user.user_id
-      }, user.user_id, master_key_id, master_priv)
-
-      user_signing_key = sign_with_master(%{
-        "keys" => %{"ed25519:msc3967_user" => "user_pub"},
-        "usage" => ["user_signing"],
-        "user_id" => user.user_id
-      }, user.user_id, master_key_id, master_priv)
-
-      followup =
-        authed(user.token)
-        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
-          "self_signing_key" => self_signing_key,
-          "user_signing_key" => user_signing_key
-        })
-
-      assert followup.status == 200
+      assert conn.status == 200
 
       query =
         authed(user.token)
         |> jp("/_matrix/client/v3/keys/query", %{"device_keys" => %{user.user_id => []}})
 
       body = decode(query)
-      assert body["self_signing_keys"][user.user_id]["keys"]["ed25519:msc3967_self"] == "self_pub"
-      assert body["user_signing_keys"][user.user_id]["keys"]["ed25519:msc3967_user"] == "user_pub"
+
+      assert body["master_keys"][user.user_id]["keys"]["ed25519:msc3967_first_master"] ==
+               "master_pub"
+
+      assert body["self_signing_keys"][user.user_id]["keys"]["ed25519:msc3967_first_self"] ==
+               "self_pub"
+
+      assert body["user_signing_keys"][user.user_id]["keys"]["ed25519:msc3967_first_user"] ==
+               "user_pub"
     end
 
-    test "MSC3967 exemption rejects a self_signing_key with an invalid master-key signature" do
-      user = register("msc3967_bad_#{System.unique_integer([:positive])}")
+    test "MSC3967: retrying the exact same upload is idempotent and skips UIA" do
+      user = register("msc3967_retry_#{System.unique_integer([:positive])}")
 
-      {master_pub, _master_priv} = :crypto.generate_key(:eddsa, :ed25519)
-      master_pub_b64 = Base.encode64(master_pub, padding: false)
-      master_key_id = "ed25519:msc3967_bad_master"
+      keys = %{
+        "master_key" => %{
+          "keys" => %{"ed25519:msc3967_retry_master" => "master_pub"},
+          "usage" => ["master"],
+          "user_id" => user.user_id
+        },
+        "self_signing_key" => %{
+          "keys" => %{"ed25519:msc3967_retry_self" => "self_pub"},
+          "usage" => ["self_signing"],
+          "user_id" => user.user_id
+        }
+      }
+
+      first = authed(user.token) |> jp("/_matrix/client/v3/keys/device_signing/upload", keys)
+      assert first.status == 200
+
+      # Simulates the original 200 OK getting lost in transit -- the client
+      # retries with the identical body and no "auth". Must still succeed,
+      # since nothing in the request is actually new.
+      retry = authed(user.token) |> jp("/_matrix/client/v3/keys/device_signing/upload", keys)
+      assert retry.status == 200
+    end
+
+    test "MSC3967: uploading a different master key without UIA is rejected" do
+      user = register("msc3967_reset_#{System.unique_integer([:positive])}")
+
+      original = %{
+        "master_key" => %{
+          "keys" => %{"ed25519:msc3967_reset_master1" => "master_pub_1"},
+          "usage" => ["master"],
+          "user_id" => user.user_id
+        }
+      }
+
+      established =
+        authed(user.token) |> jp("/_matrix/client/v3/keys/device_signing/upload", original)
+
+      assert established.status == 200
+
+      # A genuinely different master key (an identity reset) must never be
+      # accepted without UIA, no matter how it's presented.
+      replacement = %{
+        "master_key" => %{
+          "keys" => %{"ed25519:msc3967_reset_master2" => "master_pub_2"},
+          "usage" => ["master"],
+          "user_id" => user.user_id
+        }
+      }
+
+      conn =
+        authed(user.token) |> jp("/_matrix/client/v3/keys/device_signing/upload", replacement)
+
+      assert conn.status == 401
+    end
+
+    test "MSC3967: adding a new self_signing_key to an established master key without UIA is rejected" do
+      user = register("msc3967_newkey_#{System.unique_integer([:positive])}")
 
       master_key = %{
-        "keys" => %{master_key_id => master_pub_b64},
+        "keys" => %{"ed25519:msc3967_newkey_master" => "master_pub"},
         "usage" => ["master"],
         "user_id" => user.user_id
       }
 
-      authed(user.token)
-      |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
-        "auth" => %{"type" => "m.login.dummy"},
-        "master_key" => master_key
-      })
+      established =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{"master_key" => master_key})
 
-      # Signed with an unrelated keypair, not the real master key -- must NOT
-      # be accepted as an MSC3967 bypass, and must fall back to requiring UIA.
-      {_wrong_pub, wrong_priv} = :crypto.generate_key(:eddsa, :ed25519)
+      assert established.status == 200
 
-      self_signing_key = sign_with_master(%{
-        "keys" => %{"ed25519:msc3967_bad_self" => "self_pub"},
-        "usage" => ["self_signing"],
-        "user_id" => user.user_id
-      }, user.user_id, master_key_id, wrong_priv)
-
+      # Same (unchanged) master key, but a self_signing_key that was never
+      # uploaded before -- this is a *new* key, so UIA is still required.
       conn =
         authed(user.token)
-        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{"self_signing_key" => self_signing_key})
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
+          "master_key" => master_key,
+          "self_signing_key" => %{
+            "keys" => %{"ed25519:msc3967_newkey_self" => "self_pub"},
+            "usage" => ["self_signing"],
+            "user_id" => user.user_id
+          }
+        })
 
       assert conn.status == 401
     end
