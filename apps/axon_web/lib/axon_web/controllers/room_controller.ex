@@ -1,11 +1,11 @@
 defmodule AxonWeb.RoomController do
   use Phoenix.Controller, formats: [:json]
 
-  action_fallback AxonWeb.FallbackController
+  action_fallback(AxonWeb.FallbackController)
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
-  alias AxonRoom.{CreateRoom, RoomProcess, RoomUpgrade}
+  alias AxonRoom.{CreateRoom, RestrictedJoin, RoomProcess, RoomUpgrade}
 
   # POST /_matrix/client/v3/createRoom
   def create(conn, params) do
@@ -63,9 +63,8 @@ defmodule AxonWeb.RoomController do
 
       if is_local_room do
         # Local room join
-        content = %{"membership" => "join"}
-
         with {:ok, _} <- EventStore.get_room(room_id),
+             {:ok, content} <- build_join_content(room_id, user_id),
              {:ok, _event_id} <-
                RoomProcess.send_event(room_id, user_id, "m.room.member", content,
                  state_key: user_id
@@ -81,7 +80,73 @@ defmodule AxonWeb.RoomController do
             json(conn, %{"room_id" => room_id})
 
           {:error, reason} ->
-            conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Could not join room: #{inspect(reason)}"})
+            conn
+            |> put_status(403)
+            |> json(%{
+              "errcode" => "M_FORBIDDEN",
+              "error" => "Could not join room: #{inspect(reason)}"
+            })
+        end
+      end
+    end
+  end
+
+  # POST /_matrix/client/v1/knock/:room_id_or_alias
+  # POST /_matrix/client/v1/rooms/:room_id/knock
+  def knock(conn, %{"room_id_or_alias" => room_id_or_alias} = params) do
+    do_knock(conn, room_id_or_alias, params)
+  end
+
+  def knock(conn, %{"room_id" => room_id} = params) do
+    do_knock(conn, room_id, params)
+  end
+
+  defp do_knock(conn, room_id_or_alias, params) do
+    user_id = conn.assigns.current_user_id
+    local_server = Application.get_env(:axon_web, :server_name, "localhost")
+    server_params = params["server_name"] || []
+
+    {room_id, hint_servers} = resolve_room(room_id_or_alias, local_server, server_params)
+
+    if is_nil(room_id) do
+      conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
+    else
+      room_server = room_id |> String.split(":") |> List.last()
+      is_local_room = room_server == local_server or EventStore.room_exists?(room_id)
+      reason = params["reason"]
+
+      content =
+        if reason,
+          do: %{"membership" => "knock", "reason" => reason},
+          else: %{"membership" => "knock"}
+
+      if is_local_room do
+        with {:ok, _event_id} <-
+               RoomProcess.send_event(room_id, user_id, "m.room.member", content,
+                 state_key: user_id
+               ) do
+          EventStore.set_knock_preview_state(
+            room_id,
+            user_id,
+            EventStore.stripped_state_events(room_id)
+          )
+
+          json(conn, %{"room_id" => room_id})
+        end
+      else
+        via_servers = if hint_servers != [], do: hint_servers, else: [room_server]
+
+        case AxonFederation.RoomKnock.knock_via_federation(room_id, user_id, via_servers, reason) do
+          {:ok, _} ->
+            json(conn, %{"room_id" => room_id})
+
+          {:error, reason} ->
+            conn
+            |> put_status(403)
+            |> json(%{
+              "errcode" => "M_FORBIDDEN",
+              "error" => "Could not knock on room: #{inspect(reason)}"
+            })
         end
       end
     end
@@ -109,14 +174,17 @@ defmodule AxonWeb.RoomController do
 
     row =
       Repo.one(
-        from m in "room_memberships",
+        from(m in "room_memberships",
           where: m.room_id == ^room_id and m.user_id == ^user_id,
           select: %{membership: m.membership}
+        )
       )
 
     cond do
       row != nil and row.membership in ["join", "invite"] ->
-        conn |> put_status(400) |> json(%{"errcode" => "M_UNKNOWN", "error" => "You must leave the room first"})
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_UNKNOWN", "error" => "You must leave the room first"})
 
       row == nil ->
         json(conn, %{})
@@ -125,15 +193,18 @@ defmodule AxonWeb.RoomController do
         # Mark as forgotten (don't delete — we need the leave event in incremental sync)
         Repo.update_all(
           from(m in "room_memberships",
-            where: m.room_id == ^room_id and m.user_id == ^user_id),
+            where: m.room_id == ^room_id and m.user_id == ^user_id
+          ),
           set: [forgotten: true]
         )
+
         json(conn, %{})
     end
   end
 
   # POST /_matrix/client/v3/rooms/:room_id/upgrade
-  def upgrade(conn, %{"room_id" => room_id, "new_version" => new_version}) when is_binary(new_version) do
+  def upgrade(conn, %{"room_id" => room_id, "new_version" => new_version})
+      when is_binary(new_version) do
     user_id = conn.assigns.current_user_id
     server_name = Application.fetch_env!(:axon_web, :server_name)
 
@@ -143,18 +214,32 @@ defmodule AxonWeb.RoomController do
       json(conn, %{"replacement_room" => new_room_id})
     else
       {:error, :not_joined} ->
-        conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not joined to this room"})
+        conn
+        |> put_status(403)
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not joined to this room"})
 
       {:error, :insufficient_power_level} ->
-        conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Insufficient power level to upgrade room"})
+        conn
+        |> put_status(403)
+        |> json(%{
+          "errcode" => "M_FORBIDDEN",
+          "error" => "Insufficient power level to upgrade room"
+        })
 
       {:error, :unsupported_room_version} ->
-        conn |> put_status(400) |> json(%{"errcode" => "M_UNSUPPORTED_ROOM_VERSION", "error" => "Unsupported room version"})
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_UNSUPPORTED_ROOM_VERSION",
+          "error" => "Unsupported room version"
+        })
     end
   end
 
   def upgrade(conn, _params) do
-    conn |> put_status(400) |> json(%{"errcode" => "M_BAD_JSON", "error" => "new_version is required"})
+    conn
+    |> put_status(400)
+    |> json(%{"errcode" => "M_BAD_JSON", "error" => "new_version is required"})
   end
 
   # POST /_matrix/client/v3/rooms/:room_id/invite
@@ -163,10 +248,16 @@ defmodule AxonWeb.RoomController do
     invitee = params["user_id"]
 
     unless invitee do
-      conn |> put_status(400) |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user_id required"})
+      conn
+      |> put_status(400)
+      |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user_id required"})
     else
       with {:ok, _event_id} <-
-             RoomProcess.send_event(room_id, user_id, "m.room.member", %{"membership" => "invite"},
+             RoomProcess.send_event(
+               room_id,
+               user_id,
+               "m.room.member",
+               %{"membership" => "invite"},
                state_key: invitee
              ) do
         json(conn, %{})
@@ -184,9 +275,7 @@ defmodule AxonWeb.RoomController do
     content = if reason, do: Map.put(content, "reason", reason), else: content
 
     with {:ok, _event_id} <-
-           RoomProcess.send_event(room_id, user_id, "m.room.member", content,
-             state_key: target
-           ) do
+           RoomProcess.send_event(room_id, user_id, "m.room.member", content, state_key: target) do
       json(conn, %{})
     end
   end
@@ -201,9 +290,7 @@ defmodule AxonWeb.RoomController do
     content = if reason, do: Map.put(content, "reason", reason), else: content
 
     with {:ok, _event_id} <-
-           RoomProcess.send_event(room_id, user_id, "m.room.member", content,
-             state_key: target
-           ) do
+           RoomProcess.send_event(room_id, user_id, "m.room.member", content, state_key: target) do
       json(conn, %{})
     end
   end
@@ -224,7 +311,9 @@ defmodule AxonWeb.RoomController do
   # GET /_matrix/client/v3/rooms/:room_id/members
   def members(conn, %{"room_id" => room_id} = params) do
     memberships = params["membership"]
-    filter_memberships = if memberships, do: [memberships], else: ["join", "invite", "ban", "leave"]
+
+    filter_memberships =
+      if memberships, do: [memberships], else: ["join", "invite", "ban", "leave"]
 
     members = EventStore.get_room_members(room_id, filter_memberships)
 
@@ -248,12 +337,17 @@ defmodule AxonWeb.RoomController do
     user_id = conn.assigns.current_user_id
 
     membership =
-      Repo.one(from m in "room_memberships",
-        where: m.room_id == ^room_id and m.user_id == ^user_id,
-        select: m.membership)
+      Repo.one(
+        from(m in "room_memberships",
+          where: m.room_id == ^room_id and m.user_id == ^user_id,
+          select: m.membership
+        )
+      )
 
     if membership != "join" do
-      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+      conn
+      |> put_status(403)
+      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
     else
       members = EventStore.get_room_members(room_id, ["join"])
 
@@ -270,12 +364,64 @@ defmodule AxonWeb.RoomController do
   # Helpers
   # ---------------------------------------------------------------------------
 
+  # Builds the m.room.member "join" content for a local join, stamping
+  # join_authorised_via_users_server when the room is restricted and the
+  # user isn't already invited (MSC3083). Returns {:error, :restricted_join_denied}
+  # if the room is restricted and the user isn't allow-listed either.
+  defp build_join_content(room_id, user_id) do
+    current_state = EventStore.get_current_state_map(room_id)
+    join_rule_event = current_state[{"m.room.join_rules", ""}]
+    join_rule = get_in(join_rule_event, ["content", "join_rule"]) || "invite"
+
+    sender_membership =
+      get_in(current_state[{"m.room.member", user_id}], ["content", "membership"])
+
+    with :ok <- check_guest_access(user_id, current_state, sender_membership) do
+      cond do
+        join_rule not in ["restricted", "knock_restricted"] ->
+          {:ok, %{"membership" => "join"}}
+
+        sender_membership in ["invite", "join"] ->
+          {:ok, %{"membership" => "join"}}
+
+        true ->
+          join_rule_content = (join_rule_event && join_rule_event["content"]) || %{}
+
+          case RestrictedJoin.authorise(join_rule_content, user_id, current_state) do
+            {:ok, authoriser} ->
+              {:ok, %{"membership" => "join", "join_authorised_via_users_server" => authoriser}}
+
+            {:error, _} = err ->
+              err
+          end
+      end
+    end
+  end
+
+  # Guests may only join without an existing invite when the room opts in
+  # via m.room.guest_access: can_join (default is "forbidden"). An invited
+  # guest can still accept, same as any other user.
+  defp check_guest_access(user_id, current_state, sender_membership) do
+    if sender_membership == "invite" or not AxonCore.UserStore.guest?(user_id) do
+      :ok
+    else
+      guest_access =
+        get_in(current_state[{"m.room.guest_access", ""}], ["content", "guest_access"]) ||
+          "forbidden"
+
+      if guest_access == "can_join", do: :ok, else: {:error, :guest_access_forbidden}
+    end
+  end
+
   # Returns {room_id, hint_servers} or {nil, []}
   defp resolve_room(room_id_or_alias, local_server, server_params) do
     cond do
       String.starts_with?(room_id_or_alias, "#") ->
         # Alias — try local first
-        local_id = Repo.one(from a in "room_aliases", where: a.alias == ^room_id_or_alias, select: a.room_id)
+        local_id =
+          Repo.one(
+            from(a in "room_aliases", where: a.alias == ^room_id_or_alias, select: a.room_id)
+          )
 
         if local_id do
           {local_id, []}
@@ -296,7 +442,10 @@ defmodule AxonWeb.RoomController do
 
   defp resolve_remote_alias(room_alias, via_servers, _local_server) do
     Enum.find_value(via_servers, {nil, []}, fn server ->
-      case AxonFederation.HttpClient.get(server, "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode(room_alias)}") do
+      case AxonFederation.HttpClient.get(
+             server,
+             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode(room_alias)}"
+           ) do
         {:ok, %{"room_id" => room_id, "servers" => servers}} ->
           {room_id, servers}
 

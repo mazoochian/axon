@@ -96,7 +96,9 @@ defmodule AxonCore.EventStore do
             updated_at: DateTime.utc_now(:microsecond)
           }
         ],
-        on_conflict: {:replace, [:membership, :event_id, :sender, :display_name, :avatar_url, :forgotten, :updated_at]},
+        on_conflict:
+          {:replace,
+           [:membership, :event_id, :sender, :display_name, :avatar_url, :forgotten, :updated_at]},
         conflict_target: [:room_id, :user_id]
       )
 
@@ -124,7 +126,12 @@ defmodule AxonCore.EventStore do
 
   def insert_room(room_id, creator, version \\ "11", is_public \\ false) do
     %Room{}
-    |> Room.changeset(%{room_id: room_id, creator: creator, version: version, is_public: is_public})
+    |> Room.changeset(%{
+      room_id: room_id,
+      creator: creator,
+      version: version,
+      is_public: is_public
+    })
     |> Repo.insert()
   end
 
@@ -149,7 +156,7 @@ defmodule AxonCore.EventStore do
   @doc "Returns events in a room with stream_ordering > since, in order."
   def get_events_since(room_id, since_ordering, limit \\ 100) do
     Repo.all(
-      from e in Event,
+      from(e in Event,
         where:
           e.room_id == ^room_id and
             e.stream_ordering > ^since_ordering and
@@ -157,28 +164,32 @@ defmodule AxonCore.EventStore do
             not e.soft_failed,
         order_by: [asc: e.stream_ordering],
         limit: ^limit
+      )
     )
   end
 
   @doc "Paginate room history (for GET /rooms/:id/messages)."
   def get_messages(room_id, from_ordering, dir, limit \\ 10) do
     base =
-      from e in Event,
+      from(e in Event,
         where: e.room_id == ^room_id and not e.rejected and not e.soft_failed
+      )
 
     query =
       case dir do
         "b" ->
-          from e in base,
+          from(e in base,
             where: e.stream_ordering < ^from_ordering,
             order_by: [desc: e.stream_ordering],
             limit: ^limit
+          )
 
         _ ->
-          from e in base,
+          from(e in base,
             where: e.stream_ordering > ^from_ordering,
             order_by: [asc: e.stream_ordering],
             limit: ^limit
+          )
       end
 
     Repo.all(query)
@@ -188,45 +199,103 @@ defmodule AxonCore.EventStore do
   Paginate events related to `target_event_id` (for GET /rooms/:id/relations/:eventId).
   `rel_type` and `event_type` are optional filters, `nil` means "any".
   """
-  def get_relations(room_id, target_event_id, rel_type, event_type, from_ordering, dir, limit \\ 10) do
+  def get_relations(
+        room_id,
+        target_event_id,
+        rel_type,
+        event_type,
+        from_ordering,
+        dir,
+        limit \\ 10
+      ) do
     base =
-      from e in Event,
+      from(e in Event,
         where:
           e.room_id == ^room_id and not e.rejected and not e.soft_failed and
             fragment("?->'m.relates_to'->>'event_id'", e.content) == ^target_event_id
+      )
 
-    base = if rel_type, do: from(e in base, where: fragment("?->'m.relates_to'->>'rel_type'", e.content) == ^rel_type), else: base
+    base =
+      if rel_type,
+        do:
+          from(e in base,
+            where: fragment("?->'m.relates_to'->>'rel_type'", e.content) == ^rel_type
+          ),
+        else: base
+
     base = if event_type, do: from(e in base, where: e.type == ^event_type), else: base
 
     query =
       case dir do
         "f" ->
-          from e in base,
+          from(e in base,
             where: e.stream_ordering > ^from_ordering,
             order_by: [asc: e.stream_ordering],
             limit: ^limit
+          )
 
         _ ->
-          from e in base,
+          from(e in base,
             where: e.stream_ordering < ^from_ordering,
             order_by: [desc: e.stream_ordering],
             limit: ^limit
+          )
       end
 
     Repo.all(query)
   end
 
+  @doc """
+  Full-text search over `m.room.message` bodies across `room_ids`
+  (for `POST /search`). Returns `{[{event_id, rank}], total_count}`,
+  ordered by `order_by` ("rank" or "recent").
+  """
+  def search_messages([], _search_term, _order_by, _limit), do: {[], 0}
+
+  def search_messages(room_ids, search_term, order_by, limit) do
+    order_sql = if order_by == "recent", do: "stream_ordering DESC", else: "rank DESC"
+
+    %{rows: rows} =
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        """
+        SELECT event_id, ts_rank(to_tsvector('english', content->>'body'), plainto_tsquery('english', $2)) AS rank
+        FROM events
+        WHERE room_id = ANY($1) AND type = 'm.room.message' AND NOT rejected
+          AND to_tsvector('english', content->>'body') @@ plainto_tsquery('english', $2)
+        ORDER BY #{order_sql}
+        LIMIT $3
+        """,
+        [room_ids, search_term, limit]
+      )
+
+    %{rows: [[count]]} =
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        """
+        SELECT count(*)
+        FROM events
+        WHERE room_id = ANY($1) AND type = 'm.room.message' AND NOT rejected
+          AND to_tsvector('english', content->>'body') @@ plainto_tsquery('english', $2)
+        """,
+        [room_ids, search_term]
+      )
+
+    {Enum.map(rows, fn [event_id, rank] -> {event_id, rank} end), count}
+  end
+
   @doc "Returns the current max stream_ordering across all events."
   def current_max_stream_ordering do
-    Repo.one(from e in Event, select: max(e.stream_ordering)) || 0
+    Repo.one(from(e in Event, select: max(e.stream_ordering))) || 0
   end
 
   @doc "Returns the max stream_ordering in a specific room."
   def room_max_stream_ordering(room_id) do
     Repo.one(
-      from e in Event,
+      from(e in Event,
         where: e.room_id == ^room_id,
         select: max(e.stream_ordering)
+      )
     ) || 0
   end
 
@@ -302,7 +371,9 @@ defmodule AxonCore.EventStore do
       children
       |> Enum.filter(&(&1.rel_type == "m.annotation"))
       |> Enum.group_by(fn c -> {c.type, get_in(c.content, ["m.relates_to", "key"])} end)
-      |> Enum.map(fn {{type, key}, events} -> %{"type" => type, "key" => key, "count" => length(events)} end)
+      |> Enum.map(fn {{type, key}, events} ->
+        %{"type" => type, "key" => key, "count" => length(events)}
+      end)
 
     if chunk == [], do: relations, else: Map.put(relations, "m.annotation", %{"chunk" => chunk})
   end
@@ -327,7 +398,8 @@ defmodule AxonCore.EventStore do
         Map.put(relations, "m.thread", %{
           "latest_event" => latest_event_map,
           "count" => length(thread_events),
-          "current_user_participated" => user_id != nil and Enum.any?(thread_events, &(&1.sender == user_id))
+          "current_user_participated" =>
+            user_id != nil and Enum.any?(thread_events, &(&1.sender == user_id))
         })
     end
   end
@@ -353,11 +425,12 @@ defmodule AxonCore.EventStore do
   @doc "Returns all current state events for a room as a list of event maps."
   def get_current_state(room_id) do
     Repo.all(
-      from e in Event,
+      from(e in Event,
         join: s in "current_room_state",
         on: s.event_id == e.event_id and s.room_id == ^room_id,
         where: not e.rejected,
         select: e
+      )
     )
   end
 
@@ -365,7 +438,7 @@ defmodule AxonCore.EventStore do
   def get_state_event(room_id, type, state_key) do
     result =
       Repo.one(
-        from e in Event,
+        from(e in Event,
           join: s in "current_room_state",
           on:
             s.event_id == e.event_id and
@@ -374,6 +447,7 @@ defmodule AxonCore.EventStore do
               s.state_key == ^state_key,
           where: not e.rejected,
           select: e
+        )
       )
 
     case result do
@@ -397,32 +471,89 @@ defmodule AxonCore.EventStore do
 
   def get_joined_rooms(user_id) do
     Repo.all(
-      from m in RoomMembership,
+      from(m in RoomMembership,
         where: m.user_id == ^user_id and m.membership == "join" and not m.forgotten,
         select: m.room_id
+      )
     )
   end
 
   def get_invited_rooms(user_id) do
     Repo.all(
-      from m in RoomMembership,
+      from(m in RoomMembership,
         where: m.user_id == ^user_id and m.membership == "invite" and not m.forgotten,
         select: m.room_id
+      )
     )
+  end
+
+  def get_knocked_rooms(user_id) do
+    Repo.all(
+      from(m in RoomMembership,
+        where: m.user_id == ^user_id and m.membership == "knock" and not m.forgotten,
+        select: m.room_id
+      )
+    )
+  end
+
+  @preview_state_types ~w(m.room.join_rules m.room.canonical_alias m.room.avatar m.room.name m.room.create m.room.encryption)
+
+  @doc """
+  Stripped state events (type/state_key/sender/content only) — the shape
+  used for invite_state and knock_state room previews.
+  """
+  def stripped_state_events(room_id, types \\ @preview_state_types) do
+    room_id
+    |> get_current_state()
+    |> Enum.filter(&(&1.type in types))
+    |> Enum.map(fn e ->
+      %{
+        "type" => e.type,
+        "state_key" => e.state_key,
+        "sender" => e.sender,
+        "content" => e.content || %{}
+      }
+    end)
+  end
+
+  @doc "Persists a knock's room preview (stripped state events) for /sync to render."
+  def set_knock_preview_state(room_id, user_id, events) do
+    Repo.update_all(
+      from(m in "room_memberships",
+        where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "knock"
+      ),
+      set: [preview_state: %{"events" => events}]
+    )
+
+    :ok
+  end
+
+  @doc "Returns the stored knock preview's stripped events for a room the user has knocked on."
+  def get_knock_preview_state(room_id, user_id) do
+    preview =
+      Repo.one(
+        from(m in "room_memberships",
+          where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "knock",
+          select: m.preview_state
+        )
+      )
+
+    (preview || %{})["events"] || []
   end
 
   def get_left_rooms_since(user_id, since_ordering, opts \\ []) do
     exclude_forgotten = Keyword.get(opts, :exclude_forgotten, false)
 
     q =
-      from m in RoomMembership,
+      from(m in RoomMembership,
         join: e in Event,
         on: e.event_id == m.event_id,
         where:
           m.user_id == ^user_id and
-          m.membership in ["leave", "ban"] and
-          e.stream_ordering > ^since_ordering,
+            m.membership in ["leave", "ban"] and
+            e.stream_ordering > ^since_ordering,
         select: m.room_id
+      )
 
     q = if exclude_forgotten, do: from(m in q, where: not m.forgotten), else: q
     Repo.all(q)
@@ -430,9 +561,10 @@ defmodule AxonCore.EventStore do
 
   def get_room_members(room_id, memberships \\ ["join"]) do
     Repo.all(
-      from m in RoomMembership,
+      from(m in RoomMembership,
         where: m.room_id == ^room_id and m.membership in ^memberships,
         select: m
+      )
     )
   end
 
@@ -449,7 +581,7 @@ defmodule AxonCore.EventStore do
 
   def latest_snapshot(room_id) do
     Repo.one(
-      from s in "room_state_snapshots",
+      from(s in "room_state_snapshots",
         where: s.room_id == ^room_id,
         order_by: [desc: s.after_stream_ordering],
         limit: 1,
@@ -457,6 +589,7 @@ defmodule AxonCore.EventStore do
           after_stream_ordering: s.after_stream_ordering,
           state_map: s.state_map
         }
+      )
     )
   end
 
@@ -492,13 +625,14 @@ defmodule AxonCore.EventStore do
     else
       events =
         Repo.all(
-          from e in Event,
+          from(e in Event,
             where:
               e.room_id in ^all_rooms and
                 e.stream_ordering > ^since_ordering and
                 not e.rejected and
                 not e.soft_failed,
             order_by: [asc: e.stream_ordering]
+          )
         )
 
       Enum.group_by(events, & &1.room_id)
@@ -518,6 +652,7 @@ defmodule AxonCore.EventStore do
       "type" => e.type,
       "content" => e.content || %{},
       "origin_server_ts" => e.origin_server_ts,
+      "origin" => e.origin,
       "depth" => e.depth,
       "auth_events" => e.auth_event_ids,
       "prev_events" => e.prev_event_ids,
@@ -535,7 +670,7 @@ defmodule AxonCore.EventStore do
   @doc "Returns true if the room exists locally."
   def room_exists?(room_id) do
     import Ecto.Query
-    Repo.one(from r in "rooms", where: r.room_id == ^room_id, select: r.room_id) != nil
+    Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.room_id)) != nil
   end
 
   @doc "Fetch event by ID and convert to wire-format map."

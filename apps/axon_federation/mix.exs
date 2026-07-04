@@ -11,9 +11,13 @@ defmodule AxonFederation.MixProject do
       lockfile: "../../mix.lock",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps()
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   # Run "mix help compile.app" to learn about applications.
   def application do
@@ -31,7 +35,8 @@ defmodule AxonFederation.MixProject do
       {:finch, "~> 0.19"},
       {:broadway, "~> 1.1"},
       {:plug, "~> 1.16"},
-      {:telemetry, "~> 1.2"}
+      {:telemetry, "~> 1.2"},
+      {:bandit, "~> 1.5", only: :test}
     ]
   end
 end

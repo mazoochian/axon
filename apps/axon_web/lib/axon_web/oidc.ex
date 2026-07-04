@@ -15,7 +15,8 @@ defmodule AxonWeb.Oidc do
 
   require Logger
 
-  alias AxonCore.UserStore
+  alias AxonCore.{Repo, UserStore}
+  alias AxonCore.Schema.OidcDeviceBinding
   alias AxonWeb.Oidc.Discovery
 
   @scope_api_regex ~r/^urn:matrix:(?:org\.matrix\.msc2967\.)?client:api:/
@@ -45,7 +46,7 @@ defmodule AxonWeb.Oidc do
          {:ok, meta} <- metadata(),
          introspection_endpoint when is_binary(introspection_endpoint) <- meta["introspection_endpoint"],
          {:ok, %{"active" => true} = claims} <- do_introspect(introspection_endpoint, raw_token),
-         {:ok, device_id} <- extract_device_id(claims),
+         {:ok, device_id} <- extract_device_id(claims, raw_token),
          true <- has_api_scope?(claims),
          localpart when is_binary(localpart) <- extract_localpart(claims) do
       server_name = Application.fetch_env!(:axon_web, :server_name)
@@ -99,19 +100,58 @@ defmodule AxonWeb.Oidc do
     |> Enum.any?(&Regex.match?(@scope_api_regex, &1))
   end
 
-  defp extract_device_id(claims) do
-    device_id =
-      (claims["scope"] || "")
-      |> String.split(" ", trim: true)
-      |> Enum.find_value(fn scope ->
-        case Regex.run(@scope_device_regex, scope) do
-          [_, device_id] -> device_id
-          nil -> nil
-        end
-      end)
-
-    if device_id, do: {:ok, device_id}, else: {:ok, generate_device_id()}
+  defp extract_device_id(claims, raw_token) do
+    case scope_device_id(claims) do
+      device_id when is_binary(device_id) -> {:ok, device_id}
+      nil -> {:ok, stable_fallback_device_id(raw_token)}
+    end
   end
+
+  defp scope_device_id(claims) do
+    (claims["scope"] || "")
+    |> String.split(" ", trim: true)
+    |> Enum.find_value(fn scope ->
+      case Regex.run(@scope_device_regex, scope) do
+        [_, device_id] -> device_id
+        nil -> nil
+      end
+    end)
+  end
+
+  # No MSC2967 device scope on this token — rather than minting a new random
+  # device_id on every request (which would make it impossible for a client
+  # to ever hold a coherent device/cross-signing identity), pin one device_id
+  # per token by hash, generating it once on first use.
+  defp stable_fallback_device_id(raw_token) do
+    hash = token_hash(raw_token)
+
+    case Repo.get_by(OidcDeviceBinding, token_hash: hash) do
+      %OidcDeviceBinding{device_id: device_id} ->
+        device_id
+
+      nil ->
+        candidate = generate_device_id()
+
+        Logger.warning(
+          "OIDC token introspection response has no urn:matrix:client:device:<id> scope; " <>
+            "falling back to a locally-generated stable device_id. The Authorization " <>
+            "Server/client should send MSC2967 device scopes."
+        )
+
+        %OidcDeviceBinding{}
+        |> OidcDeviceBinding.changeset(%{token_hash: hash, device_id: candidate})
+        |> Repo.insert(on_conflict: :nothing, conflict_target: :token_hash)
+
+        # Re-read so a concurrent request for the same token resolves to
+        # whichever candidate actually won the insert race.
+        case Repo.get_by(OidcDeviceBinding, token_hash: hash) do
+          %OidcDeviceBinding{device_id: device_id} -> device_id
+          nil -> candidate
+        end
+    end
+  end
+
+  defp token_hash(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
 
   # `username` is the documented fallback claim real ASes (Matrix
   # Authentication Service, Synapse's delegated-auth client) send for the

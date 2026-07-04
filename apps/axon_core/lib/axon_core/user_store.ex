@@ -23,15 +23,24 @@ defmodule AxonCore.UserStore do
 
     user_id = "@#{localpart}:#{server_name}"
     password_hash = if password, do: Argon2.hash_pwd_salt(password)
+    is_guest = opts[:is_guest] || false
 
     result =
       try do
         Ecto.Multi.new()
-        |> Ecto.Multi.insert(:user,
-          User.changeset(%User{}, %{user_id: user_id, localpart: localpart, password_hash: password_hash})
+        |> Ecto.Multi.insert(
+          :user,
+          User.changeset(%User{}, %{
+            user_id: user_id,
+            localpart: localpart,
+            password_hash: password_hash,
+            is_guest: is_guest
+          })
         )
         |> Ecto.Multi.insert(:profile, fn %{user: user} ->
-          UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: display_name || localpart})
+          UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{
+            displayname: display_name || localpart
+          })
         end)
         |> Ecto.Multi.insert(:device, fn %{user: user} ->
           Device.changeset(%Device{}, %{user_id: user.user_id, device_id: device_id})
@@ -101,14 +110,20 @@ defmodule AxonCore.UserStore do
   # Token management
   # ---------------------------------------------------------------------------
 
+  @doc "Whether `user_id` registered as a guest account (kind: \"guest\")."
+  def guest?(user_id) do
+    Repo.one(from(u in User, where: u.user_id == ^user_id, select: u.is_guest)) || false
+  end
+
   @doc "Validates a raw Bearer token. Returns `{:ok, {user_id, device_id}}` or `:error`."
   def validate_token(raw_token) do
     hash = token_hash(raw_token)
 
     case Repo.one(
-           from t in AccessToken,
+           from(t in AccessToken,
              where: t.token_hash == ^hash and t.valid == true,
              select: {t.user_id, t.device_id}
+           )
          ) do
       nil -> :error
       result -> {:ok, result}
@@ -118,24 +133,38 @@ defmodule AxonCore.UserStore do
   @doc "Invalidates a single token and deletes the associated device."
   def logout(raw_token) do
     hash = token_hash(raw_token)
-    case Repo.one(from t in AccessToken, where: t.token_hash == ^hash and t.valid == true, select: {t.user_id, t.device_id}) do
+
+    case Repo.one(
+           from(t in AccessToken,
+             where: t.token_hash == ^hash and t.valid == true,
+             select: {t.user_id, t.device_id}
+           )
+         ) do
       nil ->
         :ok
+
       {user_id, device_id} ->
-        Repo.update_all(from(t in AccessToken, where: t.user_id == ^user_id and t.device_id == ^device_id), set: [valid: false])
-        Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id))
+        Repo.update_all(
+          from(t in AccessToken, where: t.user_id == ^user_id and t.device_id == ^device_id),
+          set: [valid: false]
+        )
+
+        Repo.delete_all(
+          from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id)
+        )
+
         :ok
     end
   end
 
   @doc "Invalidates all tokens for a user (optionally scoped to a device)."
   def logout_all(user_id, except_token \\ nil) do
-    q = from t in AccessToken, where: t.user_id == ^user_id and t.valid == true
+    q = from(t in AccessToken, where: t.user_id == ^user_id and t.valid == true)
 
     q =
       if except_token do
         hash = token_hash(except_token)
-        from t in q, where: t.token_hash != ^hash
+        from(t in q, where: t.token_hash != ^hash)
       else
         q
       end
@@ -193,7 +222,10 @@ defmodule AxonCore.UserStore do
         |> Repo.insert()
         |> case do
           {:ok, user} ->
-            Repo.insert(UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: localpart}))
+            Repo.insert(
+              UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: localpart})
+            )
+
             {:ok, user.user_id}
 
           {:error, _changeset} ->

@@ -108,31 +108,59 @@ defmodule AxonWeb.EventController do
 
   # GET /_matrix/client/v3/rooms/:room_id/state
   def get_state(conn, %{"room_id" => room_id}) do
-    case RoomProcess.get_state(room_id) do
-      {:ok, events} ->
-        json(conn, events)
+    user_id = conn.assigns.current_user_id
 
-      {:error, reason} ->
-        {:error, reason}
+    if member_or_forgotten?(room_id, user_id) do
+      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+    else
+      case RoomProcess.get_state(room_id) do
+        {:ok, events} ->
+          json(conn, events)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/state/:event_type/:state_key
   def get_state_event(conn, %{"room_id" => room_id, "event_type" => event_type} = params) do
+    user_id = conn.assigns.current_user_id
     state_key = params["state_key"] || ""
     format = params["format"]
 
-    case RoomProcess.get_state_event(room_id, event_type, state_key) do
-      nil ->
-        {:error, :not_found}
+    if member_or_forgotten?(room_id, user_id) do
+      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+    else
+      case RoomProcess.get_state_event(room_id, event_type, state_key) do
+        nil ->
+          {:error, :not_found}
 
-      event ->
-        if format == "event" do
-          json(conn, event)
-        else
-          json(conn, event["content"] || %{})
-        end
+        event ->
+          if format == "event" do
+            json(conn, event)
+          else
+            json(conn, event["content"] || %{})
+          end
+      end
     end
+  end
+
+  # Regression guard (finding): get_state/2, get_state_event/2, and
+  # get_messages/2 used to have no membership check at all (or, for
+  # get_messages, only checked "forgotten" — never "never was a member"),
+  # meaning any authenticated user on the server could read a private
+  # room's full state/timeline just by knowing its room_id. get_relations/2
+  # already had the correct nil-or-forgotten check; this mirrors it.
+  defp member_or_forgotten?(room_id, user_id) do
+    membership =
+      Repo.one(
+        from m in "room_memberships",
+          where: m.room_id == ^room_id and m.user_id == ^user_id,
+          select: %{membership: m.membership, forgotten: m.forgotten}
+      )
+
+    membership == nil or membership.forgotten
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/event/:event_id
@@ -234,43 +262,34 @@ defmodule AxonWeb.EventController do
   def get_messages(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
 
-    # Check if user has access to this room (not forgotten, was a member)
-    membership =
-      Repo.one(
-        from m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: %{membership: m.membership, forgotten: m.forgotten}
-      )
-
-    if membership != nil and membership.forgotten do
-      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Room is forgotten"})
+    if member_or_forgotten?(room_id, user_id) do
+      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
     else
+      from_token = params["from"]
+      dir = params["dir"] || "b"
+      limit = String.to_integer(params["limit"] || "10")
 
-    from_token = params["from"]
-    dir = params["dir"] || "b"
-    limit = String.to_integer(params["limit"] || "10")
+      from_ordering = parse_token(from_token) || (EventStore.room_max_stream_ordering(room_id) + 1)
 
-    from_ordering = parse_token(from_token) || (EventStore.room_max_stream_ordering(room_id) + 1)
+      events = EventStore.get_messages(room_id, from_ordering, dir, limit)
 
-    events = EventStore.get_messages(room_id, from_ordering, dir, limit)
+      start_token = if from_token, do: from_token, else: Integer.to_string(from_ordering)
+      end_ordering =
+        if events == [],
+          do: from_ordering,
+          else: (if dir == "b", do: hd(events).stream_ordering, else: List.last(events).stream_ordering)
 
-    start_token = if from_token, do: from_token, else: Integer.to_string(from_ordering)
-    end_ordering =
-      if events == [],
-        do: from_ordering,
-        else: (if dir == "b", do: hd(events).stream_ordering, else: List.last(events).stream_ordering)
+      chunk =
+        events
+        |> Enum.map(&EventStore.event_to_map/1)
+        |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
 
-    chunk =
-      events
-      |> Enum.map(&EventStore.event_to_map/1)
-      |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
-
-    json(conn, %{
-      "start" => start_token,
-      "end" => Integer.to_string(end_ordering),
-      "chunk" => chunk,
-      "state" => []
-    })
+      json(conn, %{
+        "start" => start_token,
+        "end" => Integer.to_string(end_ordering),
+        "chunk" => chunk,
+        "state" => []
+      })
     end
   end
 

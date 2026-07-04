@@ -45,12 +45,19 @@ defmodule AxonWeb.DeviceController do
   end
 
   # POST /_matrix/client/v3/delete_devices
+  # Requires UIA (m.login.dummy or m.login.password) — bypassed when
+  # delegated OIDC auth (MSC3861) is enabled, since a valid, currently-active
+  # Authorization-Server-issued token is proof enough.
   def delete_devices(conn, params) do
     user_id = conn.assigns.current_user_id
     auth = params["auth"]
     device_ids = params["devices"] || []
 
     cond do
+      AxonWeb.Oidc.enabled?() ->
+        do_delete_devices(user_id, device_ids)
+        json(conn, %{})
+
       is_nil(auth) ->
         conn |> put_status(401) |> json(%{
           "session" => gen_session(),
@@ -58,12 +65,8 @@ defmodule AxonWeb.DeviceController do
           "params" => %{}
         })
 
-      validate_ui_auth(user_id, auth) == :ok || match?(%{"type" => "m.login.dummy"}, auth) ->
-        Repo.update_all(
-          from(t in AccessToken, where: t.user_id == ^user_id and t.device_id in ^device_ids),
-          set: [valid: false]
-        )
-        Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id in ^device_ids))
+      validate_ui_auth(user_id, auth) == :ok ->
+        do_delete_devices(user_id, device_ids)
         json(conn, %{})
 
       true ->
@@ -77,39 +80,37 @@ defmodule AxonWeb.DeviceController do
     end
   end
 
+  defp do_delete_devices(user_id, device_ids) do
+    Repo.update_all(
+      from(t in AccessToken, where: t.user_id == ^user_id and t.device_id in ^device_ids),
+      set: [valid: false]
+    )
+    Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id in ^device_ids))
+  end
+
   # DELETE /_matrix/client/v3/devices/:device_id
-  # Requires User-Interactive Authentication
+  # Requires User-Interactive Authentication — bypassed when delegated OIDC
+  # auth (MSC3861) is enabled, since a valid, currently-active
+  # Authorization-Server-issued token is proof enough.
   def delete(conn, %{"device_id" => device_id} = params) do
     user_id = conn.assigns.current_user_id
     auth = params["auth"]
 
     cond do
+      AxonWeb.Oidc.enabled?() ->
+        do_delete_device(conn, user_id, device_id)
+
       is_nil(auth) ->
         conn
         |> put_status(401)
         |> json(%{
           "session" => gen_session(),
-          "flows" => [%{"stages" => ["m.login.password"]}],
+          "flows" => [%{"stages" => ["m.login.password"]}, %{"stages" => ["m.login.dummy"]}],
           "params" => %{}
         })
 
       validate_ui_auth(user_id, auth) == :ok ->
-        case Repo.get_by(Device, user_id: user_id, device_id: device_id) do
-          nil ->
-            {:error, :not_found}
-
-          _device ->
-            Repo.update_all(
-              from(t in AccessToken,
-                where: t.user_id == ^user_id and t.device_id == ^device_id),
-              set: [valid: false]
-            )
-            Repo.delete_all(
-              from(d in Device,
-                where: d.user_id == ^user_id and d.device_id == ^device_id)
-            )
-            json(conn, %{})
-        end
+        do_delete_device(conn, user_id, device_id)
 
       true ->
         # Distinguish: auth user doesn't match current user → 403; wrong password → 401
@@ -121,7 +122,7 @@ defmodule AxonWeb.DeviceController do
           |> put_status(401)
           |> json(%{
             "session" => gen_session(),
-            "flows" => [%{"stages" => ["m.login.password"]}],
+            "flows" => [%{"stages" => ["m.login.password"]}, %{"stages" => ["m.login.dummy"]}],
             "params" => %{},
             "errcode" => "M_FORBIDDEN",
             "error" => "Invalid credentials"
@@ -130,9 +131,26 @@ defmodule AxonWeb.DeviceController do
     end
   end
 
+  defp do_delete_device(conn, user_id, device_id) do
+    case Repo.get_by(Device, user_id: user_id, device_id: device_id) do
+      nil ->
+        {:error, :not_found}
+
+      _device ->
+        Repo.update_all(
+          from(t in AccessToken, where: t.user_id == ^user_id and t.device_id == ^device_id),
+          set: [valid: false]
+        )
+        Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id))
+        json(conn, %{})
+    end
+  end
+
   defp get_auth_user_id(%{"identifier" => %{"user" => u}}, _default) when is_binary(u), do: u
   defp get_auth_user_id(%{"user" => u}, _default) when is_binary(u), do: u
   defp get_auth_user_id(_auth, default), do: default
+
+  defp validate_ui_auth(_user_id, %{"type" => "m.login.dummy"}), do: :ok
 
   defp validate_ui_auth(current_user_id, %{"type" => "m.login.password"} = auth) do
     identifier = auth["identifier"] || %{}

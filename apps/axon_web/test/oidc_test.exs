@@ -116,4 +116,100 @@ defmodule AxonWeb.OidcTest do
     assert register_conn.status == 403
     assert decode(register_conn)["errcode"] == "M_FORBIDDEN"
   end
+
+  describe "device identity stability without an MSC2967 device scope" do
+    defp whoami(token) do
+      build_conn()
+      |> put_req_header("authorization", "Bearer #{token}")
+      |> get("/_matrix/client/v3/account/whoami")
+      |> decode()
+    end
+
+    test "a token whose introspection response has no device scope gets a stable fallback device_id" do
+      token = AxonWeb.FakeOidcServer.valid_token_no_device_scope()
+
+      first = whoami(token)
+      assert is_binary(first["device_id"])
+
+      for _ <- 1..3 do
+        again = whoami(token)
+        assert again["device_id"] == first["device_id"]
+        assert again["user_id"] == first["user_id"]
+      end
+    end
+  end
+
+  describe "sensitive endpoints bypass password-based UIA while OIDC is enabled" do
+    test "cross-signing key upload succeeds without an auth challenge" do
+      token = AxonWeb.FakeOidcServer.valid_token()
+      user_id = whoami(token)["user_id"]
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> put_req_header("content-type", "application/json")
+        |> post(
+          "/_matrix/client/v3/keys/device_signing/upload",
+          Jason.encode!(%{
+            "master_key" => %{
+              "keys" => %{"ed25519:oidc_master_pub" => "oidc_master_key_value"},
+              "usage" => ["master"],
+              "user_id" => user_id
+            }
+          })
+        )
+
+      assert conn.status == 200
+      assert decode(conn) == %{}
+    end
+
+    test "device deletion succeeds without an auth challenge" do
+      token = AxonWeb.FakeOidcServer.valid_token_no_device_scope()
+      device_id = whoami(token)["device_id"]
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> delete("/_matrix/client/v3/devices/#{device_id}")
+
+      assert conn.status == 200
+    end
+
+    test "account deactivation succeeds without an auth challenge" do
+      token = AxonWeb.FakeOidcServer.valid_token_no_device_scope()
+      whoami(token)
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> put_req_header("content-type", "application/json")
+        |> post("/_matrix/client/v3/account/deactivate", Jason.encode!(%{}))
+
+      assert conn.status == 200
+      assert decode(conn)["id_server_unbind_result"] == "success"
+    end
+
+    test "password change is reported as disabled and rejected" do
+      token = AxonWeb.FakeOidcServer.valid_token()
+
+      capabilities_conn =
+        build_conn()
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> get("/_matrix/client/v3/capabilities")
+
+      assert decode(capabilities_conn)["capabilities"]["m.change_password"]["enabled"] == false
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> put_req_header("content-type", "application/json")
+        |> post(
+          "/_matrix/client/v3/account/password",
+          Jason.encode!(%{"new_password" => "New1234!"})
+        )
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+  end
 end

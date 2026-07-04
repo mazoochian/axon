@@ -395,11 +395,10 @@ defmodule AxonWeb.CryptoIdentityTest do
           }
         })
 
-      # m.login.sso is not an accepted UIA type for this endpoint
-      # The server should either 401 (re-challenge) or accept only dummy/password
-      # Our implementation accepts any auth when auth is non-nil — this test
-      # documents current behavior and should be tightened when we add real UIA validation
-      assert conn.status in [200, 401]
+      # m.login.sso is not an accepted UIA type for this endpoint — must be
+      # rejected with a fresh 401 challenge, not silently accepted.
+      assert conn.status == 401
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
     end
 
     test "GET /room_keys/version returns 404 when user has no backup" do

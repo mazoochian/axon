@@ -8,12 +8,21 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 
 | Phase | Scope | Status |
 |---|---|---|
-| **Phase 1** — CS API | Auth, rooms, events, sync, filters, directory, E2EE keys | **Complete** — 37/50 Complement CS API tests pass (all 13 failures are Phase 3/4 scope: media, push, presence, search) |
-| **Phase 2** — Federation | State res v2, S2S API, room join, PDU fan-out | **In progress** — foundation built (key cache, HTTP client, all endpoints, outbound fan-out) |
+| **Phase 1** — CS API | Auth, rooms, events, sync, filters, directory, E2EE keys | **Complete** |
+| **Phase 2** — Federation | State res v2, S2S API, room join/knock, restricted joins, cross-server E2EE, PDU fan-out | **Complete** — join, knock, and restricted-room (MSC3083) flows all work over federation; `/keys/query` and `/keys/claim` fall back to `/_matrix/federation/v1/user/keys/*` for remote users |
 | **Phase 3** — Full E2EE | Cross-signing, key backup, SSSS, device list sync, to-device delivery | **Complete** — user-scoped key backup, cross-signing UIA, device list change tracking, OTK counts in sync |
-| **Phase 4** — Media/Push | Upload/download, thumbnails, push notifications, App Services | **Complete** — local filesystem media, Sygnal-compatible push delivery, AS skeleton with PubSub fanout |
-| **Phase 5** — Advanced | Spaces, threads, reactions, room upgrades | Not started |
-| **Phase 6** — OIDC | OAuth2/OIDC login (MSC3861) for Fractal and modern clients | Not started |
+| **Phase 4** — Media/Push | Upload/download, real thumbnails, push notifications, App Services | **Complete** — local filesystem media, ImageMagick-backed thumbnailing (cached on disk), Sygnal-compatible push delivery, AS skeleton with PubSub fanout |
+| **Phase 5** — Advanced | Spaces, threads, reactions, room upgrades | **Complete** |
+| **Phase 6** — OIDC | OAuth2/OIDC login (MSC3861) for Fractal and modern clients | **Complete** |
+| **Phase 7** — Presence & search | Presence tracking, room message search, content reporting, guest access | **Complete** — in-memory (ETS) presence with idle/offline auto-decay, Postgres full-text message search, `/report`, `m.room.guest_access` enforcement |
+
+Complement CS API pass rate: run `mix ecto.migrate` then the Complement suite below for current numbers — the last full run (pre-Phase 7) was 37/50, with all failures in areas Phase 7 now covers (media thumbnails, presence, search) plus a few not yet re-verified against Complement specifically (server notices are still unimplemented; see "Known gaps" below).
+
+### Known gaps
+
+- **Server notices** (`m.server_notice` rooms, Synapse-style admin broadcast) are not implemented.
+- **URL previews** (`GET /media/v3/preview_url`) still return 404 — deliberately deferred, since fetching arbitrary user-submitted URLs server-side needs SSRF-safe handling (deny-list private IP ranges, size/time limits) that hasn't been built yet.
+- Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
 
 ## Why BEAM?
 
@@ -114,6 +123,7 @@ Core tables:
 
 - Elixir 1.18+, Erlang/OTP 27+
 - PostgreSQL 15+
+- ImageMagick (`convert`) — for media thumbnailing; not required to run the server, only to generate resized thumbnails (non-image thumbnail requests fall back to the original file)
 
 ### Development
 
@@ -304,24 +314,7 @@ COMPLEMENT_BASE_IMAGE=axon-complement:latest \
 
 ### Current results
 
-**37/50 CS API tests passing.** All 13 failures are out-of-scope for Phase 1:
-
-```
-PASS: Auth, registration, login, logout, whoami, password change
-PASS: Rooms — create, join, leave, invite, kick, ban, unban, forget
-PASS: Events — send, state, redact, messages, history visibility
-PASS: Sync — initial, incremental, filters, account data, ignored users, unsigned.membership
-PASS: Directory — public rooms, aliases, canonical alias, room visibility
-PASS: E2EE — keys upload/query/claim, to-device messages
-PASS: Profile, receipts, read markers, device management
-
-FAIL: Media (5 tests) — Phase 4
-FAIL: E2EE device list updates (3 tests) — Phase 3
-FAIL: Push (2 tests) — Phase 4
-FAIL: Presence (1 test) — Phase 3
-FAIL: Search (1 test) — Phase 4
-FAIL: Server notices (1 test) — Phase 4
-```
+The last full Complement run (37/50 CS API tests) predates Phases 3–7 and is stale — most of its 13 failures (media, presence, search) are in areas that have since been built out. Re-run the suite above for current numbers; the only known-remaining gap is server notices (not implemented — see "Known gaps" in Status).
 
 ## Media storage
 
@@ -333,6 +326,10 @@ config :axon_media, :storage_path, "/var/lib/axon/media"
 ```
 
 Each upload generates a random 24-character base64url ID (`mxc://server/ID`). Remote media is proxied on download.
+
+### Thumbnails
+
+`GET /_matrix/media/v3/thumbnail/...` generates real thumbnails via ImageMagick (`crop` or `scale`, any `width`/`height` up to 1600px), cached on disk next to the original so repeat requests for the same size don't re-encode. Non-image content (or a missing `convert` binary) falls back to serving the original file untouched. Remote thumbnail requests are proxied straight to the origin server's own thumbnail endpoint rather than re-encoded locally.
 
 ## Application Services
 
@@ -346,9 +343,7 @@ Registration format matches Synapse's schema. The manager subscribes to all room
 
 ## Room versions
 
-Supported room versions: **2–11** (default: **11**).
-
-Room version 12 (state resolution v2.1 per MSC4297) is planned for Phase 2 completion.
+Supported room versions: **2–12** (default for new rooms: **11** — pass `room_version` to `/createRoom` for v12). Restricted joins (`join_rule: restricted`/`knock_restricted`, MSC3083) work on any version that supports them. Note: v12 is accepted and validated, but state resolution doesn't yet implement the MSC4297 v2.1 auth-difference changes specific to that version — v12 rooms currently resolve state with the same algorithm as v6–v11.
 
 ## Federation
 
@@ -356,10 +351,12 @@ Federation is implemented per the [Matrix S2S spec v1.18](https://spec.matrix.or
 
 Implemented endpoints:
 - `GET /_matrix/key/v2/server` — server signing key document
-- `GET /_matrix/federation/v1/make_join/:roomId/:userId`
+- `GET /_matrix/federation/v1/make_join/:roomId/:userId` — includes MSC3083 restricted-join authorisation
 - `PUT /_matrix/federation/v2/send_join/:roomId/:eventId`
 - `GET /_matrix/federation/v1/make_leave/:roomId/:userId`
 - `PUT /_matrix/federation/v2/send_leave/:roomId/:eventId`
+- `GET /_matrix/federation/v1/make_knock/:roomId/:userId`
+- `PUT /_matrix/federation/v1/send_knock/:roomId/:eventId`
 - `PUT /_matrix/federation/v1/send/:txnId` — inbound PDU transactions
 - `GET /_matrix/federation/v1/event/:eventId`
 - `GET /_matrix/federation/v1/state/:roomId`
@@ -368,6 +365,15 @@ Implemented endpoints:
 - `POST /_matrix/federation/v1/get_missing_events/:roomId`
 - `GET /_matrix/federation/v1/query/directory`
 - `GET /_matrix/federation/v1/query/profile`
+- `POST /_matrix/federation/v1/user/keys/query` / `claim`, `GET /_matrix/federation/v1/user/devices/:userId` — cross-server E2EE key exchange
+
+## Presence
+
+Presence (`GET`/`PUT /_matrix/client/v3/presence/:userId/status`) is tracked in-memory (ETS) per server — no DB persistence, since presence is ephemeral by spec. Using the API at all marks a user "online"; a background sweep drops idle users to "unavailable" after 5 minutes and "offline" after 30. `/sync` reports presence for the syncing user plus anyone sharing a joined room with them.
+
+## Search
+
+`POST /_matrix/client/v3/search` runs a Postgres full-text search (`tsvector`/`tsquery`, English config) over `m.room.message` bodies in rooms the requester has joined, with `rank` or `recent` ordering and per-result timeline context.
 
 ## License
 

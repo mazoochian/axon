@@ -12,7 +12,7 @@ defmodule AxonPush.Dispatcher do
 
   @doc "Called after an event is persisted. Runs in a Task so it never blocks RoomProcess."
   def dispatch_event(event, room_id) do
-    Task.start(fn -> do_dispatch(event, room_id) end)
+    Task.Supervisor.start_child(AxonPush.TaskSupervisor, fn -> do_dispatch(event, room_id) end)
   end
 
   # ---------------------------------------------------------------------------

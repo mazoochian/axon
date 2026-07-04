@@ -108,5 +108,21 @@ defmodule AxonCrypto.EventHashTest do
       assert {:error, :invalid_signature} ==
                EventHash.verify_signature(tampered, "example.com", "ed25519:abc", pub)
     end
+
+    test "verification still succeeds once event_id is added after signing (matches EventBuilder's real order of operations)",
+         %{public_key: pub, private_key: priv} do
+      # EventBuilder.build/5 signs the skeleton BEFORE "event_id" exists on the
+      # map, then adds "event_id" (the reference hash) afterward. Any event
+      # round-tripped through EventStore.event_to_map/1 always carries
+      # "event_id". If verify_signature/4 didn't exclude "event_id" from its
+      # signable computation, every axon-produced event would fail
+      # re-verification the moment it's fetched back from storage.
+      event = %{"type" => "m.room.message", "content" => %{"body" => "hi"}}
+      signed = EventHash.sign_event(event, "example.com", "ed25519:abc", priv)
+      event_id = EventHash.reference_hash(signed)
+      with_event_id = Map.put(signed, "event_id", event_id)
+
+      assert :ok == EventHash.verify_signature(with_event_id, "example.com", "ed25519:abc", pub)
+    end
   end
 end

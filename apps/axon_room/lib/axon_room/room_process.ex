@@ -324,17 +324,27 @@ defmodule AxonRoom.RoomProcess do
     end
   end
 
+  # Separates type/state_key in the flattened snapshot map key. NOT a literal
+  # NUL byte (\x00) -- Postgres's `jsonb` type rejects it outright
+  # ("unsupported Unicode escape sequence"), which silently broke every
+  # snapshot write (the fire-and-forget save task just failed and logged, so
+  # RoomProcess always replayed from event 0 on restart). \x1F (Unit
+  # Separator) is a control character meant for exactly this and, unlike
+  # \x00, Postgres stores it fine; Matrix type/state_key strings never
+  # contain it.
+  @snapshot_key_sep "\x1F"
+
   defp save_snapshot(state, stream_ordering) do
     state_map =
       Enum.into(state.current_state, %{}, fn {{type, sk}, event} ->
-        {"#{type}\0#{sk}", event["event_id"]}
+        {"#{type}#{@snapshot_key_sep}#{sk}", event["event_id"]}
       end)
 
     EventStore.create_snapshot(state.room_id, stream_ordering, state_map)
   end
 
   defp deserialize_snapshot(state_map, room_id) do
-    # state_map: %{"type\0state_key" => event_id}
+    # state_map: %{"type<sep>state_key" => event_id}
     # We need to load the actual events from the DB
     event_ids = Map.values(state_map)
 
@@ -356,7 +366,7 @@ defmodule AxonRoom.RoomProcess do
       end)
 
     Enum.into(state_map, %{}, fn {key, event_id} ->
-      [type, state_key] = String.split(key, "\0", parts: 2)
+      [type, state_key] = String.split(key, @snapshot_key_sep, parts: 2)
       event = Map.get(event_map_by_id, event_id)
       {{type, state_key}, event}
     end)

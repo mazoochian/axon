@@ -23,6 +23,9 @@ defmodule AxonRoom.AuthRules do
     end
   end
 
+  @doc "Whether `user_id` currently has at least invite power in this room (used to pick a restricted-join authoriser)."
+  def can_invite?(user_id, current_state), do: has_power?(user_id, "invite", current_state)
+
   # ---------------------------------------------------------------------------
   # m.room.create — must be the first event
   # ---------------------------------------------------------------------------
@@ -84,7 +87,7 @@ defmodule AxonRoom.AuthRules do
     membership = get_in(event, ["content", "membership"])
 
     case membership do
-      "join" -> check_join(sender, target, current_state)
+      "join" -> check_join(event, sender, target, current_state)
       "invite" -> check_invite(sender, target, current_state)
       "leave" -> check_leave(sender, target, current_state)
       "ban" -> check_ban(sender, target, current_state)
@@ -93,7 +96,7 @@ defmodule AxonRoom.AuthRules do
     end
   end
 
-  defp check_join(sender, target, current_state) do
+  defp check_join(event, sender, target, current_state) do
     cond do
       sender != target ->
         {:error, :cannot_join_for_another}
@@ -119,10 +122,7 @@ defmodule AxonRoom.AuthRules do
               else: {:error, :not_invited}
 
           join_rule in ["restricted", "knock_restricted"] ->
-            # Phase 1: treat as invite-only; full restricted logic in Phase 2
-            if sender_membership == "invite" or room_creator?(sender, current_state),
-              do: :ok,
-              else: {:error, :not_invited}
+            check_restricted_join(event, sender, sender_membership, current_state)
 
           join_rule == "knock" ->
             if sender_membership in ["invite", "knock"], do: :ok, else: {:error, :not_invited}
@@ -130,6 +130,31 @@ defmodule AxonRoom.AuthRules do
           true ->
             {:error, :not_invited}
         end
+    end
+  end
+
+  # MSC3083 restricted joins. A server that isn't itself resident in one of
+  # the room's `allow`-listed rooms can't know the joiner's membership there,
+  # so the actual "is this user allow-listed" check happens out-of-band
+  # (AxonRoom.RestrictedJoin, which has DB access) before the join event is
+  # ever built. What AuthRules verifies here — purely from this room's own
+  # state — is the vouching mechanism: the event must name a
+  # `join_authorised_via_users_server` user who is currently joined to *this*
+  # room with at least invite power. Trusting that stamp is safe because the
+  # event is signed by the authorising user's own homeserver.
+  defp check_restricted_join(event, sender, sender_membership, current_state) do
+    authoriser = get_in(event, ["content", "join_authorised_via_users_server"])
+
+    cond do
+      sender_membership == "invite" or room_creator?(sender, current_state) ->
+        :ok
+
+      is_binary(authoriser) and current_membership(authoriser, current_state) == "join" and
+          has_power?(authoriser, "invite", current_state) ->
+        :ok
+
+      true ->
+        {:error, :not_invited}
     end
   end
 
@@ -165,10 +190,19 @@ defmodule AxonRoom.AuthRules do
         do: :ok,
         else: {:error, :not_joined}
     else
-      # Kick: sender must be joined with kick power
       cond do
         sender_membership != "join" ->
           {:error, :not_joined}
+
+        # Unban ("leave" targeting a banned user) is gated by ban power, not
+        # kick power — this must be checked before the generic
+        # not-in-room rejection below, or a banned target (whose membership
+        # is legitimately "ban", not "join"/"invite") can never be unbanned
+        # by anyone, ever.
+        target_membership == "ban" ->
+          if has_power?(sender, "ban", current_state),
+            do: :ok,
+            else: {:error, :insufficient_power}
 
         target_membership not in ["join", "invite"] ->
           {:error, :target_not_in_room}
@@ -297,6 +331,7 @@ defmodule AxonRoom.AuthRules do
   # An empty PL event {} still exists → creator does NOT get implicit 100 in that case.
   defp effective_power(user_id, pl, current_state) do
     has_pl_event = Map.has_key?(current_state, {"m.room.power_levels", ""})
+
     if not has_pl_event and room_creator?(user_id, current_state),
       do: 100,
       else: sender_power(user_id, pl)

@@ -64,6 +64,39 @@ defmodule AxonWeb.FallbackController do
     |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not invited to this room"})
   end
 
+  def call(conn, {:error, :guest_access_forbidden}) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Guest access is not allowed in this room"})
+  end
+
+  def call(conn, {:error, :restricted_join_denied}) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "You are not permitted to join this room"})
+  end
+
+  def call(conn, {:error, :knocking_not_allowed}) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "This room does not accept knocks"})
+  end
+
+  def call(conn, {:error, :already_in_room}) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Already in this room"})
+  end
+
+  def call(conn, {:error, :cannot_knock_for_another}) do
+    conn
+    |> put_status(400)
+    |> json(%{
+      "errcode" => "M_INVALID_PARAM",
+      "error" => "Cannot knock on behalf of another user"
+    })
+  end
+
   def call(conn, {:error, :target_banned}) do
     conn
     |> put_status(403)
@@ -85,7 +118,10 @@ defmodule AxonWeb.FallbackController do
   def call(conn, {:error, {:bad_canonical_alias, alias_val}}) do
     conn
     |> put_status(400)
-    |> json(%{"errcode" => "M_BAD_ALIAS", "error" => "Alias #{alias_val} does not exist or does not point to this room"})
+    |> json(%{
+      "errcode" => "M_BAD_ALIAS",
+      "error" => "Alias #{alias_val} does not exist or does not point to this room"
+    })
   end
 
   def call(conn, {:error, _reason}) do
@@ -96,6 +132,9 @@ defmodule AxonWeb.FallbackController do
 
   # Phoenix render_errors integration — called when the router has no matching route
   def render("404.json", _assigns), do: %{"errcode" => "M_NOT_FOUND", "error" => "Not found"}
-  def render("500.json", _assigns), do: %{"errcode" => "M_UNKNOWN", "error" => "Internal server error"}
+
+  def render("500.json", _assigns),
+    do: %{"errcode" => "M_UNKNOWN", "error" => "Internal server error"}
+
   def render(_, _assigns), do: %{"errcode" => "M_UNKNOWN", "error" => "Internal server error"}
 end
