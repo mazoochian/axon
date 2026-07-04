@@ -62,6 +62,16 @@ defmodule AxonWeb.CryptoIdentityTest do
 
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
+  # Signs `key_json` (a cross-signing key object) with `master_priv`, the way
+  # a real client signs self_signing_key/user_signing_key with the master
+  # key: canonical JSON with "signatures" dropped, Ed25519 over that.
+  defp sign_with_master(key_json, user_id, master_key_id, master_priv) do
+    signable = key_json |> Map.drop(["signatures"]) |> AxonCrypto.CanonicalJSON.encode_to_binary()
+    sig = :crypto.sign(:eddsa, :none, signable, [master_priv, :ed25519])
+    sig_b64 = Base.encode64(sig, padding: false)
+    Map.put(key_json, "signatures", %{user_id => %{master_key_id => sig_b64}})
+  end
+
   # -------------------------------------------------------------------------
   # Tests
   # -------------------------------------------------------------------------
@@ -399,6 +409,106 @@ defmodule AxonWeb.CryptoIdentityTest do
       # rejected with a fresh 401 challenge, not silently accepted.
       assert conn.status == 401
       assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+
+    test "MSC3967: self_signing_key/user_signing_key signed by the on-file master key skip UIA" do
+      user = register("msc3967_#{System.unique_integer([:positive])}")
+
+      {master_pub, master_priv} = :crypto.generate_key(:eddsa, :ed25519)
+      master_pub_b64 = Base.encode64(master_pub, padding: false)
+      master_key_id = "ed25519:msc3967_master"
+
+      master_key = %{
+        "keys" => %{master_key_id => master_pub_b64},
+        "usage" => ["master"],
+        "user_id" => user.user_id
+      }
+
+      # Step 1: establish the master key -- this still requires normal UIA.
+      challenge =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{"master_key" => master_key})
+
+      assert challenge.status == 401
+
+      established =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
+          "auth" => %{"type" => "m.login.dummy"},
+          "master_key" => master_key
+        })
+
+      assert established.status == 200
+
+      # Step 2: a *separate* follow-up request uploading self_signing_key +
+      # user_signing_key, each validly signed by the master key above, with
+      # NO "auth" block at all. Real clients (matrix-js-sdk, matrix-rust-sdk)
+      # do exactly this per MSC3967 -- it must succeed without a fresh
+      # password prompt, since the signature already proves ownership.
+      self_signing_key = sign_with_master(%{
+        "keys" => %{"ed25519:msc3967_self" => "self_pub"},
+        "usage" => ["self_signing"],
+        "user_id" => user.user_id
+      }, user.user_id, master_key_id, master_priv)
+
+      user_signing_key = sign_with_master(%{
+        "keys" => %{"ed25519:msc3967_user" => "user_pub"},
+        "usage" => ["user_signing"],
+        "user_id" => user.user_id
+      }, user.user_id, master_key_id, master_priv)
+
+      followup =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
+          "self_signing_key" => self_signing_key,
+          "user_signing_key" => user_signing_key
+        })
+
+      assert followup.status == 200
+
+      query =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/query", %{"device_keys" => %{user.user_id => []}})
+
+      body = decode(query)
+      assert body["self_signing_keys"][user.user_id]["keys"]["ed25519:msc3967_self"] == "self_pub"
+      assert body["user_signing_keys"][user.user_id]["keys"]["ed25519:msc3967_user"] == "user_pub"
+    end
+
+    test "MSC3967 exemption rejects a self_signing_key with an invalid master-key signature" do
+      user = register("msc3967_bad_#{System.unique_integer([:positive])}")
+
+      {master_pub, _master_priv} = :crypto.generate_key(:eddsa, :ed25519)
+      master_pub_b64 = Base.encode64(master_pub, padding: false)
+      master_key_id = "ed25519:msc3967_bad_master"
+
+      master_key = %{
+        "keys" => %{master_key_id => master_pub_b64},
+        "usage" => ["master"],
+        "user_id" => user.user_id
+      }
+
+      authed(user.token)
+      |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
+        "auth" => %{"type" => "m.login.dummy"},
+        "master_key" => master_key
+      })
+
+      # Signed with an unrelated keypair, not the real master key -- must NOT
+      # be accepted as an MSC3967 bypass, and must fall back to requiring UIA.
+      {_wrong_pub, wrong_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      self_signing_key = sign_with_master(%{
+        "keys" => %{"ed25519:msc3967_bad_self" => "self_pub"},
+        "usage" => ["self_signing"],
+        "user_id" => user.user_id
+      }, user.user_id, master_key_id, wrong_priv)
+
+      conn =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{"self_signing_key" => self_signing_key})
+
+      assert conn.status == 401
     end
 
     test "GET /room_keys/version returns 404 when user has no backup" do

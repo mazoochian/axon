@@ -4,7 +4,7 @@ defmodule AxonWeb.DeviceController do
   action_fallback AxonWeb.FallbackController
 
   import Ecto.Query
-  alias AxonCore.{Repo, UserStore}
+  alias AxonCore.{KeyStore, Repo, UserStore}
   alias AxonCore.Schema.{Device, AccessToken}
 
   # GET /_matrix/client/v3/devices
@@ -85,7 +85,12 @@ defmodule AxonWeb.DeviceController do
       from(t in AccessToken, where: t.user_id == ^user_id and t.device_id in ^device_ids),
       set: [valid: false]
     )
-    Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id in ^device_ids))
+
+    # Purges device_keys/one_time_keys/fallback_keys per device too -- not
+    # just the `devices` row -- so a removed device's identity keys don't
+    # keep getting served by /keys/query forever.
+    Enum.each(device_ids, &KeyStore.purge_device(user_id, &1))
+    KeyStore.record_device_list_update(user_id)
   end
 
   # DELETE /_matrix/client/v3/devices/:device_id
@@ -141,7 +146,9 @@ defmodule AxonWeb.DeviceController do
           from(t in AccessToken, where: t.user_id == ^user_id and t.device_id == ^device_id),
           set: [valid: false]
         )
-        Repo.delete_all(from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id))
+
+        KeyStore.purge_device(user_id, device_id)
+        KeyStore.record_device_list_update(user_id)
         json(conn, %{})
     end
   end

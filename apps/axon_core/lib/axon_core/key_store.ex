@@ -180,4 +180,46 @@ defmodule AxonCore.KeyStore do
     )
     |> Enum.into(%{})
   end
+
+  @doc """
+  Fully removes a device: its `devices` row plus everything tied to its
+  cryptographic identity (device keys, one-time keys, fallback keys, and any
+  to-device messages still queued for it).
+
+  Use this instead of deleting from `devices` alone anywhere a device is
+  logged out or explicitly removed (logout, `DELETE /devices/:id`,
+  `POST /delete_devices`, dehydrated-device replacement). Without it, the
+  device's key material is orphaned and `/keys/query` keeps serving keys for
+  a session that no longer exists, indefinitely.
+  """
+  def purge_device(user_id, device_id) do
+    Repo.delete_all(
+      from(d in "devices", where: d.user_id == ^user_id and d.device_id == ^device_id)
+    )
+
+    Repo.delete_all(
+      from(k in "device_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
+    )
+
+    Repo.delete_all(
+      from(k in "one_time_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
+    )
+
+    Repo.delete_all(
+      from(k in "fallback_keys", where: k.user_id == ^user_id and k.device_id == ^device_id)
+    )
+
+    Repo.delete_all(
+      from(m in "to_device_messages",
+        where: m.target_user_id == ^user_id and m.target_device_id == ^device_id
+      )
+    )
+  end
+
+  @doc "Records that user_id's device/cross-signing keys changed, for /sync device_lists.changed and /keys/changes."
+  def record_device_list_update(user_id) do
+    # stream_ordering is recorded for informational purposes; queries use id (bigserial).
+    ordering = AxonCore.EventStore.current_max_stream_ordering()
+    Repo.insert_all("device_list_updates", [%{user_id: user_id, stream_ordering: ordering}])
+  end
 end
