@@ -387,7 +387,7 @@ defmodule AxonWeb.FederationController do
   # GET /_matrix/federation/v1/state/:room_id
   # ---------------------------------------------------------------------------
 
-  def get_state(conn, %{"room_id" => room_id} = params) do
+  def get_state(conn, %{"room_id" => room_id}) do
     state_events = EventStore.get_current_state(room_id)
     auth_chain = build_auth_chain_for_state(state_events)
 

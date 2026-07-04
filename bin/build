@@ -10,6 +10,9 @@ mix deps.get
 echo "==> Compiling"
 MIX_ENV=prod mix compile
 
+echo "==> Creating database (if needed)"
+MIX_ENV=prod mix ecto.create
+
 echo "==> Running migrations"
 MIX_ENV=prod mix ecto.migrate
 
