@@ -2,9 +2,9 @@ defmodule AxonWeb.SyncController do
   use Phoenix.Controller, formats: [:json]
 
   import Ecto.Query, only: [from: 2]
-  alias AxonCore.{EventStore, KeyStore, Repo}
+  alias AxonCore.{EventStore, Repo}
   alias AxonSync.Manager, as: SyncManager
-  alias AxonSync.Presence
+  alias AxonWeb.SyncHelpers
 
   @default_timeline_limit 100
 
@@ -24,7 +24,7 @@ defmodule AxonWeb.SyncController do
     # pr_cursor tracks AxonSync.Presence's version counter; left_cursor tracks
     # device_list_partings.id; eph_cursor tracks ephemeral_updates.id (typing/receipts).
     {since_ordering, dl_since, ad_since, pr_since, left_since, eph_since} =
-      parse_sync_token(since)
+      SyncHelpers.parse_token(since)
 
     filter = load_filter(user_id, params["filter"])
 
@@ -48,12 +48,14 @@ defmodule AxonWeb.SyncController do
       end
 
     # Advance cursors to current maxes
-    dl_next = current_dl_max_id()
-    ad_next = current_ad_max_id()
-    pr_next = Presence.current_version()
-    left_next = current_left_max_id()
-    eph_next = current_eph_max_id()
-    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}_#{pr_next}_#{left_next}_#{eph_next}"
+    dl_next = SyncHelpers.current_dl_max_id()
+    ad_next = SyncHelpers.current_ad_max_id()
+    pr_next = AxonSync.Presence.current_version()
+    left_next = SyncHelpers.current_left_max_id()
+    eph_next = SyncHelpers.current_eph_max_id()
+
+    next_batch =
+      SyncHelpers.build_token(next_ordering, dl_next, ad_next, pr_next, left_next, eph_next)
 
     rooms_response =
       build_rooms_response(
@@ -65,19 +67,19 @@ defmodule AxonWeb.SyncController do
         filter
       )
 
-    global_account_data = get_global_account_data(user_id, is_initial_sync, ad_since)
-    presence_events = get_presence_events(user_id, is_initial_sync, pr_since)
+    global_account_data = SyncHelpers.get_global_account_data(user_id, is_initial_sync, ad_since)
+    presence_events = SyncHelpers.get_presence_events(user_id, is_initial_sync, pr_since)
 
     # E2EE sync additions
-    {to_device_events, _max_tdm_id} = drain_to_device_messages(user_id, device_id)
-    otk_counts = get_otk_counts(user_id, device_id)
-    unused_fallback_types = get_unused_fallback_key_types(user_id, device_id)
+    {to_device_events, _max_tdm_id} = SyncHelpers.drain_to_device_messages(user_id, device_id)
+    otk_counts = SyncHelpers.get_otk_counts(user_id, device_id)
+    unused_fallback_types = SyncHelpers.get_unused_fallback_key_types(user_id, device_id)
 
     device_lists =
       if is_initial_sync do
         %{"changed" => [], "left" => []}
       else
-        get_device_list_changes(user_id, dl_since, left_since)
+        SyncHelpers.get_device_list_changes(user_id, dl_since, left_since)
       end
 
     resp = %{
@@ -152,7 +154,9 @@ defmodule AxonWeb.SyncController do
       joined_rooms
       |> Enum.reduce(%{}, fn room_id, acc ->
         room_events = Map.get(events_by_room, room_id, [])
-        has_new_events = room_events != [] or has_ephemeral_change?(room_id, eph_since)
+
+        has_new_events =
+          room_events != [] or SyncHelpers.has_ephemeral_change?(room_id, eph_since)
 
         if not is_initial_sync and not has_new_events do
           acc
@@ -260,8 +264,10 @@ defmodule AxonWeb.SyncController do
     # Apply type filter to timeline
     filtered_timeline = apply_type_filter(timeline_events, tl_types)
 
-    ephemeral = build_ephemeral(room_id)
-    room_account_data = build_room_account_data(room_id, user_id)
+    ephemeral =
+      SyncHelpers.build_receipt_events(room_id) ++ SyncHelpers.build_typing_event(room_id)
+
+    room_account_data = SyncHelpers.build_room_account_data(room_id, user_id)
 
     # Add unsigned.membership to timeline events (MSC4115)
     timeline_with_membership = add_membership_to_timeline(filtered_timeline, room_id, user_id)
@@ -413,90 +419,6 @@ defmodule AxonWeb.SyncController do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  # Returns {room_ordering, dl_cursor, ad_cursor, pr_cursor, left_cursor, eph_cursor}.
-  # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}_${eph_cursor}"
-  # Older, shorter tokens default the missing cursor(s) to 0 (return
-  # everything for that stream on the next sync).
-  defp parse_sync_token(nil), do: {0, 0, 0, 0, 0, 0}
-
-  defp parse_sync_token(since) do
-    parse_int = fn s ->
-      case Integer.parse(s) do
-        {n, _} -> n
-        _ -> 0
-      end
-    end
-
-    parts = String.split(since, "_")
-    room_n = parse_int.(Enum.at(parts, 0, "0"))
-    dl_n = parse_int.(Enum.at(parts, 1, "0"))
-    ad_n = parse_int.(Enum.at(parts, 2, "0"))
-    pr_n = parse_int.(Enum.at(parts, 3, "0"))
-    left_n = parse_int.(Enum.at(parts, 4, "0"))
-    eph_n = parse_int.(Enum.at(parts, 5, "0"))
-    {room_n, dl_n, ad_n, pr_n, left_n, eph_n}
-  end
-
-  defp build_room_account_data(room_id, user_id) do
-    Repo.all(
-      from(r in "room_account_data",
-        where: r.room_id == ^room_id and r.user_id == ^user_id,
-        select: %{type: r.type, content: r.content}
-      )
-    )
-    |> Enum.map(fn r -> %{"type" => r.type, "content" => r.content} end)
-  end
-
-  defp build_ephemeral(room_id) do
-    build_receipt_events(room_id) ++ build_typing_event(room_id)
-  end
-
-  defp build_receipt_events(room_id) do
-    receipts =
-      Repo.all(
-        from(r in "receipts",
-          where: r.room_id == ^room_id and r.receipt_type in ["m.read", "m.read.private"],
-          select: %{
-            user_id: r.user_id,
-            receipt_type: r.receipt_type,
-            event_id: r.event_id,
-            ts: r.ts
-          }
-        )
-      )
-
-    if receipts == [] do
-      []
-    else
-      content =
-        Enum.reduce(receipts, %{}, fn r, acc ->
-          user_entry = %{"ts" => r.ts}
-          type_map = Map.get(acc, r.event_id, %{})
-          users_map = Map.get(type_map, r.receipt_type, %{})
-
-          updated_type_map =
-            Map.put(type_map, r.receipt_type, Map.put(users_map, r.user_id, user_entry))
-
-          Map.put(acc, r.event_id, updated_type_map)
-        end)
-
-      [%{"type" => "m.receipt", "content" => content}]
-    end
-  end
-
-  # Unlike receipts (only included when non-empty), typing is always
-  # included whenever the room is in the response at all — the room only
-  # got here because something ephemeral changed, and an empty user_ids
-  # list is itself meaningful (someone stopped typing).
-  defp build_typing_event(room_id) do
-    [
-      %{
-        "type" => "m.typing",
-        "content" => %{"user_ids" => AxonSync.Typing.typing_user_ids(room_id)}
-      }
-    ]
-  end
-
   defp add_membership_to_timeline([], _room_id, _user_id), do: []
 
   defp add_membership_to_timeline(events, room_id, user_id) do
@@ -552,41 +474,6 @@ defmodule AxonWeb.SyncController do
     end
   end
 
-  # Initial sync: return all account_data for the user.
-  # Incremental sync: return only types that changed since ad_since (account_data_stream cursor).
-  defp get_global_account_data(user_id, _is_initial = true, _ad_since) do
-    Repo.all(
-      from(a in "account_data",
-        where: a.user_id == ^user_id,
-        select: %{type: a.type, content: a.content}
-      )
-    )
-    |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
-  end
-
-  defp get_global_account_data(user_id, _is_initial = false, ad_since) do
-    changed_types =
-      Repo.all(
-        from(s in "account_data_stream",
-          where: s.user_id == ^user_id and s.id > ^ad_since,
-          select: s.type,
-          distinct: true
-        )
-      )
-
-    if changed_types == [] do
-      []
-    else
-      Repo.all(
-        from(a in "account_data",
-          where: a.user_id == ^user_id and a.type in ^changed_types,
-          select: %{type: a.type, content: a.content}
-        )
-      )
-      |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
-    end
-  end
-
   defp get_ignored_users(user_id) do
     case Repo.one(
            from(a in "account_data",
@@ -622,136 +509,6 @@ defmodule AxonWeb.SyncController do
 
       sender != nil and MapSet.member?(ignored_users, sender)
     end
-  end
-
-  # ---------------------------------------------------------------------------
-  # E2EE sync helpers
-  # ---------------------------------------------------------------------------
-
-  # Atomically fetch and delete pending to-device messages for this device.
-  # Returns {events_list, max_id_delivered}.
-  defp drain_to_device_messages(user_id, device_id) do
-    rows =
-      Repo.all(
-        from(m in "to_device_messages",
-          where: m.target_user_id == ^user_id and m.target_device_id == ^device_id,
-          order_by: [asc: m.id],
-          limit: 100,
-          select: %{id: m.id, sender: m.sender, type: m.type, content: m.content}
-        )
-      )
-
-    if rows != [] do
-      ids = Enum.map(rows, & &1.id)
-      Repo.delete_all(from(m in "to_device_messages", where: m.id in ^ids))
-    end
-
-    events =
-      Enum.map(rows, fn row ->
-        %{"type" => row.type, "sender" => row.sender, "content" => row.content}
-      end)
-
-    max_id = if rows == [], do: 0, else: List.last(rows).id
-    {events, max_id}
-  end
-
-  defp get_otk_counts(user_id, device_id) do
-    Repo.all(
-      from(k in "one_time_keys",
-        where: k.user_id == ^user_id and k.device_id == ^device_id and k.claimed == false,
-        group_by: k.algorithm,
-        select: {k.algorithm, count(k.id)}
-      )
-    )
-    |> Enum.into(%{})
-  end
-
-  # Returns list of algorithm names for which an unused fallback key exists.
-  # Clients use this to know which algorithms still have fallback coverage.
-  defp get_unused_fallback_key_types(user_id, device_id) do
-    Repo.all(
-      from(fk in "fallback_keys",
-        where: fk.user_id == ^user_id and fk.device_id == ^device_id and fk.used == false,
-        select: fk.algorithm
-      )
-    )
-  end
-
-  # Returns %{"changed" => [...], "left" => [...]}.
-  # `changed`: users sharing a room with `user_id` whose keys changed, or who
-  # newly share a room with `user_id`, since `dl_since` (see
-  # AxonCore.EventStore's device-list touch on room join).
-  # `left`: users `user_id` no longer shares any room with, since `left_since`
-  # (see AxonCore.EventStore's device_list_partings on room leave).
-  defp get_device_list_changes(user_id, dl_since, left_since) do
-    # The user must see their own device-list changes (new logins, cross-signing
-    # uploads) so their other devices re-query keys — spec requires self in `changed`.
-    candidate_users = [user_id | shared_room_user_ids(user_id)]
-
-    changed =
-      Repo.all(
-        from(u in "device_list_updates",
-          where: u.user_id in ^candidate_users and u.id > ^dl_since,
-          select: u.user_id,
-          distinct: true
-        )
-      )
-
-    left = KeyStore.device_list_partings_since(user_id, left_since)
-
-    %{"changed" => changed, "left" => left}
-  end
-
-  defp shared_room_user_ids(user_id) do
-    Repo.all(
-      from(m2 in "room_memberships",
-        join: m1 in "room_memberships",
-        on: m1.room_id == m2.room_id and m1.user_id == ^user_id and m1.membership == "join",
-        where: m2.membership == "join" and m2.user_id != ^user_id,
-        select: m2.user_id,
-        distinct: true
-      )
-    )
-  end
-
-  # Presence for the user themselves plus anyone sharing a joined room with
-  # them. Initial sync returns everyone's current state; incremental sync
-  # returns only those whose presence changed since pr_since.
-  defp get_presence_events(user_id, is_initial_sync, pr_since) do
-    candidate_users = [user_id | shared_room_user_ids(user_id)]
-
-    presence_by_user =
-      if is_initial_sync do
-        Enum.into(candidate_users, %{}, fn uid -> {uid, Presence.get(uid)} end)
-      else
-        Presence.changes_since(candidate_users, pr_since)
-      end
-
-    Enum.map(presence_by_user, fn {uid, presence} ->
-      %{"type" => "m.presence", "sender" => uid, "content" => presence}
-    end)
-  end
-
-  defp current_dl_max_id do
-    Repo.one(from(u in "device_list_updates", select: max(u.id))) || 0
-  end
-
-  defp current_ad_max_id do
-    Repo.one(from(s in "account_data_stream", select: max(s.id))) || 0
-  end
-
-  defp current_left_max_id do
-    Repo.one(from(p in "device_list_partings", select: max(p.id))) || 0
-  end
-
-  defp current_eph_max_id do
-    Repo.one(from(e in "ephemeral_updates", select: max(e.id))) || 0
-  end
-
-  defp has_ephemeral_change?(room_id, eph_since) do
-    Repo.exists?(
-      from(e in "ephemeral_updates", where: e.room_id == ^room_id and e.id > ^eph_since)
-    )
   end
 
   defp get_max_ordering(events_by_room, fallback) do

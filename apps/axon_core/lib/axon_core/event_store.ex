@@ -554,6 +554,38 @@ defmodule AxonCore.EventStore do
   end
 
   @doc """
+  Returns {room_id => max_stream_ordering} for the given rooms — used by
+  sliding sync's `by_recency` list sort. Rooms with no events (shouldn't
+  happen in practice, m.room.create always exists) are simply absent.
+  """
+  def room_recency_map(room_ids) do
+    Repo.all(
+      from(e in Event,
+        where: e.room_id in ^room_ids and not e.rejected,
+        group_by: e.room_id,
+        select: {e.room_id, max(e.stream_ordering)}
+      )
+    )
+    |> Map.new()
+  end
+
+  @doc """
+  Last `limit` non-rejected/non-soft-failed events in a room, oldest first —
+  for sliding sync's per-room timeline (unlike get_user_events_since, this
+  isn't scoped to "since a cursor" or to a particular viewer).
+  """
+  def get_recent_room_events(room_id, limit) do
+    Repo.all(
+      from(e in Event,
+        where: e.room_id == ^room_id and not e.rejected and not e.soft_failed,
+        order_by: [desc: e.stream_ordering],
+        limit: ^limit
+      )
+    )
+    |> Enum.reverse()
+  end
+
+  @doc """
   Records a typing/receipt change for room_id and wakes any long-polling
   /sync for its members immediately, the same way KeyStore.record_device_list_update/1
   does for device-list changes — see /sync's ephemeral section.
@@ -598,6 +630,21 @@ defmodule AxonCore.EventStore do
     |> Enum.map(&(&1 |> String.split(":") |> List.last()))
     |> Enum.reject(&(&1 == local_server))
     |> Enum.uniq()
+  end
+
+  @doc "Returns %{joined: n, invited: n} member counts for a room."
+  def member_counts(room_id) do
+    counts =
+      Repo.all(
+        from(m in RoomMembership,
+          where: m.room_id == ^room_id and m.membership in ["join", "invite"],
+          group_by: m.membership,
+          select: {m.membership, count(m.user_id)}
+        )
+      )
+      |> Map.new()
+
+    %{joined: Map.get(counts, "join", 0), invited: Map.get(counts, "invite", 0)}
   end
 
   @doc "Whether user_id (typically remote) is a joined member of any room we know about."

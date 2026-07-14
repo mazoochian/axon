@@ -23,9 +23,17 @@ Full bidirectional EDU support (`m.typing`, `m.receipt`, `m.presence`), building
 
 Regression coverage: `apps/axon_federation/test/outbound_queue_test.exs` (failure → persisted → retry → success), `apps/axon_web/test/phase9_ephemeral_test.exs` (typing/receipt local wake-up and room-inclusion, both EDU directions for typing/receipts/presence, permission checks, expiry).
 
-## Phase 10 — Sliding Sync (MSC3575/MSC4186)
+## Phase 10 — Sliding Sync (MSC4186) (done)
 
-A new sync endpoint alongside classic `/sync` (kept for legacy clients): list-based room sorting/filtering, extensions (`e2ee`, `to_device`, `account_data`, `receipts`, `typing`), and room subscriptions. Reuses the `Phoenix.PubSub`/`AxonSync.Manager` wake-up mechanism hardened in Phase 8. Needed for modern clients (Element X and others) that prefer or require sliding sync, and to reduce sync latency generally.
+`POST /_matrix/client/unstable/org.matrix.msc4186/sync` alongside classic `/sync` (kept for legacy clients). A pragmatic subset of the MSC rather than full conformance:
+
+- **Lists**: `ranges`-paginated, recency-sorted (`sort` is always treated as `by_recency`) room lists over the user's *joined* rooms, with `is_dm`/`is_encrypted` filters. Every response re-sends a full `SYNC` op per range rather than diffing against a remembered window — no `conn_id` session state is kept, so this is spec-valid but less bandwidth-efficient than real add/remove diffing.
+- **`room_subscriptions`**: explicit per-room overrides, included regardless of list ranges; merged with any list config referencing the same room (union of `required_state`, max `timeline_limit`).
+- **`required_state` resolution**: concrete `[type, state_key]` pairs, `*` wildcards, `$ME` (substitutes the requesting user), and `$LAZY` (member events lazy-loaded to just the current timeline's senders, plus self) — reusing `EventStore.get_current_state/1`.
+- **Extensions**: `to_device`, `e2ee` (OTK/fallback-key counts, `device_lists`), `account_data` (global + per visible room), `receipts` (`m.read` only), `typing` — all built from the same `AxonWeb.SyncHelpers` module classic `/sync` now delegates to as well, so the two endpoints can't drift apart on E2EE/device-list/ephemeral semantics (the extraction this required also served as a small refactor: those cursor/extension helpers used to be private duplicates baked into `SyncController`). Extension params aren't sticky across requests — a client must resend `"enabled": true` every time, not just once.
+- **Known gaps, deliberately deferred**: invited/knocked/left rooms don't appear in `lists`/`room_subscriptions` yet (exposing them safely means re-deriving the same invite-state-only visibility rules classic sync's `build_invite_state/2` already enforces — deferred rather than done half-safely); `notification_count`/`highlight_count` are always 0 (this codebase doesn't compute per-room unread/highlight counts anywhere yet, including in classic `/sync` or push dispatch, so this isn't a regression).
+
+Long-poll wake-up reuses `AxonSync.Manager.wait_for_events/3` unchanged, so the Phase 8 wake-up fixes (to-device, device-list, ephemeral) apply here too. Regression coverage: `apps/axon_web/test/sliding_sync_test.exs` (13 tests: list sort/ranges/filters, `room_subscriptions`, `required_state` incl. `$LAZY`/`$ME`, the long-poll wake path with a real nonzero timeout, and every extension).
 
 ## Phase 11 — E2EE/verification test hardening
 
