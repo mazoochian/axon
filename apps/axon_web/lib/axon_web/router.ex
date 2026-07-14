@@ -299,6 +299,10 @@ defmodule AxonWeb.Router do
     # Sync
     get("/v3/sync", SyncController, :sync)
 
+    # Sliding sync (MSC4186) — unstable prefix per MSC, not yet a stable
+    # spec endpoint (would land at /v5/sync when stabilized).
+    post("/unstable/org.matrix.msc4186/sync", SlidingSyncController, :sync)
+
     # Directory (mutations require auth)
     put("/v3/directory/room/:room_alias", DirectoryController, :put_alias)
     delete("/v3/directory/room/:room_alias", DirectoryController, :delete_alias)
