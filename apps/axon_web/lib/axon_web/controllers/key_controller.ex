@@ -3,7 +3,7 @@ defmodule AxonWeb.KeyController do
 
   action_fallback(AxonWeb.FallbackController)
 
-  alias AxonCrypto.KeyServer
+  alias AxonCrypto.{EventHash, KeyServer}
   alias AxonCore.{KeyStore, Repo, UserStore}
   alias AxonFederation.HttpClient
   import Ecto.Query
@@ -204,12 +204,16 @@ defmodule AxonWeb.KeyController do
   end
 
   # GET /_matrix/client/v3/keys/changes
-  # Returns users whose device keys changed between `from` and `to` sync tokens.
-  # Uses the dl_cursor (second part of token) to query device_list_updates by id.
+  # Returns users whose device keys changed, or who joined/left a shared room,
+  # between `from` and `to` sync tokens. Uses the dl_cursor (2nd token part) to
+  # query device_list_updates by id, and the left_cursor (5th part) to query
+  # device_list_partings by id.
   def changes(conn, params) do
     user_id = conn.assigns.current_user_id
     dl_from = parse_dl_cursor(params["from"])
     dl_to = parse_dl_cursor(params["to"])
+    left_from = parse_left_cursor(params["from"])
+    left_to = parse_left_cursor(params["to"])
 
     # Include the user themselves: their own device-list changes (new logins,
     # cross-signing uploads) must be visible to their other devices.
@@ -227,11 +231,25 @@ defmodule AxonWeb.KeyController do
         )
       )
 
-    json(conn, %{"changed" => changed, "left" => []})
+    left =
+      Repo.all(
+        from(p in "device_list_partings",
+          where:
+            p.observer_user_id == ^user_id and
+              p.id > ^left_from and
+              p.id <= ^left_to,
+          select: p.subject_user_id,
+          distinct: true
+        )
+      )
+
+    json(conn, %{"changed" => changed, "left" => left})
   end
 
-  # Extracts the dl_cursor (device-list position) from a sync token.
-  # Token format: "${room_ordering}_${dl_cursor}" or plain integer (legacy → dl_cursor = 0).
+  # Extracts the dl_cursor (device-list position, 2nd token part) from a sync
+  # token. Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}"
+  # or plain integer (legacy → dl_cursor = 0). Integer.parse stops at the
+  # trailing "_", so this works regardless of how many parts follow.
   defp parse_dl_cursor(nil), do: 0
 
   defp parse_dl_cursor(token) do
@@ -243,6 +261,22 @@ defmodule AxonWeb.KeyController do
         end
 
       [_room_s] ->
+        0
+    end
+  end
+
+  # Extracts the left_cursor (device_list_partings position, 5th token part).
+  defp parse_left_cursor(nil), do: 0
+
+  defp parse_left_cursor(token) do
+    case String.split(token, "_") do
+      parts when length(parts) >= 5 ->
+        case Integer.parse(Enum.at(parts, 4)) do
+          {n, _} -> n
+          _ -> 0
+        end
+
+      _ ->
         0
     end
   end
@@ -267,12 +301,16 @@ defmodule AxonWeb.KeyController do
 
       # MSC3967 (stable spec): UIA is skipped when either (a) the user has no
       # existing master key yet -- first-time cross-signing setup, nothing to
-      # protect -- or (b) every key present in this request is byte-identical
-      # to what's already stored, i.e. a pure idempotent retry (the client's
-      # original 200 OK was lost in transit and it resent the same upload).
-      # If anything is new or different, UIA is still required -- this is a
-      # plain equality check against the DB, not a signature check, matching
-      # Synapse's implementation.
+      # protect -- or (b) the master key is left untouched and every
+      # self_signing_key/user_signing_key present in this request is validly
+      # signed by the master key already on file. (b) covers both a pure
+      # idempotent retry (resigning the same key reproduces the same
+      # signature) and the normal matrix-js-sdk/matrix-rust-sdk/Element flow
+      # of uploading the master key under one UIA challenge and then
+      # self_signing_key/user_signing_key in a separate, unauthenticated
+      # follow-up -- the signature itself is proof of ownership, so no fresh
+      # UIA challenge is needed. Anything not validly signed by the on-file
+      # master key still requires UIA.
       is_nil(auth) and uia_exempt?(user_id, master_key, self_signing_key, user_signing_key) ->
         store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key)
         json(conn, %{})
@@ -313,9 +351,12 @@ defmodule AxonWeb.KeyController do
   end
 
   # MSC3967 exemption check. No existing master key -> always exempt (nothing
-  # yet to protect). Otherwise exempt only if every key present in the
-  # request equals what's already on file for that key_type -- any new or
-  # changed key forces the normal UIA path.
+  # yet to protect). Otherwise exempt only if the master key itself is left
+  # untouched and every self_signing_key/user_signing_key present in the
+  # request is validly signed by the master key already on file -- a
+  # signature proves ownership regardless of whether the key content is new
+  # (bootstrap follow-up) or a resend of a previous upload (idempotent
+  # retry).
   defp uia_exempt?(user_id, master_key, self_signing_key, user_signing_key) do
     case KeyStore.cross_signing_keys([user_id], "master")[user_id] do
       nil ->
@@ -323,14 +364,8 @@ defmodule AxonWeb.KeyController do
 
       existing_master ->
         unchanged?(master_key, existing_master) and
-          unchanged?(
-            self_signing_key,
-            KeyStore.cross_signing_keys([user_id], "self_signing")[user_id]
-          ) and
-          unchanged?(
-            user_signing_key,
-            KeyStore.cross_signing_keys([user_id], "user_signing")[user_id]
-          )
+          signed_by_master?(user_id, existing_master, self_signing_key) and
+          signed_by_master?(user_id, existing_master, user_signing_key)
     end
   end
 
@@ -339,6 +374,26 @@ defmodule AxonWeb.KeyController do
   # what's already stored.
   defp unchanged?(nil, _existing), do: true
   defp unchanged?(uploaded, existing), do: uploaded == existing
+
+  # A key omitted from the request (nil) trivially passes -- nothing to
+  # verify. Otherwise the uploaded key must carry a valid signature from the
+  # master key already on file for user_id.
+  defp signed_by_master?(_user_id, _master_key_json, nil), do: true
+
+  defp signed_by_master?(user_id, master_key_json, key_json) do
+    with {master_key_id, master_pubkey_b64} <- sole_key(master_key_json),
+         {:ok, master_pubkey} <- Base.decode64(master_pubkey_b64, padding: false) do
+      EventHash.verify_signature(key_json, user_id, master_key_id, master_pubkey) == :ok
+    else
+      _ -> false
+    end
+  end
+
+  defp sole_key(%{"keys" => keys}) when map_size(keys) == 1 do
+    keys |> Map.to_list() |> hd()
+  end
+
+  defp sole_key(_), do: :error
 
   defp store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key) do
     # On key replacement (reset), purge stale signatures for this user so
@@ -435,6 +490,13 @@ defmodule AxonWeb.KeyController do
           end)
         end)
       end)
+
+      # A new signature changes what target_user_id's /keys/query response
+      # looks like (e.g. "this device is now cross-signed"), so it must be
+      # visible the same way any other key change is: via device_lists.changed
+      # in /sync and /keys/changes. Without this, clients waiting on that
+      # signal after self-signing a device never see it arrive.
+      record_device_list_update(target_user_id)
     end)
 
     json(conn, %{"failures" => %{}})
@@ -658,23 +720,60 @@ defmodule AxonWeb.KeyController do
   def send_to_device(conn, %{"event_type" => event_type, "txn_id" => _txn_id} = params) do
     sender_id = conn.assigns.current_user_id
     messages = get_in(params, ["messages"]) || %{}
+    local_server = Application.fetch_env!(:axon_web, :server_name)
 
-    Enum.each(messages, fn {target_user_id, device_messages} ->
-      Enum.each(device_messages, fn {target_device_id, content} ->
-        Repo.insert_all("to_device_messages", [
-          %{
-            sender: sender_id,
-            target_user_id: target_user_id,
-            target_device_id: target_device_id,
-            type: event_type,
-            content: content,
-            inserted_at: DateTime.utc_now(:microsecond)
-          }
-        ])
-      end)
+    {local_targets, remote_targets} = split_to_device_targets(messages, local_server)
+
+    Enum.each(local_targets, fn {target_user_id, device_messages} ->
+      KeyStore.deliver_to_device(sender_id, target_user_id, event_type, device_messages)
     end)
 
+    send_remote_to_device(remote_targets, sender_id, event_type)
+
     json(conn, %{})
+  end
+
+  # Splits a %{user_id => %{device_id => content}} request map into local and
+  # remote (grouped by destination server) maps, preserving the per-user
+  # message payloads on both sides (unlike split_local_remote/2, whose local
+  # branch only needs user_ids since /keys/query and /keys/claim re-derive
+  # what they need locally).
+  defp split_to_device_targets(messages, local_server) do
+    Enum.reduce(messages, {%{}, %{}}, fn {target_user_id, device_messages}, {local, remote} ->
+      server = target_user_id |> String.split(":") |> List.last()
+
+      if server == local_server do
+        {Map.put(local, target_user_id, device_messages), remote}
+      else
+        {local,
+         Map.update(
+           remote,
+           server,
+           %{target_user_id => device_messages},
+           &Map.put(&1, target_user_id, device_messages)
+         )}
+      end
+    end)
+  end
+
+  # Relays to-device messages for remote-server targets as m.direct_to_device
+  # EDUs. The "*" wildcard device id, if present, is forwarded as-is (not
+  # expanded here) since only the destination server knows its own users'
+  # device ids; it expands the wildcard itself on receipt.
+  defp send_remote_to_device(remote_targets, sender_id, event_type) do
+    Enum.each(remote_targets, fn {server, device_messages_by_user} ->
+      edu = %{
+        "edu_type" => "m.direct_to_device",
+        "content" => %{
+          "sender" => sender_id,
+          "type" => event_type,
+          "message_id" => :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false),
+          "messages" => device_messages_by_user
+        }
+      }
+
+      Phoenix.PubSub.broadcast(Axon.PubSub, "federation:fanout", {:federate_edu, edu, server})
+    end)
   end
 
   # ---------------------------------------------------------------------------

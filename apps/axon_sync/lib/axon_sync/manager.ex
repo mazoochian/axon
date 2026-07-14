@@ -78,6 +78,21 @@ defmodule AxonSync.Manager do
         events = EventStore.get_user_events_since(user_id, since_ordering)
         {:ok, events}
 
+      {:device_list, _user_id} ->
+        # This user's device/cross-signing keys changed (e.g. a
+        # device_signing/upload); return immediately so the caller's fresh
+        # device_lists.changed query picks it up without waiting out the
+        # timeout.
+        events = EventStore.get_user_events_since(user_id, since_ordering)
+        {:ok, events}
+
+      {:account_data, _user_id} ->
+        # This user's global account data changed; return immediately so
+        # the caller's fresh account_data query picks it up without
+        # waiting out the timeout.
+        events = EventStore.get_user_events_since(user_id, since_ordering)
+        {:ok, events}
+
       :sync_timeout ->
         {:ok, %{}}
     after

@@ -2,7 +2,7 @@ defmodule AxonWeb.SyncController do
   use Phoenix.Controller, formats: [:json]
 
   import Ecto.Query, only: [from: 2]
-  alias AxonCore.{EventStore, Repo}
+  alias AxonCore.{EventStore, KeyStore, Repo}
   alias AxonSync.Manager, as: SyncManager
   alias AxonSync.Presence
 
@@ -17,10 +17,12 @@ defmodule AxonWeb.SyncController do
 
     # nil means initial sync; a string (even "0") means incremental
     is_initial_sync = is_nil(since)
-    # next_batch token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}"
+
+    # next_batch token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}"
     # dl_cursor tracks device_list_updates.id; ad_cursor tracks account_data_stream.id;
-    # pr_cursor tracks AxonSync.Presence's version counter.
-    {since_ordering, dl_since, ad_since, pr_since} = parse_sync_token(since)
+    # pr_cursor tracks AxonSync.Presence's version counter; left_cursor tracks
+    # device_list_partings.id.
+    {since_ordering, dl_since, ad_since, pr_since, left_since} = parse_sync_token(since)
 
     filter = load_filter(user_id, params["filter"])
 
@@ -47,7 +49,8 @@ defmodule AxonWeb.SyncController do
     dl_next = current_dl_max_id()
     ad_next = current_ad_max_id()
     pr_next = Presence.current_version()
-    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}_#{pr_next}"
+    left_next = current_left_max_id()
+    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}_#{pr_next}_#{left_next}"
 
     rooms_response =
       build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter)
@@ -64,7 +67,7 @@ defmodule AxonWeb.SyncController do
       if is_initial_sync do
         %{"changed" => [], "left" => []}
       else
-        get_device_list_changes(user_id, dl_since)
+        get_device_list_changes(user_id, dl_since, left_since)
       end
 
     resp = %{
@@ -397,7 +400,7 @@ defmodule AxonWeb.SyncController do
   # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}"
   # Older, shorter tokens default the missing cursor(s) to 0 (return
   # everything for that stream on the next sync).
-  defp parse_sync_token(nil), do: {0, 0, 0, 0}
+  defp parse_sync_token(nil), do: {0, 0, 0, 0, 0}
 
   defp parse_sync_token(since) do
     parse_int = fn s ->
@@ -412,7 +415,8 @@ defmodule AxonWeb.SyncController do
     dl_n = parse_int.(Enum.at(parts, 1, "0"))
     ad_n = parse_int.(Enum.at(parts, 2, "0"))
     pr_n = parse_int.(Enum.at(parts, 3, "0"))
-    {room_n, dl_n, ad_n, pr_n}
+    left_n = parse_int.(Enum.at(parts, 4, "0"))
+    {room_n, dl_n, ad_n, pr_n, left_n}
   end
 
   defp build_room_account_data(room_id, user_id) do
@@ -639,10 +643,12 @@ defmodule AxonWeb.SyncController do
   end
 
   # Returns %{"changed" => [...], "left" => [...]}.
-  # `changed`: users sharing a room with `user_id` whose keys changed since `since_ordering`.
-  # `left`: users who were in a shared room before but have since left (simplified to [] for now).
-  # dl_since is the dl_cursor from the previous sync token (max device_list_updates.id seen).
-  defp get_device_list_changes(user_id, dl_since) do
+  # `changed`: users sharing a room with `user_id` whose keys changed, or who
+  # newly share a room with `user_id`, since `dl_since` (see
+  # AxonCore.EventStore's device-list touch on room join).
+  # `left`: users `user_id` no longer shares any room with, since `left_since`
+  # (see AxonCore.EventStore's device_list_partings on room leave).
+  defp get_device_list_changes(user_id, dl_since, left_since) do
     # The user must see their own device-list changes (new logins, cross-signing
     # uploads) so their other devices re-query keys — spec requires self in `changed`.
     candidate_users = [user_id | shared_room_user_ids(user_id)]
@@ -656,7 +662,9 @@ defmodule AxonWeb.SyncController do
         )
       )
 
-    %{"changed" => changed, "left" => []}
+    left = KeyStore.device_list_partings_since(user_id, left_since)
+
+    %{"changed" => changed, "left" => left}
   end
 
   defp shared_room_user_ids(user_id) do
@@ -695,6 +703,10 @@ defmodule AxonWeb.SyncController do
 
   defp current_ad_max_id do
     Repo.one(from(s in "account_data_stream", select: max(s.id))) || 0
+  end
+
+  defp current_left_max_id do
+    Repo.one(from(p in "device_list_partings", select: max(p.id))) || 0
   end
 
   defp get_max_ordering(events_by_room, fallback) do

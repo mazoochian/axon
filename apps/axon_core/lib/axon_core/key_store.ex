@@ -181,6 +181,59 @@ defmodule AxonCore.KeyStore do
     |> Enum.into(%{})
   end
 
+  @doc "All registered device_ids for a local user."
+  def device_ids_for_user(user_id) do
+    Repo.all(
+      from(d in "devices",
+        where: d.user_id == ^user_id,
+        select: d.device_id
+      )
+    )
+  end
+
+  @doc """
+  Stores a `sendToDevice`-style `%{device_id => content}` map for a local
+  target user and wakes any long-polling `/sync` for them immediately.
+
+  The wildcard device id `"*"` (send to every device the user owns) is
+  expanded against `device_ids_for_user/1` rather than stored literally,
+  since no real device_id will ever match a literal `"*"` on drain.
+
+  Used by both the client-facing `PUT /sendToDevice` endpoint and the
+  inbound federation `m.direct_to_device` EDU handler, so local delivery
+  behaves identically regardless of which server the sender was on.
+  """
+  def deliver_to_device(sender_id, target_user_id, event_type, device_messages) do
+    device_messages
+    |> expand_wildcard_device(target_user_id)
+    |> Enum.each(fn {target_device_id, content} ->
+      Repo.insert_all("to_device_messages", [
+        %{
+          sender: sender_id,
+          target_user_id: target_user_id,
+          target_device_id: target_device_id,
+          type: event_type,
+          content: content,
+          inserted_at: DateTime.utc_now(:microsecond)
+        }
+      ])
+    end)
+
+    Phoenix.PubSub.broadcast(Axon.PubSub, "user:#{target_user_id}", {:to_device, target_user_id})
+  end
+
+  defp expand_wildcard_device(device_messages, target_user_id) do
+    case Map.pop(device_messages, "*") do
+      {nil, rest} ->
+        rest
+
+      {wildcard_content, rest} ->
+        target_user_id
+        |> device_ids_for_user()
+        |> Enum.reduce(rest, fn device_id, acc -> Map.put_new(acc, device_id, wildcard_content) end)
+    end
+  end
+
   @doc """
   Fully removes a device: its `devices` row plus everything tied to its
   cryptographic identity (device keys, one-time keys, fallback keys, and any
@@ -221,5 +274,41 @@ defmodule AxonCore.KeyStore do
     # stream_ordering is recorded for informational purposes; queries use id (bigserial).
     ordering = AxonCore.EventStore.current_max_stream_ordering()
     Repo.insert_all("device_list_updates", [%{user_id: user_id, stream_ordering: ordering}])
+
+    # Wake any long-polling /sync request for this user so the change is
+    # visible immediately instead of only after its timeout elapses.
+    Phoenix.PubSub.broadcast(Axon.PubSub, "user:#{user_id}", {:device_list, user_id})
+  end
+
+  @doc """
+  Records that `subject_user_id` no longer shares any room with
+  `observer_user_id`, for /sync device_lists.left and /keys/changes `left`.
+
+  Unlike record_device_list_update/1, this can't be recomputed from current
+  membership at query time (the parted pair no longer shares a room to
+  query), so it's logged explicitly at the moment the last shared room is
+  left. Wakes the observer's long-polling /sync the same way.
+  """
+  def record_device_list_parting(observer_user_id, subject_user_id) do
+    Repo.insert_all("device_list_partings", [
+      %{observer_user_id: observer_user_id, subject_user_id: subject_user_id}
+    ])
+
+    Phoenix.PubSub.broadcast(
+      Axon.PubSub,
+      "user:#{observer_user_id}",
+      {:device_list, observer_user_id}
+    )
+  end
+
+  @doc "Users that `observer_user_id` has parted ways with (no longer shares any room), with id > `since`."
+  def device_list_partings_since(observer_user_id, since) do
+    Repo.all(
+      from(p in "device_list_partings",
+        where: p.observer_user_id == ^observer_user_id and p.id > ^since,
+        select: p.subject_user_id,
+        distinct: true
+      )
+    )
   end
 end

@@ -61,10 +61,9 @@ defmodule AxonWeb.Phase4Test do
       assert String.contains?(body["content_uri"], "localhost")
     end
 
-    test "upload via /_matrix/media/v3/upload (unauthenticated path)" do
+    test "upload via legacy /_matrix/media/v3/upload path with auth" do
       user = register("media_up2_#{System.unique_integer([:positive])}")
 
-      # This path doesn't require auth by our router config
       conn =
         authed(user.token)
         |> put_req_header("content-type", "text/plain")
@@ -73,6 +72,19 @@ defmodule AxonWeb.Phase4Test do
       assert conn.status == 200
       body = decode(conn)
       assert String.starts_with?(body["content_uri"], "mxc://")
+    end
+
+    test "upload via legacy /_matrix/media/v3/upload path without auth is rejected" do
+      # Upload requires auth per spec, same as the modern
+      # /_matrix/client/v3/media/upload path -- an anonymous upload here must
+      # not succeed (and must not be attributed to a nil uploader).
+      conn =
+        build_conn()
+        |> put_req_header("content-type", "text/plain")
+        |> post("/_matrix/media/v3/upload", "hello plain text")
+
+      assert conn.status == 401
+      assert decode(conn)["errcode"] == "M_MISSING_TOKEN"
     end
 
     test "download a locally uploaded file" do

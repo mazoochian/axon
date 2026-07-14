@@ -193,8 +193,8 @@ defmodule AxonWeb.DeviceController do
     %{
       "device_id" => device.device_id,
       "display_name" => device.display_name,
-      "last_seen_ip" => nil,
-      "last_seen_ts" => nil
+      "last_seen_ip" => device.last_seen_ip,
+      "last_seen_ts" => device.last_seen_ts
     }
   end
 end
