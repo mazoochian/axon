@@ -6,7 +6,8 @@ defmodule AxonSync.Application do
     children = [
       {Phoenix.PubSub, name: Axon.PubSub},
       AxonSync.Manager,
-      AxonSync.Presence
+      AxonSync.Presence,
+      AxonSync.Typing
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: AxonSync.Supervisor)

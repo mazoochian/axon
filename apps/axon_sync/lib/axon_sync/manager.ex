@@ -34,6 +34,7 @@ defmodule AxonSync.Manager do
   def wait_for_events(user_id, since_ordering, timeout \\ 30_000) do
     # Subscribe to rooms this user is in
     joined_rooms = EventStore.get_joined_rooms(user_id)
+
     Enum.each(joined_rooms, fn room_id ->
       Phoenix.PubSub.subscribe(@pubsub, "room:#{room_id}")
     end)
@@ -93,6 +94,13 @@ defmodule AxonSync.Manager do
         events = EventStore.get_user_events_since(user_id, since_ordering)
         {:ok, events}
 
+      {:ephemeral, _room_id} ->
+        # A typing or receipt change in one of our subscribed rooms;
+        # return immediately so the caller's fresh ephemeral query picks it
+        # up without waiting out the timeout.
+        events = EventStore.get_user_events_since(user_id, since_ordering)
+        {:ok, events}
+
       :sync_timeout ->
         {:ok, %{}}
     after
@@ -104,6 +112,7 @@ defmodule AxonSync.Manager do
     Enum.each(rooms, fn room_id ->
       Phoenix.PubSub.unsubscribe(@pubsub, "room:#{room_id}")
     end)
+
     Phoenix.PubSub.unsubscribe(@pubsub, "user:#{user_id}")
   end
 end

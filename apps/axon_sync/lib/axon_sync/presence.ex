@@ -45,6 +45,23 @@ defmodule AxonSync.Presence do
     GenServer.cast(__MODULE__, {:bump_activity, user_id})
   end
 
+  @doc """
+  Records presence reported by a remote homeserver for one of its users
+  (via an inbound m.presence EDU). Skips bump_activity's "calling the API
+  implies online" local-only semantics — trusts the remote's reported
+  presence and last_active_ago directly — and skips re-broadcasting for
+  federation (this data already came from federation; re-fanning it out
+  would loop it back toward its origin and any other server we share a
+  room with).
+  """
+  def set_remote(user_id, presence, status_msg, last_active_ago_ms)
+      when presence in ["online", "unavailable", "offline"] do
+    GenServer.call(
+      __MODULE__,
+      {:set_remote_presence, user_id, presence, status_msg, last_active_ago_ms}
+    )
+  end
+
   @doc "Returns the current presence map for a user, or the spec default if never seen."
   def get(user_id) do
     case :ets.lookup(@table, user_id) do
@@ -96,6 +113,18 @@ defmodule AxonSync.Presence do
   def handle_call({:set_presence, user_id, presence, status_msg}, _from, state) do
     now = System.system_time(:millisecond)
     record(user_id, presence, status_msg, now)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call(
+        {:set_remote_presence, user_id, presence, status_msg, last_active_ago_ms},
+        _from,
+        state
+      ) do
+    now = System.system_time(:millisecond)
+    last_active_ts = if is_integer(last_active_ago_ms), do: now - last_active_ago_ms, else: now
+    record_no_broadcast(user_id, presence, status_msg, last_active_ts)
     {:reply, :ok, state}
   end
 
@@ -152,7 +181,43 @@ defmodule AxonSync.Presence do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  # A local presence write (set_presence, bump_activity, the idle/offline
+  # tick sweep) — federates to servers sharing a room with this user
+  # whenever the presence value or status_msg actually changes, but not on
+  # every touch (bump_activity re-records on *every* authenticated request
+  # just to keep last_active_ts/currently_active fresh for local /sync,
+  # which would otherwise flood federation peers with a message per API
+  # call).
   defp record(user_id, presence, status_msg, last_active_ts) do
+    changed? = presence_changed?(user_id, presence, status_msg)
+    write(user_id, presence, status_msg, last_active_ts)
+
+    if changed? do
+      presence_map = to_map(presence, status_msg, last_active_ts)
+
+      Phoenix.PubSub.broadcast(
+        Axon.PubSub,
+        "federation:fanout",
+        {:presence_changed, user_id, presence_map}
+      )
+    end
+  end
+
+  # A remote-origin presence write (inbound m.presence EDU) — never
+  # federates, since re-broadcasting data we just received from federation
+  # would loop it back out.
+  defp record_no_broadcast(user_id, presence, status_msg, last_active_ts) do
+    write(user_id, presence, status_msg, last_active_ts)
+  end
+
+  defp presence_changed?(user_id, presence, status_msg) do
+    case :ets.lookup(@table, user_id) do
+      [{^user_id, ^presence, ^status_msg, _, _}] -> false
+      _ -> true
+    end
+  end
+
+  defp write(user_id, presence, status_msg, last_active_ts) do
     version = :ets.update_counter(@table, :__version__, 1)
     :ets.insert(@table, {user_id, presence, status_msg, last_active_ts, version})
     :ets.insert(@log_table, {version, user_id})

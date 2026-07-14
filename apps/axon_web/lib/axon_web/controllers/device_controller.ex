@@ -1,7 +1,7 @@
 defmodule AxonWeb.DeviceController do
   use Phoenix.Controller, formats: [:json]
 
-  action_fallback AxonWeb.FallbackController
+  action_fallback(AxonWeb.FallbackController)
 
   import Ecto.Query
   alias AxonCore.{KeyStore, Repo, UserStore}
@@ -10,7 +10,7 @@ defmodule AxonWeb.DeviceController do
   # GET /_matrix/client/v3/devices
   def index(conn, _params) do
     user_id = conn.assigns.current_user_id
-    devices = Repo.all(from d in Device, where: d.user_id == ^user_id)
+    devices = Repo.all(from(d in Device, where: d.user_id == ^user_id))
     json(conn, %{"devices" => Enum.map(devices, &device_to_map/1)})
   end
 
@@ -59,7 +59,9 @@ defmodule AxonWeb.DeviceController do
         json(conn, %{})
 
       is_nil(auth) ->
-        conn |> put_status(401) |> json(%{
+        conn
+        |> put_status(401)
+        |> json(%{
           "session" => gen_session(),
           "flows" => [%{"stages" => ["m.login.password"]}, %{"stages" => ["m.login.dummy"]}],
           "params" => %{}
@@ -70,7 +72,9 @@ defmodule AxonWeb.DeviceController do
         json(conn, %{})
 
       true ->
-        conn |> put_status(401) |> json(%{
+        conn
+        |> put_status(401)
+        |> json(%{
           "session" => gen_session(),
           "flows" => [%{"stages" => ["m.login.password"]}, %{"stages" => ["m.login.dummy"]}],
           "params" => %{},
@@ -120,8 +124,14 @@ defmodule AxonWeb.DeviceController do
       true ->
         # Distinguish: auth user doesn't match current user → 403; wrong password → 401
         auth_user_id = get_auth_user_id(auth, user_id)
+
         if auth_user_id != user_id do
-          conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Auth user does not match device owner"})
+          conn
+          |> put_status(403)
+          |> json(%{
+            "errcode" => "M_FORBIDDEN",
+            "error" => "Auth user does not match device owner"
+          })
         else
           conn
           |> put_status(401)

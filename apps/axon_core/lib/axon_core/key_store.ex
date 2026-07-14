@@ -57,7 +57,10 @@ defmodule AxonCore.KeyStore do
   def cross_signing_signatures(target_user_ids, viewer_user_id) do
     visibility_condition =
       if viewer_user_id do
-        dynamic([s], s.signing_user_id == s.target_user_id or s.signing_user_id == ^viewer_user_id)
+        dynamic(
+          [s],
+          s.signing_user_id == s.target_user_id or s.signing_user_id == ^viewer_user_id
+        )
       else
         dynamic([s], s.signing_user_id == s.target_user_id)
       end
@@ -230,7 +233,9 @@ defmodule AxonCore.KeyStore do
       {wildcard_content, rest} ->
         target_user_id
         |> device_ids_for_user()
-        |> Enum.reduce(rest, fn device_id, acc -> Map.put_new(acc, device_id, wildcard_content) end)
+        |> Enum.reduce(rest, fn device_id, acc ->
+          Map.put_new(acc, device_id, wildcard_content)
+        end)
     end
   end
 

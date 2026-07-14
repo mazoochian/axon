@@ -8,7 +8,9 @@ defmodule AxonFederation.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      AxonFederation.KeyCache
+      AxonFederation.KeyCache,
+      {Task.Supervisor, name: AxonFederation.TaskSupervisor},
+      AxonFederation.OutboundQueue
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

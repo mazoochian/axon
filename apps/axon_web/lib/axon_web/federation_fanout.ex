@@ -1,13 +1,20 @@
 defmodule AxonWeb.FederationFanout do
   @moduledoc """
-  Subscribes to PubSub federation:fanout events and sends PDUs to remote servers.
+  Subscribes to PubSub federation:fanout events and hands PDUs/EDUs off to
+  AxonFederation.OutboundQueue for durable delivery (persisted, retried with
+  backoff on failure).
+
+  This module exists only to bridge PubSub messages from axon_room (PDUs)
+  and axon_web controllers (EDUs) into that queue — it avoids a cross-app
+  dependency from axon_room to axon_federation, since they sit at the same
+  supervision level in the umbrella.
   """
 
   use GenServer
-  require Logger
 
-  alias AxonFederation.HttpClient
+  alias AxonCore.EventStore
   alias AxonCrypto.KeyServer
+  alias AxonFederation.OutboundQueue
 
   @pubsub Axon.PubSub
 
@@ -24,24 +31,13 @@ defmodule AxonWeb.FederationFanout do
   @impl true
   def handle_info({:federate_event, event_map, remote_servers}, state) do
     origin = KeyServer.server_name()
-    txn_id = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
 
-    Task.Supervisor.start_child(Axon.TaskSupervisor, fn ->
-      Enum.each(remote_servers, fn server ->
-        case HttpClient.put(
-               server,
-               "/_matrix/federation/v1/send/#{txn_id}",
-               %{
-                 "origin" => origin,
-                 "origin_server_ts" => System.os_time(:millisecond),
-                 "pdus" => [event_map]
-               }
-             ) do
-          {:ok, _} -> :ok
-          {:error, reason} ->
-            Logger.warning("Fan-out to #{server} failed: #{inspect(reason)}")
-        end
-      end)
+    Enum.each(remote_servers, fn server ->
+      OutboundQueue.enqueue(server, %{
+        "origin" => origin,
+        "origin_server_ts" => System.os_time(:millisecond),
+        "pdus" => [event_map]
+      })
     end)
 
     {:noreply, state}
@@ -50,26 +46,40 @@ defmodule AxonWeb.FederationFanout do
   @impl true
   def handle_info({:federate_edu, edu, destination_server}, state) do
     origin = KeyServer.server_name()
-    txn_id = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
 
-    Task.Supervisor.start_child(Axon.TaskSupervisor, fn ->
-      case HttpClient.put(
-             destination_server,
-             "/_matrix/federation/v1/send/#{txn_id}",
-             %{
-               "origin" => origin,
-               "origin_server_ts" => System.os_time(:millisecond),
-               "pdus" => [],
-               "edus" => [edu]
-             }
-           ) do
-        {:ok, _} ->
-          :ok
+    OutboundQueue.enqueue(destination_server, %{
+      "origin" => origin,
+      "origin_server_ts" => System.os_time(:millisecond),
+      "pdus" => [],
+      "edus" => [edu]
+    })
 
-        {:error, reason} ->
-          Logger.warning("EDU fan-out to #{destination_server} failed: #{inspect(reason)}")
-      end
-    end)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:presence_changed, user_id, presence_map}, state) do
+    origin = KeyServer.server_name()
+
+    case EventStore.remote_servers_for_user(user_id) do
+      [] ->
+        :ok
+
+      remote_servers ->
+        edu = %{
+          "edu_type" => "m.presence",
+          "content" => %{"push" => [Map.put(presence_map, "user_id", user_id)]}
+        }
+
+        Enum.each(remote_servers, fn server ->
+          OutboundQueue.enqueue(server, %{
+            "origin" => origin,
+            "origin_server_ts" => System.os_time(:millisecond),
+            "pdus" => [],
+            "edus" => [edu]
+          })
+        end)
+    end
 
     {:noreply, state}
   end
