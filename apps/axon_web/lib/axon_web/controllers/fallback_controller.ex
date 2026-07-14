@@ -109,6 +109,15 @@ defmodule AxonWeb.FallbackController do
     |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Target user is not in room"})
   end
 
+  def call(conn, {:error, :room_blocked}) do
+    conn
+    |> put_status(403)
+    |> json(%{
+      "errcode" => "M_FORBIDDEN",
+      "error" => "This room has been blocked by the server admin"
+    })
+  end
+
   def call(conn, {:error, :power_levels_may_not_list_creators}) do
     conn
     |> put_status(403)

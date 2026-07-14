@@ -59,6 +59,19 @@ defmodule AxonRoom.RoomProcess do
   end
 
   @doc """
+  Terminates a room's live process, if running, without touching its DB
+  rows — used by admin room purge (AxonCore.EventStore.purge_room/1) so a
+  process that's already resident in memory doesn't keep serving stale
+  state after its underlying rows are deleted out from under it.
+  """
+  def stop_if_running(room_id) do
+    case Horde.Registry.lookup(AxonRoom.Registry, room_id) do
+      [{pid, _}] -> Horde.DynamicSupervisor.terminate_child(AxonRoom.Supervisor, pid)
+      [] -> :ok
+    end
+  end
+
+  @doc """
   Sends an event through the room. Checks auth rules, persists, broadcasts.
 
   Returns `{:ok, event_id}` or `{:error, reason}`.
@@ -163,7 +176,11 @@ defmodule AxonRoom.RoomProcess do
             event_map = EventStore.event_to_map(persisted)
             new_state = apply_and_advance(state, event_map, persisted.stream_ordering)
             broadcast(state.room_id, event_map)
-            broadcast_for_federation(state.room_id, event_map, new_state.current_state)
+
+            unless shadow_banned_message?(event_map) do
+              broadcast_for_federation(state.room_id, event_map, new_state.current_state)
+            end
+
             # Push notifications (fire-and-forget)
             AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
             # AppService fanout via PubSub (avoids circular dep on axon_web)
@@ -388,6 +405,19 @@ defmodule AxonRoom.RoomProcess do
 
   defp broadcast(room_id, event_map) do
     Phoenix.PubSub.broadcast(@pubsub, "room:#{room_id}", {:new_event, room_id, event_map})
+  end
+
+  # Shadow-banned users (admin API) get a normal 200 for every send — they
+  # don't get to find out — but their non-state (message-like) events must
+  # not actually reach anyone else. State events (joins, etc.) still
+  # federate normally: hiding those would corrupt other servers' view of
+  # room membership/state, which is a much bigger inconsistency than muting
+  # a spammer's messages. Local-side muting (excluding these events from
+  # other local users' /sync) happens in AxonCore.EventStore.get_user_events_since/2.
+  defp shadow_banned_message?(%{"state_key" => _}), do: false
+
+  defp shadow_banned_message?(event_map) do
+    AxonCore.UserStore.shadow_banned?(event_map["sender"])
   end
 
   # Broadcast for federation fan-out via PubSub. axon_web subscribes and sends

@@ -533,7 +533,8 @@ defmodule AxonWeb.RoomController do
     sender_membership =
       get_in(current_state[{"m.room.member", user_id}], ["content", "membership"])
 
-    with :ok <- check_guest_access(user_id, current_state, sender_membership) do
+    with :ok <- check_room_not_blocked(room_id),
+         :ok <- check_guest_access(user_id, current_state, sender_membership) do
       result =
         cond do
           join_rule not in ["restricted", "knock_restricted"] ->
@@ -570,6 +571,10 @@ defmodule AxonWeb.RoomController do
   end
 
   defp maybe_attach_third_party_invite(content, _), do: content
+
+  defp check_room_not_blocked(room_id) do
+    if EventStore.room_blocked?(room_id), do: {:error, :room_blocked}, else: :ok
+  end
 
   # Guests may only join without an existing invite when the room opts in
   # via m.room.guest_access: can_join (default is "forbidden"). An invited

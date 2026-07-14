@@ -15,6 +15,13 @@ defmodule AxonWeb.Router do
     plug(AxonWeb.Plug.AuthenticateToken)
   end
 
+  pipeline :admin do
+    plug(:accepts, ["json"])
+    plug(:fetch_query_params)
+    plug(AxonWeb.Plug.AuthenticateToken)
+    plug(AxonWeb.Plug.RequireAdmin)
+  end
+
   # -------------------------------------------------------------------------
   # Discovery — no auth
   # -------------------------------------------------------------------------
@@ -133,6 +140,28 @@ defmodule AxonWeb.Router do
 
     get("/register", AuthController, :synapse_nonce)
     post("/register", AuthController, :synapse_register)
+  end
+
+  # -------------------------------------------------------------------------
+  # Admin API (Phase 13) — gated by AxonWeb.Plug.RequireAdmin
+  # -------------------------------------------------------------------------
+  scope "/_synapse/admin/v1", AxonWeb do
+    pipe_through(:admin)
+
+    get("/users", AdminController, :list_users)
+    get("/users/:user_id", AdminController, :get_user)
+    post("/deactivate/:user_id", AdminController, :deactivate_user)
+    post("/users/:user_id/shadow_ban", AdminController, :shadow_ban)
+    delete("/users/:user_id/shadow_ban", AdminController, :unshadow_ban)
+
+    get("/rooms", AdminController, :list_rooms)
+    get("/rooms/:room_id", AdminController, :get_room)
+    delete("/rooms/:room_id", AdminController, :purge_room)
+
+    post("/media/quarantine/:server_name/:media_id", AdminController, :quarantine_media)
+    delete("/media/quarantine/:server_name/:media_id", AdminController, :unquarantine_media)
+
+    get("/event_reports", AdminController, :list_reports)
   end
 
   # -------------------------------------------------------------------------

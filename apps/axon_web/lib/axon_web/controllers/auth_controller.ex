@@ -3,6 +3,9 @@ defmodule AxonWeb.AuthController do
 
   action_fallback(AxonWeb.FallbackController)
 
+  plug(AxonWeb.Plug.RateLimit, [bucket: :login] when action == :login)
+  plug(AxonWeb.Plug.RateLimit, [bucket: :register] when action == :register)
+
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{UserStore, Repo}
 
@@ -207,11 +210,7 @@ defmodule AxonWeb.AuthController do
   end
 
   defp do_deactivate(conn, user_id) do
-    Repo.update_all(from(u in "users", where: u.user_id == ^user_id),
-      set: [deactivated: true]
-    )
-
-    UserStore.logout_all(user_id)
+    UserStore.deactivate(user_id)
     json(conn, %{"id_server_unbind_result" => "success"})
   end
 
@@ -241,7 +240,7 @@ defmodule AxonWeb.AuthController do
         conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Invalid MAC"})
 
       true ->
-        opts = [server_name: server_name()]
+        opts = [server_name: server_name(), admin: is_admin]
 
         case UserStore.register(String.downcase(username), password, opts) do
           {:ok, result} ->

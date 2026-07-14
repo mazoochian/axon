@@ -4,12 +4,13 @@ defmodule AxonCore.Schema.Room do
 
   @primary_key {:room_id, :string, autogenerate: false}
   schema "rooms" do
-    field :version, :string, default: "12"
-    field :creator, :string
-    field :is_public, :boolean, default: false
-    field :canonical_alias, :string
+    field(:version, :string, default: "12")
+    field(:creator, :string)
+    field(:is_public, :boolean, default: false)
+    field(:canonical_alias, :string)
+    field(:blocked, :boolean, default: false)
 
-    has_many :memberships, AxonCore.Schema.RoomMembership, foreign_key: :room_id
+    has_many(:memberships, AxonCore.Schema.RoomMembership, foreign_key: :room_id)
 
     timestamps(type: :utc_datetime_usec)
   end
