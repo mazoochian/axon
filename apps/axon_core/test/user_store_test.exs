@@ -23,12 +23,17 @@ defmodule AxonCore.UserStoreTest do
     test "a duplicate localpart is rejected" do
       localpart = uniq("alice")
       assert {:ok, _} = UserStore.register(localpart, "Test1234!", server_name: "localhost")
-      assert UserStore.register(localpart, "Different1!", server_name: "localhost") == {:error, :user_in_use}
+
+      assert UserStore.register(localpart, "Different1!", server_name: "localhost") ==
+               {:error, :user_in_use}
     end
 
     test "a guest registration sets is_guest and needs no password" do
       localpart = uniq("guest")
-      assert {:ok, result} = UserStore.register(localpart, nil, server_name: "localhost", is_guest: true)
+
+      assert {:ok, result} =
+               UserStore.register(localpart, nil, server_name: "localhost", is_guest: true)
+
       assert UserStore.guest?(result.user_id) == true
     end
 
@@ -40,8 +45,60 @@ defmodule AxonCore.UserStoreTest do
 
     test "an explicit device_id is honored instead of a generated one" do
       localpart = uniq("alice")
-      {:ok, result} = UserStore.register(localpart, "Test1234!", server_name: "localhost", device_id: "MYDEVICE")
+
+      {:ok, result} =
+        UserStore.register(localpart, "Test1234!",
+          server_name: "localhost",
+          device_id: "MYDEVICE"
+        )
+
       assert result.device_id == "MYDEVICE"
+    end
+
+    test "an empty localpart is rejected (required-field validation, not treated as a uniqueness conflict)" do
+      assert {:error, _reason} = UserStore.register("", "Test1234!", server_name: "localhost")
+    end
+
+    test "admin: true is honored (bootstrap registration promoting an admin)" do
+      localpart = uniq("admin")
+
+      {:ok, result} =
+        UserStore.register(localpart, "Test1234!", server_name: "localhost", admin: true)
+
+      assert {:ok, user} = UserStore.get_user(result.user_id)
+      assert user.admin == true
+    end
+  end
+
+  describe "deactivate/1" do
+    test "marks the user deactivated and invalidates every outstanding token" do
+      localpart = uniq("alice")
+      {:ok, reg} = UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
+      :ok = UserStore.deactivate(reg.user_id)
+
+      assert {:ok, user} = UserStore.get_user(reg.user_id)
+      assert user.deactivated == true
+      assert UserStore.validate_token(reg.access_token) == :error
+    end
+  end
+
+  describe "shadow-ban" do
+    test "set_shadow_banned/2 toggles the flag, shadow_banned?/1 reflects it" do
+      localpart = uniq("alice")
+      {:ok, reg} = UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
+      refute UserStore.shadow_banned?(reg.user_id)
+
+      :ok = UserStore.set_shadow_banned(reg.user_id, true)
+      assert UserStore.shadow_banned?(reg.user_id)
+
+      :ok = UserStore.set_shadow_banned(reg.user_id, false)
+      refute UserStore.shadow_banned?(reg.user_id)
+    end
+
+    test "shadow_banned?/1 is false for an unknown user" do
+      refute UserStore.shadow_banned?("@nobody:localhost")
     end
   end
 
@@ -59,17 +116,21 @@ defmodule AxonCore.UserStoreTest do
     end
 
     test "wrong password is forbidden", %{localpart: localpart} do
-      assert UserStore.login(localpart, "WrongPassword!", server_name: "localhost") == {:error, :forbidden}
+      assert UserStore.login(localpart, "WrongPassword!", server_name: "localhost") ==
+               {:error, :forbidden}
     end
 
     test "an unknown user is forbidden" do
-      assert UserStore.login(uniq("nobody"), "whatever", server_name: "localhost") == {:error, :forbidden}
+      assert UserStore.login(uniq("nobody"), "whatever", server_name: "localhost") ==
+               {:error, :forbidden}
     end
 
     test "a deactivated user cannot log in", %{localpart: localpart, user_id: user_id} do
       import Ecto.Query
       Repo.update_all(from(u in "users", where: u.user_id == ^user_id), set: [deactivated: true])
-      assert UserStore.login(localpart, "Test1234!", server_name: "localhost") == {:error, :forbidden}
+
+      assert UserStore.login(localpart, "Test1234!", server_name: "localhost") ==
+               {:error, :forbidden}
     end
 
     test "login by full user_id (not just localpart) works", %{user_id: user_id} do
@@ -123,8 +184,11 @@ defmodule AxonCore.UserStoreTest do
       subject = uniq("subject")
       localpart = uniq("oidcuser")
 
-      {:ok, {user_id1, _}} = UserStore.authenticate_via_oidc(subject, localpart, "DEV1", "localhost")
-      {:ok, {user_id2, _}} = UserStore.authenticate_via_oidc(subject, "irrelevant_localpart_now", "DEV2", "localhost")
+      {:ok, {user_id1, _}} =
+        UserStore.authenticate_via_oidc(subject, localpart, "DEV1", "localhost")
+
+      {:ok, {user_id2, _}} =
+        UserStore.authenticate_via_oidc(subject, "irrelevant_localpart_now", "DEV2", "localhost")
 
       assert user_id1 == user_id2
     end
@@ -139,7 +203,9 @@ defmodule AxonCore.UserStoreTest do
 
     test "refuses to attach a different OIDC subject to an already-oidc-linked localpart" do
       localpart = uniq("oidcuser")
-      {:ok, _} = UserStore.authenticate_via_oidc(uniq("subject_a"), localpart, "DEV1", "localhost")
+
+      {:ok, _} =
+        UserStore.authenticate_via_oidc(uniq("subject_a"), localpart, "DEV1", "localhost")
 
       assert UserStore.authenticate_via_oidc(uniq("subject_b"), localpart, "DEV2", "localhost") ==
                {:error, :localpart_taken_by_other_subject}
@@ -150,10 +216,13 @@ defmodule AxonCore.UserStoreTest do
       subject = uniq("subject")
       localpart = uniq("oidcuser")
 
-      {:ok, {user_id, _}} = UserStore.authenticate_via_oidc(subject, localpart, "DEV1", "localhost")
+      {:ok, {user_id, _}} =
+        UserStore.authenticate_via_oidc(subject, localpart, "DEV1", "localhost")
+
       Repo.update_all(from(u in "users", where: u.user_id == ^user_id), set: [deactivated: true])
 
-      assert UserStore.authenticate_via_oidc(subject, localpart, "DEV2", "localhost") == {:error, :deactivated}
+      assert UserStore.authenticate_via_oidc(subject, localpart, "DEV2", "localhost") ==
+               {:error, :deactivated}
     end
   end
 

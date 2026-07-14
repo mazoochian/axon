@@ -81,6 +81,14 @@ defmodule AxonCrypto.CanonicalJSONTest do
       assert to_binary(%{"a" => <<1>>}) == ~s({"a":"\\u0001"})
     end
 
+    test "control character \\b (backspace) escaped" do
+      assert to_binary(%{"a" => "\b"}) == ~s({"a":"\\b"})
+    end
+
+    test "control character \\f (form feed) escaped" do
+      assert to_binary(%{"a" => "\f"}) == ~s({"a":"\\f"})
+    end
+
     test "spec example from Matrix appendix" do
       input = %{
         "one" => 1,
