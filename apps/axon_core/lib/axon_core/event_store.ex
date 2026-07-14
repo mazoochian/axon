@@ -154,7 +154,8 @@ defmodule AxonCore.EventStore do
   defp other_joined_members(repo, room_id, excluding_user_id) do
     repo.all(
       from(m in "room_memberships",
-        where: m.room_id == ^room_id and m.membership == "join" and m.user_id != ^excluding_user_id,
+        where:
+          m.room_id == ^room_id and m.membership == "join" and m.user_id != ^excluding_user_id,
         select: m.user_id
       )
     )
@@ -549,6 +550,60 @@ defmodule AxonCore.EventStore do
         where: m.user_id == ^user_id and m.membership == "invite" and not m.forgotten,
         select: m.room_id
       )
+    )
+  end
+
+  @doc """
+  Records a typing/receipt change for room_id and wakes any long-polling
+  /sync for its members immediately, the same way KeyStore.record_device_list_update/1
+  does for device-list changes — see /sync's ephemeral section.
+  """
+  def record_ephemeral_update(room_id) do
+    Repo.insert_all("ephemeral_updates", [%{room_id: room_id}])
+    Phoenix.PubSub.broadcast(Axon.PubSub, "room:#{room_id}", {:ephemeral, room_id})
+  end
+
+  @doc "Server names of this room's joined members who aren't local, for EDU fan-out targeting."
+  def remote_servers_for_room(room_id) do
+    local_server = Application.get_env(:axon_web, :server_name, "localhost")
+
+    Repo.all(
+      from(m in RoomMembership,
+        where: m.room_id == ^room_id and m.membership == "join",
+        select: m.user_id
+      )
+    )
+    |> Enum.map(&(&1 |> String.split(":") |> List.last()))
+    |> Enum.reject(&(&1 == local_server))
+    |> Enum.uniq()
+  end
+
+  @doc """
+  Server names of users (other than user_id) who share any room with
+  user_id, for presence EDU fan-out targeting — presence is federated to
+  every server you share a room with, not just the ones for a single room.
+  """
+  def remote_servers_for_user(user_id) do
+    local_server = Application.get_env(:axon_web, :server_name, "localhost")
+
+    Repo.all(
+      from(m2 in RoomMembership,
+        join: m1 in RoomMembership,
+        on: m1.room_id == m2.room_id and m1.user_id == ^user_id and m1.membership == "join",
+        where: m2.membership == "join" and m2.user_id != ^user_id,
+        select: m2.user_id,
+        distinct: true
+      )
+    )
+    |> Enum.map(&(&1 |> String.split(":") |> List.last()))
+    |> Enum.reject(&(&1 == local_server))
+    |> Enum.uniq()
+  end
+
+  @doc "Whether user_id (typically remote) is a joined member of any room we know about."
+  def known_user?(user_id) do
+    Repo.exists?(
+      from(m in RoomMembership, where: m.user_id == ^user_id and m.membership == "join")
     )
   end
 

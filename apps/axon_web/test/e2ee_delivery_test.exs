@@ -164,8 +164,11 @@ defmodule AxonWeb.E2EEDeliveryTest do
       room_a = create_room(alice.token, %{"preset" => "public_chat"})
       room_b = create_room(alice.token, %{"preset" => "public_chat"})
 
-      assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_a}", %{}) |> Map.get(:status) == 200
-      assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_b}", %{}) |> Map.get(:status) == 200
+      assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_a}", %{}) |> Map.get(:status) ==
+               200
+
+      assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_b}", %{}) |> Map.get(:status) ==
+               200
 
       alice_since = sync_once(alice.token)["next_batch"]
 
@@ -190,7 +193,11 @@ defmodule AxonWeb.E2EEDeliveryTest do
     setup do
       start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
       KeyCache.clear()
-      Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:#{@port}"})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{@port}"
+      })
+
       on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
       :ok
     end

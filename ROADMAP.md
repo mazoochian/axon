@@ -12,9 +12,16 @@ Despite a substantial existing E2EE surface (key upload/query/claim, cross-signi
 
 Fixed by: broadcasting a PubSub wake on to-device delivery (mirroring the existing `device_list_updates` pattern); re-touching `device_list_updates` for both parties on room join and a new `device_list_partings` table + cursor for room leave; and adding `m.direct_to_device` EDU support (outbound via `AxonWeb.FederationFanout`, inbound via `FederationController.send_transaction/2`), plus wildcard (`"*"`) device-id expansion. Regression coverage in `apps/axon_web/test/e2ee_delivery_test.exs` exercises the real long-poll path with a nonzero timeout (closing the test-coverage gap that hid bug 1) and the cross-server EDU path via `AxonFederation.FakeRemoteMatrixServer`.
 
-## Phase 9 — Federation EDU & real-time parity
+## Phase 9 — Federation EDU & real-time parity (done)
 
-Full bidirectional EDU support (`m.typing`, `m.receipt`, `m.presence`), building on the `m.direct_to_device` scaffolding from Phase 8. Durable outbound federation transaction retry/backoff — today `AxonWeb.FederationFanout` is fire-and-forget: a failed delivery just logs a warning and is dropped, with no queue or redelivery. General federation robustness matters here specifically because this deployment federates with other servers in production use, not just same-server accounts.
+Full bidirectional EDU support (`m.typing`, `m.receipt`, `m.presence`), building on the `m.direct_to_device` scaffolding from Phase 8, plus durable outbound federation delivery.
+
+- **Typing indicators** (`PUT /rooms/:room_id/typing/:user_id`) were a complete no-op stub — acknowledged and discarded. Now backed by `AxonSync.Typing` (in-memory, auto-expiring, mirroring `AxonSync.Presence`'s design), surfaced in `/sync`'s per-room `ephemeral` section, and federated as `m.typing` EDUs both ways.
+- **Read receipts** had no PubSub wake at all (unlike to-device/device-lists/account-data, fixed in Phase 8) — a receipt posted to an otherwise-quiet room sat unseen until something else happened in that room, since incremental sync only included a room at all when it had a *new timeline event*. Fixed with a new `ephemeral_updates` log (mirroring `device_list_updates`) that both wakes long-pollers and makes a room eligible for inclusion on ephemeral-only changes; `m.read` receipts (never `m.read.private`) now federate as `m.receipt` EDUs.
+- **Presence** now federates as `m.presence` EDUs to every server sharing a room with the user, but only on an actual state transition (online/unavailable/offline or status_msg change) — not on every `bump_activity` touch, which happens on every authenticated request and would otherwise flood federation peers.
+- **Durable outbound delivery**: `AxonFederation.OutboundQueue` persists every outbound PDU/EDU transaction before the first attempt and retries with exponential backoff (30s → 1hr cap, giving up after 7 days) on failure, reusing the same row id as the txn_id on every retry so a remote server that already processed an earlier attempt responds idempotently. Replaces the previous fire-and-forget behavior in `AxonWeb.FederationFanout`, where a failed delivery just logged a warning and was dropped — meaning a remote server being briefly unreachable silently lost whatever was sent to it during that window. Matters here specifically because this deployment federates with other servers in production use, not just same-server accounts.
+
+Regression coverage: `apps/axon_federation/test/outbound_queue_test.exs` (failure → persisted → retry → success), `apps/axon_web/test/phase9_ephemeral_test.exs` (typing/receipt local wake-up and room-inclusion, both EDU directions for typing/receipts/presence, permission checks, expiry).
 
 ## Phase 10 — Sliding Sync (MSC3575/MSC4186)
 
@@ -34,4 +41,4 @@ A real admin API beyond the current Synapse-compatible shared-secret registratio
 
 ## Phase 14 — Feature completion pass
 
-Persist custom push rules (`PUT`/`DELETE` on `/pushrules/...` currently discard silently — only the server default rule set is actually served). Wire up typing indicators (currently a no-op). Server notices. SSRF-safe URL previews (currently deliberately 404s — see README "Known gaps").
+Persist custom push rules (`PUT`/`DELETE` on `/pushrules/...` currently discard silently — only the server default rule set is actually served). Server notices. SSRF-safe URL previews (currently deliberately 404s — see README "Known gaps").

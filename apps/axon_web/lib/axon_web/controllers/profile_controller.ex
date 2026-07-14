@@ -1,7 +1,7 @@
 defmodule AxonWeb.ProfileController do
   use Phoenix.Controller, formats: [:json]
 
-  action_fallback AxonWeb.FallbackController
+  action_fallback(AxonWeb.FallbackController)
 
   alias AxonCore.{EventStore, UserStore}
   alias AxonFederation.HttpClient
@@ -11,8 +11,17 @@ defmodule AxonWeb.ProfileController do
   def show(conn, %{"user_id" => user_id}) do
     with {:ok, profile} <- fetch_profile(user_id) do
       resp = %{}
-      resp = if profile["displayname"], do: Map.put(resp, "displayname", profile["displayname"]), else: resp
-      resp = if profile["avatar_url"], do: Map.put(resp, "avatar_url", profile["avatar_url"]), else: resp
+
+      resp =
+        if profile["displayname"],
+          do: Map.put(resp, "displayname", profile["displayname"]),
+          else: resp
+
+      resp =
+        if profile["avatar_url"],
+          do: Map.put(resp, "avatar_url", profile["avatar_url"]),
+          else: resp
+
       json(conn, resp)
     end
   end
@@ -27,10 +36,15 @@ defmodule AxonWeb.ProfileController do
   # PUT /_matrix/client/v3/profile/:user_id/displayname
   def set_displayname(conn, %{"user_id" => user_id, "displayname" => displayname}) do
     if user_id != conn.assigns.current_user_id do
-      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot set another user's profile"})
+      conn
+      |> put_status(403)
+      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot set another user's profile"})
     else
       with {:ok, _} <- UserStore.update_profile(user_id, %{displayname: displayname}) do
-        Task.Supervisor.start_child(Axon.TaskSupervisor, fn -> propagate_profile_to_rooms(user_id) end)
+        Task.Supervisor.start_child(Axon.TaskSupervisor, fn ->
+          propagate_profile_to_rooms(user_id)
+        end)
+
         json(conn, %{})
       end
     end
@@ -48,10 +62,15 @@ defmodule AxonWeb.ProfileController do
   # PUT /_matrix/client/v3/profile/:user_id/avatar_url
   def set_avatar_url(conn, %{"user_id" => user_id, "avatar_url" => avatar_url}) do
     if user_id != conn.assigns.current_user_id do
-      conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot set another user's profile"})
+      conn
+      |> put_status(403)
+      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot set another user's profile"})
     else
       with {:ok, _} <- UserStore.update_profile(user_id, %{avatar_url: avatar_url}) do
-        Task.Supervisor.start_child(Axon.TaskSupervisor, fn -> propagate_profile_to_rooms(user_id) end)
+        Task.Supervisor.start_child(Axon.TaskSupervisor, fn ->
+          propagate_profile_to_rooms(user_id)
+        end)
+
         json(conn, %{})
       end
     end
@@ -95,7 +114,10 @@ defmodule AxonWeb.ProfileController do
         {:ok, body}
 
       {:error, reason} ->
-        Logger.warning("Federation profile query to #{server} for #{user_id} failed: #{inspect(reason)}")
+        Logger.warning(
+          "Federation profile query to #{server} for #{user_id} failed: #{inspect(reason)}"
+        )
+
         {:error, :not_found}
     end
   end
@@ -115,8 +137,16 @@ defmodule AxonWeb.ProfileController do
   defp propagate_profile_to_rooms(user_id) do
     with {:ok, profile} <- UserStore.get_profile(user_id) do
       profile_fields = %{}
-      profile_fields = if profile.displayname, do: Map.put(profile_fields, "displayname", profile.displayname), else: profile_fields
-      profile_fields = if profile.avatar_url,  do: Map.put(profile_fields, "avatar_url",  profile.avatar_url),  else: profile_fields
+
+      profile_fields =
+        if profile.displayname,
+          do: Map.put(profile_fields, "displayname", profile.displayname),
+          else: profile_fields
+
+      profile_fields =
+        if profile.avatar_url,
+          do: Map.put(profile_fields, "avatar_url", profile.avatar_url),
+          else: profile_fields
 
       EventStore.get_joined_rooms(user_id)
       |> Enum.each(fn room_id ->
@@ -127,7 +157,10 @@ defmodule AxonWeb.ProfileController do
           event_map ->
             current_content = event_map["content"] || %{}
             new_content = Map.merge(current_content, profile_fields)
-            AxonRoom.RoomProcess.send_event(room_id, user_id, "m.room.member", new_content, state_key: user_id)
+
+            AxonRoom.RoomProcess.send_event(room_id, user_id, "m.room.member", new_content,
+              state_key: user_id
+            )
         end
       end)
     end

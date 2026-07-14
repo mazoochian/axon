@@ -132,7 +132,8 @@ defmodule AxonWeb.FederationController do
         |> put_status(400)
         |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid join event"})
 
-      {:error, sig_error} when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
+      {:error, sig_error}
+      when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
         conn
         |> put_status(403)
         |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Bad event signature"})
@@ -189,7 +190,8 @@ defmodule AxonWeb.FederationController do
          {:ok, _} <- apply_leave_event(room_id, leave_event) do
       json(conn, %{})
     else
-      {:error, sig_error} when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
+      {:error, sig_error}
+      when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
         conn
         |> put_status(403)
         |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Bad event signature"})
@@ -274,7 +276,8 @@ defmodule AxonWeb.FederationController do
         |> put_status(400)
         |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid knock event"})
 
-      {:error, sig_error} when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
+      {:error, sig_error}
+      when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
         conn
         |> put_status(403)
         |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Bad event signature"})
@@ -366,8 +369,46 @@ defmodule AxonWeb.FederationController do
     end
   end
 
-  # Only m.direct_to_device is handled today (the E2EE relay path this fixes);
-  # other EDU types (m.typing, m.receipt, m.presence) are a later phase.
+  defp process_inbound_edu(%{"edu_type" => "m.typing", "content" => content}, origin) do
+    room_id = content["room_id"]
+    user_id = content["user_id"]
+    typing? = content["typing"] == true
+    timeout_ms = content["timeout"] || 30_000
+
+    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+
+    if sender_server == origin and local_room_member?(room_id, user_id) do
+      if typing?,
+        do: AxonSync.Typing.start(room_id, user_id, timeout_ms),
+        else: AxonSync.Typing.stop(room_id, user_id)
+
+      EventStore.record_ephemeral_update(room_id)
+    else
+      Logger.warning(
+        "Dropping m.typing EDU from #{origin} for room #{inspect(room_id)}, user #{inspect(user_id)}"
+      )
+    end
+  end
+
+  defp process_inbound_edu(
+         %{"edu_type" => "m.presence", "content" => %{"push" => updates}},
+         origin
+       )
+       when is_list(updates) do
+    Enum.each(updates, &apply_inbound_presence(&1, origin))
+  end
+
+  defp process_inbound_edu(%{"edu_type" => "m.receipt", "content" => content}, origin)
+       when is_map(content) do
+    Enum.each(content, fn {room_id, receipt_types} ->
+      Enum.each(receipt_types, fn {receipt_type, users} ->
+        Enum.each(users, fn {user_id, receipt_data} ->
+          apply_inbound_receipt(origin, room_id, receipt_type, user_id, receipt_data)
+        end)
+      end)
+    end)
+  end
+
   defp process_inbound_edu(%{"edu_type" => "m.direct_to_device", "content" => content}, origin) do
     sender = content["sender"]
     event_type = content["type"]
@@ -383,9 +424,7 @@ defmodule AxonWeb.FederationController do
         end
       end)
     else
-      Logger.warning(
-        "Dropping m.direct_to_device EDU from #{origin} claiming sender #{sender}"
-      )
+      Logger.warning("Dropping m.direct_to_device EDU from #{origin} claiming sender #{sender}")
     end
   end
 
@@ -667,6 +706,65 @@ defmodule AxonWeb.FederationController do
   defp local_user?(user_id, local_server) do
     user_id |> String.split(":") |> List.last() == local_server
   end
+
+  # Guards inbound ephemeral EDUs (m.typing, m.receipt) against a remote
+  # server injecting state for a room/user we have no actual relationship
+  # with — the claimed user must be a joined member of the room per our own
+  # (federation-derived) membership records.
+  defp local_room_member?(room_id, user_id) when is_binary(room_id) and is_binary(user_id) do
+    EventStore.get_membership(room_id, user_id) == {:ok, "join"}
+  end
+
+  defp local_room_member?(_room_id, _user_id), do: false
+
+  defp apply_inbound_receipt(origin, room_id, receipt_type, user_id, receipt_data) do
+    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+    event_id = receipt_data["event_ids"] |> List.wrap() |> List.first()
+    ts = get_in(receipt_data, ["data", "ts"]) || System.os_time(:millisecond)
+
+    if sender_server == origin and is_binary(event_id) and local_room_member?(room_id, user_id) do
+      Repo.insert_all(
+        "receipts",
+        [
+          %{
+            room_id: room_id,
+            user_id: user_id,
+            receipt_type: receipt_type,
+            event_id: event_id,
+            ts: ts
+          }
+        ],
+        on_conflict: {:replace, [:event_id, :ts]},
+        conflict_target: [:room_id, :user_id, :receipt_type]
+      )
+
+      EventStore.record_ephemeral_update(room_id)
+    else
+      Logger.warning(
+        "Dropping m.receipt EDU from #{origin} for room #{inspect(room_id)}, user #{inspect(user_id)}"
+      )
+    end
+  end
+
+  # Silently ignores unrecognized/irrelevant users in the batch — a
+  # m.presence push commonly covers many users, and one of them not being
+  # anyone we share a room with is normal, not suspicious (unlike a
+  # room-scoped m.typing/m.receipt EDU naming a room we have no relation to).
+  defp apply_inbound_presence(%{"user_id" => user_id, "presence" => presence} = update, origin)
+       when presence in ["online", "unavailable", "offline"] do
+    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+
+    if sender_server == origin and EventStore.known_user?(user_id) do
+      AxonSync.Presence.set_remote(
+        user_id,
+        presence,
+        update["status_msg"],
+        update["last_active_ago"]
+      )
+    end
+  end
+
+  defp apply_inbound_presence(_update, _origin), do: :ok
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/key/v2/query (batch key query from remote servers)

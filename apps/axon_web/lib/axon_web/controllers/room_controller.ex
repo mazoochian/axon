@@ -6,6 +6,7 @@ defmodule AxonWeb.RoomController do
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
   alias AxonRoom.{CreateRoom, RestrictedJoin, RoomProcess, RoomUpgrade}
+  alias AxonSync.Typing
 
   # POST /_matrix/client/v3/createRoom
   def create(conn, params) do
@@ -165,8 +166,66 @@ defmodule AxonWeb.RoomController do
   end
 
   # PUT /_matrix/client/v3/rooms/:room_id/typing/:user_id
-  # Typing is ephemeral — we acknowledge but don't persist or fan out yet.
-  def typing(conn, _params), do: json(conn, %{})
+  def typing(conn, %{"room_id" => room_id, "user_id" => user_id} = params) do
+    current_user_id = conn.assigns.current_user_id
+
+    cond do
+      user_id != current_user_id ->
+        conn
+        |> put_status(403)
+        |> json(%{
+          "errcode" => "M_FORBIDDEN",
+          "error" => "Cannot set another user's typing state"
+        })
+
+      not joined?(room_id, current_user_id) ->
+        conn
+        |> put_status(403)
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+
+      params["typing"] == true ->
+        timeout_ms = params["timeout"] || 30_000
+        Typing.start(room_id, user_id, timeout_ms)
+        EventStore.record_ephemeral_update(room_id)
+        federate_typing(room_id, user_id, true, timeout_ms)
+        json(conn, %{})
+
+      true ->
+        Typing.stop(room_id, user_id)
+        EventStore.record_ephemeral_update(room_id)
+        federate_typing(room_id, user_id, false, 0)
+        json(conn, %{})
+    end
+  end
+
+  defp joined?(room_id, user_id) do
+    case EventStore.get_membership(room_id, user_id) do
+      {:ok, "join"} -> true
+      _ -> false
+    end
+  end
+
+  defp federate_typing(room_id, user_id, typing, timeout_ms) do
+    case EventStore.remote_servers_for_room(room_id) do
+      [] ->
+        :ok
+
+      remote_servers ->
+        edu = %{
+          "edu_type" => "m.typing",
+          "content" => %{
+            "room_id" => room_id,
+            "user_id" => user_id,
+            "typing" => typing,
+            "timeout" => timeout_ms
+          }
+        }
+
+        Enum.each(remote_servers, fn server ->
+          Phoenix.PubSub.broadcast(Axon.PubSub, "federation:fanout", {:federate_edu, edu, server})
+        end)
+    end
+  end
 
   # POST /_matrix/client/v3/rooms/:room_id/forget
   def forget(conn, %{"room_id" => room_id}) do

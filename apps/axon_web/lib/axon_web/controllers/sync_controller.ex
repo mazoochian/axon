@@ -18,11 +18,13 @@ defmodule AxonWeb.SyncController do
     # nil means initial sync; a string (even "0") means incremental
     is_initial_sync = is_nil(since)
 
-    # next_batch token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}"
+    # next_batch token format:
+    # "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}_${eph_cursor}"
     # dl_cursor tracks device_list_updates.id; ad_cursor tracks account_data_stream.id;
     # pr_cursor tracks AxonSync.Presence's version counter; left_cursor tracks
-    # device_list_partings.id.
-    {since_ordering, dl_since, ad_since, pr_since, left_since} = parse_sync_token(since)
+    # device_list_partings.id; eph_cursor tracks ephemeral_updates.id (typing/receipts).
+    {since_ordering, dl_since, ad_since, pr_since, left_since, eph_since} =
+      parse_sync_token(since)
 
     filter = load_filter(user_id, params["filter"])
 
@@ -50,10 +52,18 @@ defmodule AxonWeb.SyncController do
     ad_next = current_ad_max_id()
     pr_next = Presence.current_version()
     left_next = current_left_max_id()
-    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}_#{pr_next}_#{left_next}"
+    eph_next = current_eph_max_id()
+    next_batch = "#{next_ordering}_#{dl_next}_#{ad_next}_#{pr_next}_#{left_next}_#{eph_next}"
 
     rooms_response =
-      build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter)
+      build_rooms_response(
+        user_id,
+        events_by_room,
+        is_initial_sync,
+        since_ordering,
+        eph_since,
+        filter
+      )
 
     global_account_data = get_global_account_data(user_id, is_initial_sync, ad_since)
     presence_events = get_presence_events(user_id, is_initial_sync, pr_since)
@@ -124,7 +134,14 @@ defmodule AxonWeb.SyncController do
   # Sync response builder
   # ---------------------------------------------------------------------------
 
-  defp build_rooms_response(user_id, events_by_room, is_initial_sync, since_ordering, filter) do
+  defp build_rooms_response(
+         user_id,
+         events_by_room,
+         is_initial_sync,
+         since_ordering,
+         eph_since,
+         filter
+       ) do
     joined_rooms = EventStore.get_joined_rooms(user_id)
     invited_rooms = EventStore.get_invited_rooms(user_id)
     tl_limit = filter_timeline_limit(filter)
@@ -135,7 +152,7 @@ defmodule AxonWeb.SyncController do
       joined_rooms
       |> Enum.reduce(%{}, fn room_id, acc ->
         room_events = Map.get(events_by_room, room_id, [])
-        has_new_events = room_events != []
+        has_new_events = room_events != [] or has_ephemeral_change?(room_id, eph_since)
 
         if not is_initial_sync and not has_new_events do
           acc
@@ -396,11 +413,11 @@ defmodule AxonWeb.SyncController do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  # Returns {room_ordering, dl_cursor, ad_cursor, pr_cursor}.
-  # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}"
+  # Returns {room_ordering, dl_cursor, ad_cursor, pr_cursor, left_cursor, eph_cursor}.
+  # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}_${eph_cursor}"
   # Older, shorter tokens default the missing cursor(s) to 0 (return
   # everything for that stream on the next sync).
-  defp parse_sync_token(nil), do: {0, 0, 0, 0, 0}
+  defp parse_sync_token(nil), do: {0, 0, 0, 0, 0, 0}
 
   defp parse_sync_token(since) do
     parse_int = fn s ->
@@ -416,7 +433,8 @@ defmodule AxonWeb.SyncController do
     ad_n = parse_int.(Enum.at(parts, 2, "0"))
     pr_n = parse_int.(Enum.at(parts, 3, "0"))
     left_n = parse_int.(Enum.at(parts, 4, "0"))
-    {room_n, dl_n, ad_n, pr_n, left_n}
+    eph_n = parse_int.(Enum.at(parts, 5, "0"))
+    {room_n, dl_n, ad_n, pr_n, left_n, eph_n}
   end
 
   defp build_room_account_data(room_id, user_id) do
@@ -430,6 +448,10 @@ defmodule AxonWeb.SyncController do
   end
 
   defp build_ephemeral(room_id) do
+    build_receipt_events(room_id) ++ build_typing_event(room_id)
+  end
+
+  defp build_receipt_events(room_id) do
     receipts =
       Repo.all(
         from(r in "receipts",
@@ -460,6 +482,19 @@ defmodule AxonWeb.SyncController do
 
       [%{"type" => "m.receipt", "content" => content}]
     end
+  end
+
+  # Unlike receipts (only included when non-empty), typing is always
+  # included whenever the room is in the response at all — the room only
+  # got here because something ephemeral changed, and an empty user_ids
+  # list is itself meaningful (someone stopped typing).
+  defp build_typing_event(room_id) do
+    [
+      %{
+        "type" => "m.typing",
+        "content" => %{"user_ids" => AxonSync.Typing.typing_user_ids(room_id)}
+      }
+    ]
   end
 
   defp add_membership_to_timeline([], _room_id, _user_id), do: []
@@ -707,6 +742,16 @@ defmodule AxonWeb.SyncController do
 
   defp current_left_max_id do
     Repo.one(from(p in "device_list_partings", select: max(p.id))) || 0
+  end
+
+  defp current_eph_max_id do
+    Repo.one(from(e in "ephemeral_updates", select: max(e.id))) || 0
+  end
+
+  defp has_ephemeral_change?(room_id, eph_since) do
+    Repo.exists?(
+      from(e in "ephemeral_updates", where: e.room_id == ^room_id and e.id > ^eph_since)
+    )
   end
 
   defp get_max_ordering(events_by_room, fallback) do
