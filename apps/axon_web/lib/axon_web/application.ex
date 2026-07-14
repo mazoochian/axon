@@ -7,8 +7,7 @@ defmodule AxonWeb.Application do
 
     children = [
       # Server signing key — must start before the endpoint
-      {AxonCrypto.KeyServer,
-       server_name: Application.fetch_env!(:axon_web, :server_name)},
+      {AxonCrypto.KeyServer, server_name: Application.fetch_env!(:axon_web, :server_name)},
       # HTTP client for outbound federation requests
       {Finch, name: Axon.Finch},
       # Caches the delegated OIDC Authorization Server's discovery document
@@ -19,6 +18,8 @@ defmodule AxonWeb.Application do
       AxonWeb.FederationFanout,
       # Application service manager (loads AS registrations, dispatches events)
       AxonWeb.AppService.Manager,
+      # In-memory rate limiter (login/register/message-send)
+      AxonWeb.RateLimiter,
       # Cluster auto-discovery
       {Cluster.Supervisor, [topologies, [name: Axon.ClusterSupervisor]]},
       # CS API endpoint (port 8008)

@@ -10,6 +10,7 @@ defmodule AxonCore.Schema.User do
     field(:deactivated, :boolean, default: false)
     field(:admin, :boolean, default: false)
     field(:is_guest, :boolean, default: false)
+    field(:shadow_banned, :boolean, default: false)
 
     has_one(:profile, AxonCore.Schema.UserProfile, foreign_key: :user_id)
     has_many(:devices, AxonCore.Schema.Device, foreign_key: :user_id)
@@ -27,7 +28,8 @@ defmodule AxonCore.Schema.User do
       :oidc_subject,
       :deactivated,
       :admin,
-      :is_guest
+      :is_guest,
+      :shadow_banned
     ])
     |> validate_required([:user_id, :localpart])
     |> validate_format(:user_id, ~r/^@[^:]+:.+$/, message: "must be in @localpart:server format")

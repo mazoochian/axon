@@ -54,6 +54,14 @@ config :axon_web, AxonWeb.FederationEndpoint,
   render_errors: [formats: [json: AxonWeb.FallbackController], layout: false],
   pubsub_server: Axon.PubSub
 
+# Rate limits (Phase 13). Each bucket is [max: N, window_ms: M] — N
+# requests per M milliseconds, keyed per-IP (login/register) or per-user
+# (send_event). See AxonWeb.Plug.RateLimit.
+config :axon_web, :rate_limits,
+  login: [max: 10, window_ms: 60_000],
+  register: [max: 5, window_ms: 60_000],
+  send_event: [max: 20, window_ms: 10_000]
+
 # Media storage backend: :local or :s3
 config :axon_media,
   backend: :local,

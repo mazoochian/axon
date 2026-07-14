@@ -24,6 +24,7 @@ defmodule AxonCore.UserStore do
     user_id = "@#{localpart}:#{server_name}"
     password_hash = if password, do: Argon2.hash_pwd_salt(password)
     is_guest = opts[:is_guest] || false
+    is_admin = opts[:admin] || false
 
     result =
       try do
@@ -34,7 +35,8 @@ defmodule AxonCore.UserStore do
             user_id: user_id,
             localpart: localpart,
             password_hash: password_hash,
-            is_guest: is_guest
+            is_guest: is_guest,
+            admin: is_admin
           })
         )
         |> Ecto.Multi.insert(:profile, fn %{user: user} ->
@@ -113,6 +115,27 @@ defmodule AxonCore.UserStore do
   @doc "Whether `user_id` registered as a guest account (kind: \"guest\")."
   def guest?(user_id) do
     Repo.one(from(u in User, where: u.user_id == ^user_id, select: u.is_guest)) || false
+  end
+
+  @doc """
+  Deactivates a user: marks the account deactivated and invalidates every
+  access token, local (self-service `/account/deactivate`) or admin-initiated.
+  """
+  def deactivate(user_id) do
+    Repo.update_all(from(u in User, where: u.user_id == ^user_id), set: [deactivated: true])
+    logout_all(user_id)
+    :ok
+  end
+
+  @doc "Sets or clears a user's shadow-ban flag (admin API)."
+  def set_shadow_banned(user_id, banned?) when is_boolean(banned?) do
+    Repo.update_all(from(u in User, where: u.user_id == ^user_id), set: [shadow_banned: banned?])
+    :ok
+  end
+
+  @doc "Whether `user_id` is currently shadow-banned."
+  def shadow_banned?(user_id) do
+    Repo.one(from(u in User, where: u.user_id == ^user_id, select: u.shadow_banned)) || false
   end
 
   @doc "Validates a raw Bearer token. Returns `{:ok, {user_id, device_id}}` or `:error`."

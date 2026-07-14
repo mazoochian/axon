@@ -212,7 +212,7 @@ defmodule AxonWeb.SlidingSyncController do
 
     raw_timeline =
       if timeline_limit > 0 do
-        EventStore.get_recent_room_events(room_id, timeline_limit)
+        EventStore.get_recent_room_events(room_id, timeline_limit, user_id)
       else
         []
       end

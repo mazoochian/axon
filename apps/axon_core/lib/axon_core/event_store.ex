@@ -208,6 +208,37 @@ defmodule AxonCore.EventStore do
     end
   end
 
+  @doc "Whether room_id has been purged/blocked by a server admin (AdminController.purge_room/2)."
+  def room_blocked?(room_id) do
+    Repo.one(from(r in Room, where: r.room_id == ^room_id, select: r.blocked)) || false
+  end
+
+  @doc """
+  Admin room deletion: removes the room's events, state, memberships, and
+  other room-scoped rows from local storage, and marks it blocked so a
+  future join attempt gets a clear, specific rejection instead of either
+  silently doing nothing or (worse) recreating a room nobody actually
+  administers under the same id. The `rooms` row itself is kept — it's the
+  tombstone that `blocked` lives on, and nothing else references its
+  deletion via a cascading FK, so removing it would just orphan any
+  remaining child data anyway.
+  """
+  def purge_room(room_id) do
+    Repo.transaction(fn ->
+      Repo.delete_all(from(e in Event, where: e.room_id == ^room_id))
+      Repo.delete_all(from(s in "current_room_state", where: s.room_id == ^room_id))
+      Repo.delete_all(from(s in "room_state_snapshots", where: s.room_id == ^room_id))
+      Repo.delete_all(from(m in RoomMembership, where: m.room_id == ^room_id))
+      Repo.delete_all(from(a in "room_aliases", where: a.room_id == ^room_id))
+      Repo.delete_all(from(a in "room_account_data", where: a.room_id == ^room_id))
+      Repo.delete_all(from(r in "receipts", where: r.room_id == ^room_id))
+      Repo.delete_all(from(e in "ephemeral_updates", where: e.room_id == ^room_id))
+      Repo.update_all(from(r in Room, where: r.room_id == ^room_id), set: [blocked: true])
+    end)
+
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # Event queries
   # ---------------------------------------------------------------------------
@@ -570,19 +601,25 @@ defmodule AxonCore.EventStore do
   end
 
   @doc """
-  Last `limit` non-rejected/non-soft-failed events in a room, oldest first —
-  for sliding sync's per-room timeline (unlike get_user_events_since, this
-  isn't scoped to "since a cursor" or to a particular viewer).
+  Last `limit` non-rejected/non-soft-failed events in a room, oldest first,
+  visible to `viewer_id` — for sliding sync's per-room timeline. Shadow-ban
+  filtering (see get_user_events_since/2) applies the same way; unlike that
+  function this isn't scoped to "since a cursor", so a filtered-out event
+  isn't backfilled to keep the list at `limit` length.
   """
-  def get_recent_room_events(room_id, limit) do
-    Repo.all(
-      from(e in Event,
-        where: e.room_id == ^room_id and not e.rejected and not e.soft_failed,
-        order_by: [desc: e.stream_ordering],
-        limit: ^limit
+  def get_recent_room_events(room_id, limit, viewer_id \\ nil) do
+    events =
+      Repo.all(
+        from(e in Event,
+          where: e.room_id == ^room_id and not e.rejected and not e.soft_failed,
+          order_by: [desc: e.stream_ordering],
+          limit: ^limit
+        )
       )
-    )
-    |> Enum.reverse()
+      |> Enum.reverse()
+
+    banned_senders = shadow_banned_senders(events)
+    Enum.reject(events, &hidden_from_viewer?(&1, viewer_id, banned_senders))
   end
 
   @doc """
@@ -802,7 +839,41 @@ defmodule AxonCore.EventStore do
           )
         )
 
+      banned_senders = shadow_banned_senders(events)
+      events = Enum.reject(events, &hidden_from_viewer?(&1, user_id, banned_senders))
+
       Enum.group_by(events, & &1.room_id)
+    end
+  end
+
+  # Shadow-ban local enforcement (admin API): a shadow-banned sender's own
+  # non-state (message-like) events are hidden from every *other* local
+  # viewer's sync — the whole point is they don't find out — but never from
+  # themselves (reading your own writes must always work normally) and
+  # never for state events (hiding e.g. a join would corrupt every other
+  # viewer's picture of room membership, a much bigger inconsistency than
+  # muting a spammer's messages). The outbound federation half of this
+  # lives in AxonRoom.RoomProcess.shadow_banned_message?/1.
+  defp hidden_from_viewer?(%Event{state_key: nil, sender: sender}, viewer_id, banned_senders)
+       when sender != viewer_id do
+    MapSet.member?(banned_senders, sender)
+  end
+
+  defp hidden_from_viewer?(_event, _viewer_id, _banned_senders), do: false
+
+  defp shadow_banned_senders(events) do
+    senders = events |> Enum.map(& &1.sender) |> Enum.uniq()
+
+    if senders == [] do
+      MapSet.new()
+    else
+      Repo.all(
+        from(u in "users",
+          where: u.user_id in ^senders and u.shadow_banned == true,
+          select: u.user_id
+        )
+      )
+      |> MapSet.new()
     end
   end
 
