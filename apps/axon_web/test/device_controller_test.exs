@@ -41,6 +41,18 @@ defmodule AxonWeb.DeviceControllerTest do
     assert decode(conn)["device_id"] == alice.device_id
   end
 
+  test "an authenticated request updates last_seen_ts/last_seen_ip, not left null" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    conn = authed(alice.token) |> get("/_matrix/client/v3/devices/#{alice.device_id}")
+    assert conn.status == 200
+    body = decode(conn)
+
+    assert is_integer(body["last_seen_ts"])
+    assert body["last_seen_ts"] > 0
+    assert is_binary(body["last_seen_ip"])
+  end
+
   test "show for an unknown device_id 404s" do
     alice = register("alice_#{System.unique_integer([:positive])}")
     conn = authed(alice.token) |> get("/_matrix/client/v3/devices/NONEXISTENT")

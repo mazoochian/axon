@@ -17,6 +17,8 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 - **URL previews** (`GET /media/v3/preview_url`) still return 404 — deliberately deferred, since fetching arbitrary user-submitted URLs server-side needs SSRF-safe handling (deny-list private IP ranges, size/time limits) that hasn't been built yet.
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
 
+See [ROADMAP.md](ROADMAP.md) for what's planned next (Phase 8 onward), continuing on from the phases below.
+
 ## Why BEAM?
 
 Synapse's worker model solves concurrency by spawning separate OS processes — each carrying a full Python interpreter (~200–500 MB). A moderately busy Synapse deployment with workers can consume 2–10 GB RAM.

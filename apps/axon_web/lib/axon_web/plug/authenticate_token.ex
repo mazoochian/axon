@@ -21,6 +21,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
         case UserStore.validate_token(raw_token) do
           {:ok, {user_id, device_id}} ->
             AxonSync.Presence.bump_activity(user_id)
+            UserStore.touch_device(user_id, device_id, remote_ip(conn))
 
             conn
             |> assign(:current_user_id, user_id)
@@ -34,6 +35,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
             case AxonWeb.Oidc.enabled?() and AxonWeb.Oidc.introspect(raw_token) do
               {:ok, {user_id, device_id}} ->
                 AxonSync.Presence.bump_activity(user_id)
+                UserStore.touch_device(user_id, device_id, remote_ip(conn))
 
                 conn
                 |> assign(:current_user_id, user_id)
@@ -59,4 +61,6 @@ defmodule AxonWeb.Plug.AuthenticateToken do
       _ -> conn.query_params["access_token"]
     end
   end
+
+  defp remote_ip(conn), do: conn.remote_ip |> :inet.ntoa() |> to_string()
 end

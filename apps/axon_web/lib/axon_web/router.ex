@@ -155,6 +155,12 @@ defmodule AxonWeb.Router do
     get("/r0/download/:server_name/:media_id", MediaController, :download)
     get("/r0/download/:server_name/:media_id/:filename", MediaController, :download)
     get("/r0/thumbnail/:server_name/:media_id", MediaController, :thumbnail)
+  end
+
+  # Upload requires auth per spec (unlike legacy download/thumbnail above,
+  # which stay unauthenticated for old-client compatibility).
+  scope "/_matrix/media", AxonWeb do
+    pipe_through(:authenticated)
     post("/v3/upload", MediaController, :upload)
     post("/r0/upload", MediaController, :upload)
   end

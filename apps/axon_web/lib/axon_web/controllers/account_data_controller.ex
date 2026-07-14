@@ -61,6 +61,10 @@ defmodule AxonWeb.AccountDataController do
 
       Repo.insert_all("account_data_stream", [%{user_id: user_id, type: type}])
 
+      # Wake any long-polling /sync request for this user so the change is
+      # visible immediately instead of only after its timeout elapses.
+      Phoenix.PubSub.broadcast(Axon.PubSub, "user:#{user_id}", {:account_data, user_id})
+
       json(conn, %{})
     end
   end

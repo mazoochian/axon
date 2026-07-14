@@ -47,5 +47,32 @@ defmodule AxonWeb.FederationFanout do
     {:noreply, state}
   end
 
+  @impl true
+  def handle_info({:federate_edu, edu, destination_server}, state) do
+    origin = KeyServer.server_name()
+    txn_id = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+
+    Task.Supervisor.start_child(Axon.TaskSupervisor, fn ->
+      case HttpClient.put(
+             destination_server,
+             "/_matrix/federation/v1/send/#{txn_id}",
+             %{
+               "origin" => origin,
+               "origin_server_ts" => System.os_time(:millisecond),
+               "pdus" => [],
+               "edus" => [edu]
+             }
+           ) do
+        {:ok, _} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("EDU fan-out to #{destination_server} failed: #{inspect(reason)}")
+      end
+    end)
+
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 end

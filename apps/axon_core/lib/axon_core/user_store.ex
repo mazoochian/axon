@@ -304,6 +304,14 @@ defmodule AxonCore.UserStore do
     end
   end
 
+  @doc "Records that device_id was just used, for GET /devices last_seen_ts/last_seen_ip."
+  def touch_device(user_id, device_id, ip) do
+    Repo.update_all(
+      from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id),
+      set: [last_seen_ts: System.os_time(:millisecond), last_seen_ip: ip]
+    )
+  end
+
   defp token_hash(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
 
   defp generate_device_id do

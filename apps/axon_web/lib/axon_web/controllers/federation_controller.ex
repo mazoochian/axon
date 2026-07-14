@@ -319,6 +319,7 @@ defmodule AxonWeb.FederationController do
   def send_transaction(conn, %{"txn_id" => txn_id} = params) do
     origin = conn.assigns[:origin_server]
     pdus = params["pdus"] || []
+    edus = params["edus"] || []
 
     # Check idempotency
     already_processed =
@@ -345,6 +346,8 @@ defmodule AxonWeb.FederationController do
            end}
         end)
 
+      Enum.each(edus, &process_inbound_edu(&1, origin))
+
       # Record transaction
       Repo.insert_all(
         "federation_inbound_txns",
@@ -362,6 +365,31 @@ defmodule AxonWeb.FederationController do
       json(conn, %{"pdus" => pdu_results})
     end
   end
+
+  # Only m.direct_to_device is handled today (the E2EE relay path this fixes);
+  # other EDU types (m.typing, m.receipt, m.presence) are a later phase.
+  defp process_inbound_edu(%{"edu_type" => "m.direct_to_device", "content" => content}, origin) do
+    sender = content["sender"]
+    event_type = content["type"]
+    messages = content["messages"] || %{}
+    local_server = KeyServer.server_name()
+
+    sender_server = sender |> to_string() |> String.split(":") |> List.last()
+
+    if sender_server == origin do
+      Enum.each(messages, fn {target_user_id, device_messages} ->
+        if local_user?(target_user_id, local_server) do
+          KeyStore.deliver_to_device(sender, target_user_id, event_type, device_messages)
+        end
+      end)
+    else
+      Logger.warning(
+        "Dropping m.direct_to_device EDU from #{origin} claiming sender #{sender}"
+      )
+    end
+  end
+
+  defp process_inbound_edu(_edu, _origin), do: :ok
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/event/:event_id

@@ -7,7 +7,7 @@ defmodule AxonCore.EventStore do
   """
 
   import Ecto.Query
-  alias AxonCore.Repo
+  alias AxonCore.{KeyStore, Repo}
   alias AxonCore.Schema.{Event, Room, RoomMembership}
 
   # ---------------------------------------------------------------------------
@@ -80,6 +80,14 @@ defmodule AxonCore.EventStore do
     target_user_id = event.state_key
 
     if membership && target_user_id do
+      previous_membership =
+        repo.one(
+          from(m in "room_memberships",
+            where: m.room_id == ^event.room_id and m.user_id == ^target_user_id,
+            select: m.membership
+          )
+        )
+
       repo.insert_all(
         "room_memberships",
         [
@@ -102,10 +110,67 @@ defmodule AxonCore.EventStore do
         conflict_target: [:room_id, :user_id]
       )
 
+      notify_device_lists(repo, event.room_id, target_user_id, previous_membership, membership)
+
       {:ok, nil}
     else
       {:ok, nil}
     end
+  end
+
+  # A user newly joining a room now shares it with every other current
+  # member — per spec, /sync device_lists.changed and /keys/changes must
+  # reflect that even if none of their keys actually changed. Re-touching
+  # device_list_updates for everyone involved (the existing "keys changed"
+  # signal) achieves this without a separate mechanism: it wakes any
+  # long-polling /sync and gives both sides a fresh cursor position.
+  defp notify_device_lists(repo, room_id, user_id, previous_membership, "join")
+       when previous_membership != "join" do
+    other_members = other_joined_members(repo, room_id, user_id)
+
+    KeyStore.record_device_list_update(user_id)
+    Enum.each(other_members, &KeyStore.record_device_list_update/1)
+  end
+
+  # A user leaving/being removed no longer shares this room with its other
+  # members. If that was the only room they shared, record an explicit
+  # "parting" for device_lists.left — unlike `changed`, this can't be
+  # derived from current membership, since by definition the parted pair no
+  # longer shares any room to query.
+  defp notify_device_lists(repo, room_id, user_id, "join", new_membership)
+       when new_membership != "join" do
+    other_members = other_joined_members(repo, room_id, user_id)
+
+    Enum.each(other_members, fn other_id ->
+      unless shares_another_room?(repo, user_id, other_id, room_id) do
+        KeyStore.record_device_list_parting(other_id, user_id)
+        KeyStore.record_device_list_parting(user_id, other_id)
+      end
+    end)
+  end
+
+  defp notify_device_lists(_repo, _room_id, _user_id, _previous, _new), do: :ok
+
+  defp other_joined_members(repo, room_id, excluding_user_id) do
+    repo.all(
+      from(m in "room_memberships",
+        where: m.room_id == ^room_id and m.membership == "join" and m.user_id != ^excluding_user_id,
+        select: m.user_id
+      )
+    )
+  end
+
+  defp shares_another_room?(repo, user_a, user_b, excluding_room_id) do
+    repo.exists?(
+      from(m1 in "room_memberships",
+        join: m2 in "room_memberships",
+        on: m1.room_id == m2.room_id,
+        where:
+          m1.user_id == ^user_a and m1.membership == "join" and
+            m2.user_id == ^user_b and m2.membership == "join" and
+            m1.room_id != ^excluding_room_id
+      )
+    )
   end
 
   defp insert_auth_edges(_repo, %Event{auth_event_ids: []}), do: {:ok, nil}
