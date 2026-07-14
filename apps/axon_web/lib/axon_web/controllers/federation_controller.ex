@@ -253,7 +253,8 @@ defmodule AxonWeb.FederationController do
       "origin_server_ts" => System.os_time(:millisecond),
       "origin" => user_id |> String.split(":") |> List.last(),
       "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
-      "auth_events" => select_join_auth_events(user_id, room_ctx.current_state),
+      "auth_events" =>
+        select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
       "depth" => room_ctx.depth + 1
     }
   end
@@ -916,7 +917,8 @@ defmodule AxonWeb.FederationController do
       "origin_server_ts" => System.os_time(:millisecond),
       "origin" => user_id |> String.split(":") |> List.last(),
       "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
-      "auth_events" => select_join_auth_events(user_id, room_ctx.current_state),
+      "auth_events" =>
+        select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
       "depth" => room_ctx.depth + 1
     }
   end
@@ -933,18 +935,28 @@ defmodule AxonWeb.FederationController do
       "origin_server_ts" => System.os_time(:millisecond),
       "origin" => user_id |> String.split(":") |> List.last(),
       "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
-      "auth_events" => select_join_auth_events(user_id, room_ctx.current_state),
+      "auth_events" =>
+        select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
       "depth" => room_ctx.depth + 1
     }
   end
 
-  defp select_join_auth_events(user_id, current_state) do
-    [
-      get_in(current_state, [{"m.room.create", ""}, "event_id"]),
-      get_in(current_state, [{"m.room.power_levels", ""}, "event_id"]),
-      get_in(current_state, [{"m.room.join_rules", ""}, "event_id"]),
-      get_in(current_state, [{"m.room.member", user_id}, "event_id"])
-    ]
+  defp select_join_auth_events(user_id, current_state, room_version) do
+    # Room v12 (rule 3.2): m.room.create MUST NOT be selected as an auth
+    # event for anything — mirrors AxonRoom.EventBuilder.select_auth_events/5,
+    # duplicated here because a remote join's template is built without
+    # going through the normal local event-build path.
+    create_ref =
+      if room_version == "12",
+        do: [],
+        else: [get_in(current_state, [{"m.room.create", ""}, "event_id"])]
+
+    (create_ref ++
+       [
+         get_in(current_state, [{"m.room.power_levels", ""}, "event_id"]),
+         get_in(current_state, [{"m.room.join_rules", ""}, "event_id"]),
+         get_in(current_state, [{"m.room.member", user_id}, "event_id"])
+       ])
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq()
   end

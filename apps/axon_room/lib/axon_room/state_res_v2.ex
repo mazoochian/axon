@@ -1,6 +1,17 @@
 defmodule AxonRoom.StateResV2 do
   @moduledoc """
-  Matrix State Resolution v2.
+  Matrix State Resolution v2, plus the room-v12 (MSC4297 "state resolution
+  v2.1") tweak to it: iterative auth checks start from an empty state map
+  instead of the unconflicted state map (unconflicted is merged back in only
+  once, at the very end — see `resolve/3`'s `room_version` branch below).
+
+  Not implemented: MSC4297's "conflicted state subgraph"/"auth difference
+  over the full conflicted set" refinement, which only changes the outcome
+  for deep, multi-generation DAG forks. `AxonRoom.StateResolver` (this
+  module's only caller) already deliberately resolves just enough state for
+  one incoming PDU's auth check rather than replaying arbitrary historical
+  forks, so that refinement wouldn't be reachable through the current call
+  path anyway — documented there too.
 
   Spec: https://spec.matrix.org/v1.18/rooms/v2/#state-resolution
   Used for room versions 2+.
@@ -17,10 +28,12 @@ defmodule AxonRoom.StateResV2 do
 
   `get_event_fn` fetches an event map by event_id (returns nil if not found).
   """
-  @spec resolve([state_set()], (String.t() -> event_map() | nil)) :: state_set()
-  def resolve([], _), do: %{}
-  def resolve([single], _), do: single
-  def resolve(state_sets, get_event_fn) do
+  @spec resolve([state_set()], (String.t() -> event_map() | nil), String.t()) :: state_set()
+  def resolve(state_sets, get_event_fn, room_version \\ "11")
+  def resolve([], _, _), do: %{}
+  def resolve([single], _, _), do: single
+
+  def resolve(state_sets, get_event_fn, room_version) do
     all_keys =
       state_sets
       |> Enum.flat_map(&Map.keys/1)
@@ -70,9 +83,18 @@ defmodule AxonRoom.StateResV2 do
 
       resolved =
         Enum.reduce(sorted, %{}, fn event, resolved_so_far ->
-          check_state = Map.merge(unconflicted, resolved_so_far)
+          # Room v12 (MSC4297): start from resolved_so_far alone, not merged
+          # with unconflicted — this is precisely the change that protects
+          # against state resets; unconflicted state is folded back in only
+          # once, below, after the whole iteration finishes. Versions before
+          # 12 keep the original v2 behavior of checking against
+          # unconflicted-plus-resolved-so-far at every step.
+          check_state =
+            if room_version == "12",
+              do: resolved_so_far,
+              else: Map.merge(unconflicted, resolved_so_far)
 
-          if state_event?(event) and AuthRules.check(event, check_state) == :ok do
+          if state_event?(event) and AuthRules.check(event, check_state, room_version) == :ok do
             key = {event["type"], event["state_key"]}
             Map.put(resolved_so_far, key, event)
           else
@@ -159,7 +181,12 @@ defmodule AxonRoom.StateResV2 do
         []
 
       [most_recent | _] ->
-        build_mainline_chain(most_recent, get_event_fn, [most_recent], MapSet.new([most_recent["event_id"]]))
+        build_mainline_chain(
+          most_recent,
+          get_event_fn,
+          [most_recent],
+          MapSet.new([most_recent["event_id"]])
+        )
     end
   end
 
@@ -178,8 +205,11 @@ defmodule AxonRoom.StateResV2 do
       end)
 
     case next_pl do
-      nil -> acc
-      pl -> build_mainline_chain(pl, get_event_fn, acc ++ [pl], MapSet.put(visited, pl["event_id"]))
+      nil ->
+        acc
+
+      pl ->
+        build_mainline_chain(pl, get_event_fn, acc ++ [pl], MapSet.put(visited, pl["event_id"]))
     end
   end
 

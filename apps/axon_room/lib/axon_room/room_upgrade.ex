@@ -47,32 +47,98 @@ defmodule AxonRoom.RoomUpgrade do
   """
   def execute(old_room_id, user_id, new_version, server_name) do
     with :ok <- CreateRoom.check_version_supported(new_version) do
-      new_room_id = CreateRoom.generate_room_id(server_name)
       extra_create_content = fetch_create_extras(old_room_id)
       initial_state = copy_initial_state(old_room_id)
 
-      with {:ok, tombstone_event_id} <-
-             RoomProcess.send_event(
-               old_room_id,
-               user_id,
-               "m.room.tombstone",
-               %{"body" => "This room has been replaced", "replacement_room" => new_room_id},
-               state_key: ""
-             ) do
-        creation_content =
-          Map.put(extra_create_content, "predecessor", %{
-            "room_id" => old_room_id,
-            "event_id" => tombstone_event_id
-          })
-
-        CreateRoom.execute(user_id,
-          room_id: new_room_id,
-          server_name: server_name,
-          version: new_version,
-          creation_content: creation_content,
-          initial_state: initial_state
+      if new_version == "12" do
+        execute_v12(
+          old_room_id,
+          user_id,
+          new_version,
+          server_name,
+          extra_create_content,
+          initial_state
+        )
+      else
+        execute_legacy(
+          old_room_id,
+          user_id,
+          new_version,
+          server_name,
+          extra_create_content,
+          initial_state
         )
       end
+    end
+  end
+
+  defp execute_legacy(
+         old_room_id,
+         user_id,
+         new_version,
+         server_name,
+         extra_create_content,
+         initial_state
+       ) do
+    new_room_id = CreateRoom.generate_room_id(server_name)
+
+    with {:ok, tombstone_event_id} <-
+           RoomProcess.send_event(
+             old_room_id,
+             user_id,
+             "m.room.tombstone",
+             %{"body" => "This room has been replaced", "replacement_room" => new_room_id},
+             state_key: ""
+           ) do
+      creation_content =
+        Map.put(extra_create_content, "predecessor", %{
+          "room_id" => old_room_id,
+          "event_id" => tombstone_event_id
+        })
+
+      CreateRoom.execute(user_id,
+        room_id: new_room_id,
+        server_name: server_name,
+        version: new_version,
+        creation_content: creation_content,
+        initial_state: initial_state
+      )
+    end
+  end
+
+  # Room v12's room_id is derived from its own create event (MSC4297), so —
+  # unlike every earlier version — it can't be pre-generated and handed to
+  # the old room's tombstone up front. Reversed order instead: create the
+  # new room first (predecessor carries just the old room_id; there's no
+  # tombstone event_id yet to include, which is fine — it's informational,
+  # not auth-rule-checked in any room version), then tombstone the old room
+  # once the new room_id is known.
+  defp execute_v12(
+         old_room_id,
+         user_id,
+         new_version,
+         server_name,
+         extra_create_content,
+         initial_state
+       ) do
+    creation_content = Map.put(extra_create_content, "predecessor", %{"room_id" => old_room_id})
+
+    with {:ok, new_room_id} <-
+           CreateRoom.execute(user_id,
+             server_name: server_name,
+             version: new_version,
+             creation_content: creation_content,
+             initial_state: initial_state
+           ),
+         {:ok, _tombstone_event_id} <-
+           RoomProcess.send_event(
+             old_room_id,
+             user_id,
+             "m.room.tombstone",
+             %{"body" => "This room has been replaced", "replacement_room" => new_room_id},
+             state_key: ""
+           ) do
+      {:ok, new_room_id}
     end
   end
 

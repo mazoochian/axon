@@ -22,11 +22,11 @@ defmodule AxonRoom.EventBuilder do
         id -> [id]
       end
 
-    auth_event_ids = select_auth_events(type, state_key, sender, room_ctx.current_state)
+    auth_event_ids =
+      select_auth_events(type, state_key, sender, room_ctx.current_state, room_ctx.room_version)
 
     skeleton = %{
       "type" => type,
-      "room_id" => room_ctx.room_id,
       "sender" => sender,
       "content" => content,
       "origin_server_ts" => System.os_time(:millisecond),
@@ -35,6 +35,16 @@ defmodule AxonRoom.EventBuilder do
       "auth_events" => auth_event_ids,
       "depth" => room_ctx.depth + 1
     }
+
+    # Room v12: the m.room.create event MUST NOT carry a room_id field (the
+    # room_id IS its event ID, with "!" instead of "$" — see
+    # AxonRoom.CreateRoom's v12 bootstrap, which calls this with
+    # room_ctx.room_id == nil to compute that hash before the room exists).
+    # Every other event keeps "room_id" as normal.
+    skeleton =
+      if room_ctx.room_id,
+        do: Map.put(skeleton, "room_id", room_ctx.room_id),
+        else: skeleton
 
     skeleton =
       if state_key != nil,
@@ -58,12 +68,20 @@ defmodule AxonRoom.EventBuilder do
   # Spec: https://spec.matrix.org/latest/server-server-api/#auth-events-selection
   # ---------------------------------------------------------------------------
 
-  defp select_auth_events(type, state_key, sender, current_state) do
-    always = [
-      lookup(current_state, "m.room.create", ""),
-      lookup(current_state, "m.room.power_levels", ""),
-      lookup(current_state, "m.room.member", sender)
-    ]
+  defp select_auth_events(type, state_key, sender, current_state, room_version) do
+    # Room v12 (MSC4297/rule 3.2): m.room.create MUST NOT be selected as an
+    # auth event for anything — its authority is implicit via room_id now
+    # (rule 2: room_id must itself be the create event's ID). Versions
+    # before 12 keep including it.
+    create_ref =
+      if room_version == "12", do: [], else: [lookup(current_state, "m.room.create", "")]
+
+    always =
+      create_ref ++
+        [
+          lookup(current_state, "m.room.power_levels", ""),
+          lookup(current_state, "m.room.member", sender)
+        ]
 
     extras =
       case type do

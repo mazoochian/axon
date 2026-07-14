@@ -109,6 +109,24 @@ defmodule AxonWeb.FallbackController do
     |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Target user is not in room"})
   end
 
+  def call(conn, {:error, :power_levels_may_not_list_creators}) do
+    conn
+    |> put_status(403)
+    |> json(%{
+      "errcode" => "M_FORBIDDEN",
+      "error" => "power_levels.users may not list the room's creator(s) (room v12+)"
+    })
+  end
+
+  def call(conn, {:error, :invalid_additional_creators}) do
+    conn
+    |> put_status(400)
+    |> json(%{
+      "errcode" => "M_INVALID_PARAM",
+      "error" => "additional_creators must be an array of valid user IDs"
+    })
+  end
+
   def call(conn, {:error, {:invalid_alias_format, alias_val}}) do
     conn
     |> put_status(400)
