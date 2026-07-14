@@ -77,11 +77,30 @@ defmodule AxonWeb.MediaController do
     end
   end
 
-  # GET /_matrix/client/v3/media/preview_url
+  # GET /_matrix/client/v1/media/preview_url (also /v3, kept for older clients)
+  def url_preview(conn, %{"url" => url}) do
+    server_name = Application.fetch_env!(:axon_web, :server_name)
+
+    case AxonMedia.UrlPreview.fetch(url, server_name) do
+      {:ok, data} ->
+        json(conn, data)
+
+      {:error, reason} when reason in [:invalid_url, :blocked_address] ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_UNKNOWN", "error" => "URL cannot be previewed"})
+
+      {:error, _reason} ->
+        conn
+        |> put_status(502)
+        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to fetch URL preview"})
+    end
+  end
+
   def url_preview(conn, _params) do
     conn
-    |> put_status(404)
-    |> json(%{"errcode" => "M_NOT_FOUND", "error" => "URL preview not implemented"})
+    |> put_status(400)
+    |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "url is required"})
   end
 
   # ---------------------------------------------------------------------------

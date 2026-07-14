@@ -13,11 +13,10 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 
 ### Known gaps
 
-- **Server notices** (`m.server_notice` rooms, Synapse-style admin broadcast) are not implemented.
-- **URL previews** (`GET /media/v3/preview_url`) still return 404 — deliberately deferred, since fetching arbitrary user-submitted URLs server-side needs SSRF-safe handling (deny-list private IP ranges, size/time limits) that hasn't been built yet.
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
+- URL preview SSRF protection blocks literal/resolved private IP ranges but doesn't pin the HTTP connection to the address it validated, so it isn't immune to DNS rebinding — see `AxonMedia.UrlPreview`'s moduledoc.
 
-See [ROADMAP.md](ROADMAP.md) for what's planned next (Phase 8 onward), continuing on from the phases below.
+See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 14 — the full roadmap as originally scoped is now complete).
 
 ## Why BEAM?
 
@@ -288,7 +287,7 @@ COMPLEMENT_BASE_IMAGE=axon-complement:latest \
 
 ### Current results
 
-The last full Complement run (37/50 CS API tests) predates Phases 3–7 and is stale — most of its 13 failures (media, presence, search) are in areas that have since been built out. Re-run the suite above for current numbers; the only known-remaining gap is server notices (not implemented — see "Known gaps" in Status).
+The last full Complement run (37/50 CS API tests) predates Phases 3–7 and is stale — most of its 13 failures (media, presence, search) are in areas that have since been built out. Re-run the suite above for current numbers.
 
 ## Media storage
 

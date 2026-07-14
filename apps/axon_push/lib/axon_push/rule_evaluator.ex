@@ -13,16 +13,18 @@ defmodule AxonPush.RuleEvaluator do
 
   @doc """
   Evaluate push rules for `user_id` against `event` in `room_id`.
-  `rules` is the default ruleset map (with string keys matching push rule kinds).
+  `rules` is the effective ruleset map (with string keys matching push rule
+  kinds) — see `AxonPush.UserRules.effective_rules/1` for how server
+  defaults and this user's customization get merged into it.
   Returns {:notify, actions} | :dont_notify.
   """
   def should_notify?(event, room_id, user_id, rules) do
-    # Merge user overrides from DB (not yet persisted — use defaults for now)
     member_count = get_member_count(room_id)
     display_name = get_display_name(user_id)
 
     Enum.reduce_while(@rule_kinds, :dont_notify, fn kind, _acc ->
       kind_rules = rules[kind] || []
+
       case eval_kind(kind, kind_rules, event, room_id, user_id, display_name, member_count) do
         {:match, actions} ->
           if "notify" in actions do
@@ -30,7 +32,9 @@ defmodule AxonPush.RuleEvaluator do
           else
             {:halt, :dont_notify}
           end
-        :no_match -> {:cont, :dont_notify}
+
+        :no_match ->
+          {:cont, :dont_notify}
       end
     end)
   end
@@ -49,6 +53,7 @@ defmodule AxonPush.RuleEvaluator do
       if rule["enabled"] != false do
         pattern = rule["pattern"] || ""
         pattern = String.replace(pattern, "${user_localpart}", localpart)
+
         if glob_match?(pattern, body) do
           {:halt, {:match, rule["actions"] || []}}
         else
@@ -60,15 +65,40 @@ defmodule AxonPush.RuleEvaluator do
     end)
   end
 
+  # Room/sender rules match implicitly by rule_id == room_id / sender,
+  # never by an explicit "conditions" array (there isn't one in the PUT
+  # body for these kinds) — falling through to the generic conditions-based
+  # clause below would vacuously match *every* room/sender rule against
+  # *every* event, since `all_conditions_match?([], ...)` is trivially true
+  # on an empty conditions list.
+  defp eval_kind("room", rules, _event, room_id, _user_id, _dn, _count) do
+    match_by_rule_id(rules, room_id)
+  end
+
+  defp eval_kind("sender", rules, event, _room_id, _user_id, _dn, _count) do
+    match_by_rule_id(rules, event["sender"])
+  end
+
   defp eval_kind(_kind, rules, event, room_id, user_id, display_name, member_count) do
     Enum.reduce_while(rules, :no_match, fn rule, _ ->
       if rule["enabled"] != false do
         conditions = rule["conditions"] || []
+
         if all_conditions_match?(conditions, event, room_id, user_id, display_name, member_count) do
           {:halt, {:match, rule["actions"] || []}}
         else
           {:cont, :no_match}
         end
+      else
+        {:cont, :no_match}
+      end
+    end)
+  end
+
+  defp match_by_rule_id(rules, target_id) do
+    Enum.reduce_while(rules, :no_match, fn rule, _ ->
+      if rule["enabled"] != false and rule["rule_id"] == target_id do
+        {:halt, {:match, rule["actions"] || []}}
       else
         {:cont, :no_match}
       end
@@ -85,30 +115,69 @@ defmodule AxonPush.RuleEvaluator do
     end)
   end
 
-  defp eval_condition(%{"kind" => "event_match", "key" => key, "pattern" => pattern}, event, _room_id, user_id, _dn, _count) do
+  defp eval_condition(
+         %{"kind" => "event_match", "key" => key, "pattern" => pattern},
+         event,
+         _room_id,
+         user_id,
+         _dn,
+         _count
+       ) do
     localpart = localpart(user_id)
-    pattern = pattern
+
+    pattern =
+      pattern
       |> String.replace("${user_id}", user_id)
       |> String.replace("${user_localpart}", localpart)
+
     value = get_event_field(event, key)
     glob_match?(pattern, to_string(value || ""))
   end
 
-  defp eval_condition(%{"kind" => "contains_display_name"}, event, _room_id, _user_id, display_name, _count) do
+  defp eval_condition(
+         %{"kind" => "contains_display_name"},
+         event,
+         _room_id,
+         _user_id,
+         display_name,
+         _count
+       ) do
     body = get_in(event, ["content", "body"]) || ""
+
     display_name != nil and display_name != "" and
       String.contains?(String.downcase(body), String.downcase(display_name))
   end
 
-  defp eval_condition(%{"kind" => "room_member_count", "is" => expr}, _event, _room_id, _user_id, _dn, member_count) do
+  defp eval_condition(
+         %{"kind" => "room_member_count", "is" => expr},
+         _event,
+         _room_id,
+         _user_id,
+         _dn,
+         member_count
+       ) do
     eval_count_expr(expr, member_count)
   end
 
-  defp eval_condition(%{"kind" => "event_property_is", "key" => key, "value" => value}, event, _, _, _, _) do
+  defp eval_condition(
+         %{"kind" => "event_property_is", "key" => key, "value" => value},
+         event,
+         _,
+         _,
+         _,
+         _
+       ) do
     get_event_field(event, key) == value
   end
 
-  defp eval_condition(%{"kind" => "event_property_contains", "key" => key, "value" => value}, event, _, _, _, _) do
+  defp eval_condition(
+         %{"kind" => "event_property_contains", "key" => key, "value" => value},
+         event,
+         _,
+         _,
+         _,
+         _
+       ) do
     case get_event_field(event, key) do
       list when is_list(list) -> value in list
       _ -> false
@@ -148,47 +217,70 @@ defmodule AxonPush.RuleEvaluator do
   defp eval_count_expr(expr, count) do
     cond do
       String.starts_with?(expr, "==") ->
-        String.slice(expr, 2..-1//1) |> String.trim() |> Integer.parse() |> case do
+        String.slice(expr, 2..-1//1)
+        |> String.trim()
+        |> Integer.parse()
+        |> case do
           {n, _} -> count == n
           _ -> false
         end
+
       String.starts_with?(expr, ">=") ->
-        String.slice(expr, 2..-1//1) |> String.trim() |> Integer.parse() |> case do
+        String.slice(expr, 2..-1//1)
+        |> String.trim()
+        |> Integer.parse()
+        |> case do
           {n, _} -> count >= n
           _ -> false
         end
+
       String.starts_with?(expr, "<=") ->
-        String.slice(expr, 2..-1//1) |> String.trim() |> Integer.parse() |> case do
+        String.slice(expr, 2..-1//1)
+        |> String.trim()
+        |> Integer.parse()
+        |> case do
           {n, _} -> count <= n
           _ -> false
         end
+
       String.starts_with?(expr, ">") ->
-        String.slice(expr, 1..-1//1) |> String.trim() |> Integer.parse() |> case do
+        String.slice(expr, 1..-1//1)
+        |> String.trim()
+        |> Integer.parse()
+        |> case do
           {n, _} -> count > n
           _ -> false
         end
+
       String.starts_with?(expr, "<") ->
-        String.slice(expr, 1..-1//1) |> String.trim() |> Integer.parse() |> case do
+        String.slice(expr, 1..-1//1)
+        |> String.trim()
+        |> Integer.parse()
+        |> case do
           {n, _} -> count < n
           _ -> false
         end
-      true -> false
+
+      true ->
+        false
     end
   end
 
   defp get_member_count(room_id) do
     Repo.one(
-      from m in "room_memberships",
+      from(m in "room_memberships",
         where: m.room_id == ^room_id and m.membership == "join",
         select: count(m.user_id)
+      )
     ) || 0
   end
 
   defp get_display_name(user_id) do
     Repo.one(
-      from p in "user_profiles",
+      from(p in "user_profiles",
         where: p.user_id == ^user_id,
         select: p.displayname
+      )
     )
   end
 
