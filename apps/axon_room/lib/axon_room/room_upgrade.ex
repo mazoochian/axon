@@ -123,6 +123,14 @@ defmodule AxonRoom.RoomUpgrade do
        ) do
     creation_content = Map.put(extra_create_content, "predecessor", %{"room_id" => old_room_id})
 
+    # The copied m.room.power_levels almost always lists the old room's
+    # creator (a normal pre-v12 room has no other way to grant them power)
+    # — but v12 rule 10.4 rejects a power_levels event that lists a
+    # creator in `users` at all, since they get implicit infinite power
+    # instead. Without stripping this, upgrading any ordinary room to v12
+    # would fail immediately after creating it.
+    initial_state = strip_creator_from_power_levels(initial_state, user_id)
+
     with {:ok, new_room_id} <-
            CreateRoom.execute(user_id,
              server_name: server_name,
@@ -140,6 +148,17 @@ defmodule AxonRoom.RoomUpgrade do
            ) do
       {:ok, new_room_id}
     end
+  end
+
+  defp strip_creator_from_power_levels(initial_state, creator_id) do
+    Enum.map(initial_state, fn
+      %{"type" => "m.room.power_levels", "content" => content} = ev ->
+        users = Map.delete(content["users"] || %{}, creator_id)
+        %{ev | "content" => Map.put(content, "users", users)}
+
+      ev ->
+        ev
+    end)
   end
 
   defp fetch_power_levels(room_id) do

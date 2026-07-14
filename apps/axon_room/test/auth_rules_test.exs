@@ -18,7 +18,8 @@ defmodule AxonRoom.AuthRulesTest do
   # ---------------------------------------------------------------------------
 
   defp create_event(creator \\ @creator) do
-    {{"m.room.create", ""}, %{"type" => "m.room.create", "sender" => creator, "content" => %{"creator" => creator}}}
+    {{"m.room.create", ""},
+     %{"type" => "m.room.create", "sender" => creator, "content" => %{"creator" => creator}}}
   end
 
   defp member_event(user_id, membership, extra_content \\ %{}) do
@@ -33,7 +34,10 @@ defmodule AxonRoom.AuthRulesTest do
 
   defp join_rules_event(rule, extra_content \\ %{}) do
     {{"m.room.join_rules", ""},
-     %{"type" => "m.room.join_rules", "content" => Map.merge(%{"join_rule" => rule}, extra_content)}}
+     %{
+       "type" => "m.room.join_rules",
+       "content" => Map.merge(%{"join_rule" => rule}, extra_content)
+     }}
   end
 
   defp power_levels_event(content) do
@@ -65,17 +69,36 @@ defmodule AxonRoom.AuthRulesTest do
 
   describe "m.room.create" do
     test "allowed as the very first event with no prev_events" do
-      event = %{"type" => "m.room.create", "sender" => @creator, "prev_events" => [], "content" => %{}}
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{}
+      }
+
       assert AuthRules.check(event, %{}, "11") == :ok
     end
 
     test "rejected if a create event already exists" do
-      event = %{"type" => "m.room.create", "sender" => @creator, "prev_events" => [], "content" => %{}}
-      assert AuthRules.check(event, state([create_event()]), "11") == {:error, :room_already_created}
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{}
+      }
+
+      assert AuthRules.check(event, state([create_event()]), "11") ==
+               {:error, :room_already_created}
     end
 
     test "rejected if prev_events is non-empty" do
-      event = %{"type" => "m.room.create", "sender" => @creator, "prev_events" => ["$x"], "content" => %{}}
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => ["$x"],
+        "content" => %{}
+      }
+
       assert AuthRules.check(event, %{}, "11") == {:error, :create_event_has_prev_events}
     end
   end
@@ -126,7 +149,9 @@ defmodule AxonRoom.AuthRulesTest do
       event = member_event_to_send(@alice, @alice, "join")
       assert AuthRules.check(event, st, "11") == {:error, :not_invited}
 
-      st_invited = state([create_event(), join_rules_event("invite"), member_event(@alice, "invite")])
+      st_invited =
+        state([create_event(), join_rules_event("invite"), member_event(@alice, "invite")])
+
       assert AuthRules.check(event, st_invited, "11") == :ok
     end
 
@@ -135,7 +160,9 @@ defmodule AxonRoom.AuthRulesTest do
       event = member_event_to_send(@alice, @alice, "join")
       assert AuthRules.check(event, st, "11") == {:error, :not_invited}
 
-      st_knocked = state([create_event(), join_rules_event("knock"), member_event(@alice, "knock")])
+      st_knocked =
+        state([create_event(), join_rules_event("knock"), member_event(@alice, "knock")])
+
       assert AuthRules.check(event, st_knocked, "11") == :ok
     end
 
@@ -160,7 +187,11 @@ defmodule AxonRoom.AuthRulesTest do
           power_levels_event(%{"users" => %{@creator => 100}, "invite" => 0})
         ])
 
-      event = member_event_to_send(@alice, @alice, "join", %{"join_authorised_via_users_server" => @creator})
+      event =
+        member_event_to_send(@alice, @alice, "join", %{
+          "join_authorised_via_users_server" => @creator
+        })
+
       assert AuthRules.check(event, st, "11") == :ok
     end
 
@@ -173,13 +204,18 @@ defmodule AxonRoom.AuthRulesTest do
           power_levels_event(%{"invite" => 50})
         ])
 
-      event = member_event_to_send(@alice, @alice, "join", %{"join_authorised_via_users_server" => @bob})
+      event =
+        member_event_to_send(@alice, @alice, "join", %{"join_authorised_via_users_server" => @bob})
+
       assert AuthRules.check(event, st, "11") == {:error, :not_invited}
     end
 
     test "restricted join_rule: rejected when the named authoriser isn't actually joined" do
       st = state([create_event(), join_rules_event("restricted")])
-      event = member_event_to_send(@alice, @alice, "join", %{"join_authorised_via_users_server" => @bob})
+
+      event =
+        member_event_to_send(@alice, @alice, "join", %{"join_authorised_via_users_server" => @bob})
+
       assert AuthRules.check(event, st, "11") == {:error, :not_invited}
     end
   end
@@ -279,7 +315,13 @@ defmodule AxonRoom.AuthRulesTest do
     end
 
     test "cannot kick a target who isn't in the room" do
-      st = state([create_event(), member_event(@creator, "join"), power_levels_event(%{"users" => %{@creator => 100}})])
+      st =
+        state([
+          create_event(),
+          member_event(@creator, "join"),
+          power_levels_event(%{"users" => %{@creator => 100}})
+        ])
+
       event = member_event_to_send(@creator, @alice, "leave")
       assert AuthRules.check(event, st, "11") == {:error, :target_not_in_room}
     end
@@ -402,13 +444,25 @@ defmodule AxonRoom.AuthRulesTest do
     end
 
     test "joined sender with default power (0) cannot send a state_default(50) event" do
-      st = state([create_event(), member_event(@alice, "join"), power_levels_event(%{"users" => %{@alice => 0}})])
+      st =
+        state([
+          create_event(),
+          member_event(@alice, "join"),
+          power_levels_event(%{"users" => %{@alice => 0}})
+        ])
+
       event = state_event(@alice, "m.room.name", %{"name" => "hi"})
       assert AuthRules.check(event, st, "11") == {:error, :insufficient_power}
     end
 
     test "joined sender with sufficient power can send a state event" do
-      st = state([create_event(), member_event(@alice, "join"), power_levels_event(%{"users" => %{@alice => 50}})])
+      st =
+        state([
+          create_event(),
+          member_event(@alice, "join"),
+          power_levels_event(%{"users" => %{@alice => 50}})
+        ])
+
       event = state_event(@alice, "m.room.name", %{"name" => "hi"})
       assert AuthRules.check(event, st, "11") == :ok
     end
@@ -507,6 +561,275 @@ defmodule AxonRoom.AuthRulesTest do
       # Spec-correct behavior would reject this (100 > sender's own level 50).
       # Current implementation allows it.
       assert AuthRules.check(event, st, "11") == :ok
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Room v12: additional_creators validation (rule 1) and creator privilege
+  # ---------------------------------------------------------------------------
+
+  describe "room v12 additional_creators validation" do
+    test "a create event with a valid additional_creators array is accepted" do
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{"additional_creators" => [@alice]}
+      }
+
+      assert AuthRules.check(event, %{}, "12") == :ok
+    end
+
+    test "a non-list additional_creators is rejected" do
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{"additional_creators" => "not-a-list"}
+      }
+
+      assert AuthRules.check(event, %{}, "12") == {:error, :invalid_additional_creators}
+    end
+
+    test "an additional_creators entry that isn't a valid user id is rejected" do
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{"additional_creators" => ["not-a-user-id"]}
+      }
+
+      assert AuthRules.check(event, %{}, "12") == {:error, :invalid_additional_creators}
+    end
+
+    test "additional_creators is not validated for pre-v12 rooms" do
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{"additional_creators" => "garbage, ignored pre-v12"}
+      }
+
+      assert AuthRules.check(event, %{}, "11") == :ok
+    end
+  end
+
+  describe "room v12 creator privilege" do
+    defp v12_create_event(creator, additional \\ []) do
+      content = %{"creator" => creator}
+
+      content =
+        if additional == [],
+          do: content,
+          else: Map.put(content, "additional_creators", additional)
+
+      {{"m.room.create", ""},
+       %{"type" => "m.room.create", "sender" => creator, "content" => content}}
+    end
+
+    test "the creator can send a state event even with no power_levels users entry" do
+      st = state([v12_create_event(@creator), member_event(@creator, "join")])
+      event = state_event(@creator, "m.room.name", %{"name" => "Room"})
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "an additional_creator also gets infinite power" do
+      st =
+        state([
+          v12_create_event(@creator, [@alice]),
+          member_event(@creator, "join"),
+          member_event(@alice, "join")
+        ])
+
+      event = state_event(@alice, "m.room.name", %{"name" => "Room"})
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "a power_levels event listing the creator in users is rejected (rule 10.4)" do
+      st = state([v12_create_event(@creator), member_event(@creator, "join")])
+      event = state_event(@creator, "m.room.power_levels", %{"users" => %{@creator => 100}})
+      assert AuthRules.check(event, st, "12") == {:error, :power_levels_may_not_list_creators}
+    end
+
+    test "a power_levels event listing an additional_creator in users is rejected" do
+      st =
+        state([
+          v12_create_event(@creator, [@alice]),
+          member_event(@creator, "join"),
+          member_event(@alice, "join")
+        ])
+
+      event = state_event(@creator, "m.room.power_levels", %{"users" => %{@alice => 100}})
+      assert AuthRules.check(event, st, "12") == {:error, :power_levels_may_not_list_creators}
+    end
+
+    test "a power_levels event that doesn't list any creator is accepted" do
+      st = state([v12_create_event(@creator), member_event(@creator, "join")])
+      event = state_event(@creator, "m.room.power_levels", %{"users" => %{@bob => 50}})
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "a non-creator without power still can't send a state event, despite v12" do
+      st =
+        state([
+          v12_create_event(@creator),
+          member_event(@creator, "join"),
+          member_event(@bob, "join"),
+          power_levels_event(%{"users" => %{}, "state_default" => 50, "users_default" => 0})
+        ])
+
+      event = state_event(@bob, "m.room.name", %{"name" => "hijack"})
+      assert AuthRules.check(event, st, "12") == {:error, :insufficient_power}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # m.room.third_party_invite (rule 7) and join-via-signed-proof
+  # ---------------------------------------------------------------------------
+
+  describe "m.room.third_party_invite" do
+    test "a member with invite power can send it" do
+      st =
+        state([
+          create_event(),
+          member_event(@creator, "join"),
+          power_levels_event(%{"invite" => 0, "users_default" => 0})
+        ])
+
+      event = %{
+        "type" => "m.room.third_party_invite",
+        "sender" => @creator,
+        "state_key" => "tok",
+        "content" => %{}
+      }
+
+      assert AuthRules.check(event, st, "11") == :ok
+    end
+
+    test "a member without invite power cannot send it" do
+      st =
+        state([
+          create_event(),
+          member_event(@creator, "join"),
+          member_event(@alice, "join"),
+          power_levels_event(%{"invite" => 50, "users_default" => 0})
+        ])
+
+      event = %{
+        "type" => "m.room.third_party_invite",
+        "sender" => @alice,
+        "state_key" => "tok",
+        "content" => %{}
+      }
+
+      assert AuthRules.check(event, st, "11") == {:error, :insufficient_power}
+    end
+  end
+
+  describe "join via signed 3pid proof" do
+    defp generate_keypair do
+      {public_key, private_key} = :crypto.generate_key(:eddsa, :ed25519)
+      {public_key, private_key}
+    end
+
+    defp sign_3pid_proof(mxid, token, issuer, key_id, private_key) do
+      AxonCrypto.EventHash.sign_event(
+        %{"mxid" => mxid, "token" => token},
+        issuer,
+        key_id,
+        private_key
+      )
+    end
+
+    defp third_party_invite_state(token, public_key) do
+      {{"m.room.third_party_invite", token},
+       %{
+         "type" => "m.room.third_party_invite",
+         "state_key" => token,
+         "content" => %{"public_key" => Base.encode64(public_key, padding: false)}
+       }}
+    end
+
+    test "a validly-signed proof authorizes a join in an invite-only room with no direct invite" do
+      {public_key, private_key} = generate_keypair()
+      token = "sometoken"
+      signed = sign_3pid_proof(@alice, token, "issuer.example", "ed25519:1", private_key)
+
+      st =
+        state([
+          create_event(),
+          member_event(@creator, "join"),
+          join_rules_event("invite"),
+          third_party_invite_state(token, public_key)
+        ])
+
+      event =
+        member_event_to_send(@alice, @alice, "join", %{
+          "third_party_invite" => %{"signed" => signed}
+        })
+
+      assert AuthRules.check(event, st, "11") == :ok
+    end
+
+    test "rejected when the signed mxid doesn't match the joining sender" do
+      {public_key, private_key} = generate_keypair()
+      token = "sometoken2"
+      signed = sign_3pid_proof(@bob, token, "issuer.example", "ed25519:1", private_key)
+
+      st =
+        state([
+          create_event(),
+          member_event(@creator, "join"),
+          join_rules_event("invite"),
+          third_party_invite_state(token, public_key)
+        ])
+
+      event =
+        member_event_to_send(@alice, @alice, "join", %{
+          "third_party_invite" => %{"signed" => signed}
+        })
+
+      assert AuthRules.check(event, st, "11") == {:error, :not_invited}
+    end
+
+    test "rejected when the signature doesn't verify against the invite event's public key" do
+      {_public_key, private_key} = generate_keypair()
+      {other_public_key, _other_private} = generate_keypair()
+      token = "sometoken3"
+      signed = sign_3pid_proof(@alice, token, "issuer.example", "ed25519:1", private_key)
+
+      st =
+        state([
+          create_event(),
+          member_event(@creator, "join"),
+          join_rules_event("invite"),
+          # Room's stored invite carries a DIFFERENT public key than the one
+          # that actually signed the proof.
+          third_party_invite_state(token, other_public_key)
+        ])
+
+      event =
+        member_event_to_send(@alice, @alice, "join", %{
+          "third_party_invite" => %{"signed" => signed}
+        })
+
+      assert AuthRules.check(event, st, "11") == {:error, :not_invited}
+    end
+
+    test "rejected when the token doesn't match any live m.room.third_party_invite" do
+      {_public_key, private_key} = generate_keypair()
+
+      signed =
+        sign_3pid_proof(@alice, "no-such-token", "issuer.example", "ed25519:1", private_key)
+
+      st = state([create_event(), member_event(@creator, "join"), join_rules_event("invite")])
+
+      event =
+        member_event_to_send(@alice, @alice, "join", %{
+          "third_party_invite" => %{"signed" => signed}
+        })
+
+      assert AuthRules.check(event, st, "11") == {:error, :not_invited}
     end
   end
 end

@@ -12,7 +12,10 @@ defmodule AxonRoom.RoomUpgradeTest do
 
   defp new_user(prefix) do
     localpart = "#{prefix}_#{System.unique_integer([:positive])}"
-    {:ok, %{user_id: user_id}} = UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
+    {:ok, %{user_id: user_id}} =
+      UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
     user_id
   end
 
@@ -48,8 +51,14 @@ defmodule AxonRoom.RoomUpgradeTest do
     test "insufficient_power_level for a default-power member" do
       creator = new_user("alice")
       bob = new_user("bob")
-      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
-      {:ok, _} = RoomProcess.send_event(room_id, bob, "m.room.member", %{"membership" => "join"}, state_key: bob)
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      {:ok, _} =
+        RoomProcess.send_event(room_id, bob, "m.room.member", %{"membership" => "join"},
+          state_key: bob
+        )
 
       assert RoomUpgrade.ensure_can_tombstone(room_id, bob) == {:error, :insufficient_power_level}
     end
@@ -60,7 +69,11 @@ defmodule AxonRoom.RoomUpgradeTest do
       creator = new_user("alice")
 
       {:ok, old_room_id} =
-        CreateRoom.execute(creator, server_name: "localhost", name: "Old Name", preset: "public_chat")
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          name: "Old Name",
+          preset: "public_chat"
+        )
 
       assert {:ok, new_room_id} = RoomUpgrade.execute(old_room_id, creator, "9", "localhost")
       refute new_room_id == old_room_id
@@ -86,6 +99,35 @@ defmodule AxonRoom.RoomUpgradeTest do
                {:error, :unsupported_room_version}
 
       refute content_of(room_id, "m.room.tombstone")
+    end
+
+    test "upgrading to v12 creates the new (domainless) room first, then tombstones the old one referencing it" do
+      creator = new_user("alice")
+
+      {:ok, old_room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          name: "Old Name",
+          preset: "public_chat"
+        )
+
+      assert {:ok, new_room_id} = RoomUpgrade.execute(old_room_id, creator, "12", "localhost")
+
+      refute String.contains?(new_room_id, ":")
+
+      tombstone = content_of(old_room_id, "m.room.tombstone")
+      assert tombstone["replacement_room"] == new_room_id
+
+      create_content = content_of(new_room_id, "m.room.create")
+      assert create_content["room_version"] == "12"
+      # v12 predecessor carries only room_id — there's no tombstone
+      # event_id available yet at the point the new room is created
+      # (order is reversed vs. every earlier version; see RoomUpgrade's
+      # moduledoc).
+      assert create_content["predecessor"] == %{"room_id" => old_room_id}
+
+      assert content_of(new_room_id, "m.room.join_rules")["join_rule"] ==
+               content_of(old_room_id, "m.room.join_rules")["join_rule"]
     end
   end
 end

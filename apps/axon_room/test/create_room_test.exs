@@ -165,4 +165,70 @@ defmodule AxonRoom.CreateRoomTest do
       refute id1 == id2
     end
   end
+
+  describe "room v12" do
+    test "the room_id is domainless and hash-derived from the create event" do
+      creator = new_user("alice")
+      assert {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost", version: "12")
+
+      assert String.starts_with?(room_id, "!")
+      refute String.contains?(room_id, ":")
+    end
+
+    test "the create event carries no room_id field" do
+      creator = new_user("alice")
+      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost", version: "12")
+
+      {:ok, state} = RoomProcess.get_state(room_id)
+      create_event = Enum.find(state, &(&1["type"] == "m.room.create"))
+      refute Map.has_key?(create_event, "room_id")
+    end
+
+    test "the creator is not listed in power_levels.users (implicit infinite power instead)" do
+      creator = new_user("alice")
+      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost", version: "12")
+
+      pl = content_of(room_id, "m.room.power_levels")
+      refute Map.has_key?(pl["users"] || %{}, creator)
+    end
+
+    test "additional_creators (via creation_content) are stored on the create event" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "12",
+          creation_content: %{"additional_creators" => [bob]}
+        )
+
+      create_content = content_of(room_id, "m.room.create")
+      assert create_content["additional_creators"] == [bob]
+    end
+
+    test "a malformed additional_creators entry is rejected before the room is created" do
+      creator = new_user("alice")
+
+      assert CreateRoom.execute(creator,
+               server_name: "localhost",
+               version: "12",
+               creation_content: %{"additional_creators" => ["not-a-user-id"]}
+             ) == {:error, :invalid_additional_creators}
+    end
+
+    test "a v12 room's join_rules/history_visibility/etc. still get created normally" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "12",
+          preset: "public_chat"
+        )
+
+      assert content_of(room_id, "m.room.join_rules")["join_rule"] == "public"
+      assert content_of(room_id, "m.room.member", creator)["membership"] == "join"
+    end
+  end
 end
