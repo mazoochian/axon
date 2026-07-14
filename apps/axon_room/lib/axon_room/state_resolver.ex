@@ -43,7 +43,7 @@ defmodule AxonRoom.StateResolver do
   implied by each of `pdu`'s prev_events (via their auth_events) together
   with `current_state`, our own view.
   """
-  def resolve_for_auth_check(pdu, current_state) do
+  def resolve_for_auth_check(pdu, current_state, room_version \\ "11") do
     prev_events = pdu["prev_events"] || []
 
     branch_state_sets =
@@ -53,7 +53,7 @@ defmodule AxonRoom.StateResolver do
 
     state_sets = [current_state | branch_state_sets] |> Enum.uniq()
 
-    resolved = StateResV2.resolve(state_sets, &EventStore.get_event_map/1)
+    resolved = StateResV2.resolve(state_sets, &EventStore.get_event_map/1, room_version)
     Map.merge(current_state, resolved)
   end
 

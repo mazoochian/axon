@@ -4,9 +4,24 @@ defmodule AxonWeb.VersionController do
   def versions(conn, _params) do
     json(conn, %{
       "versions" => [
-        "v1.1", "v1.2", "v1.3", "v1.4", "v1.5", "v1.6",
-        "v1.7", "v1.8", "v1.9", "v1.10", "v1.11", "v1.12",
-        "v1.13", "v1.14", "v1.15", "v1.16", "v1.17", "v1.18"
+        "v1.1",
+        "v1.2",
+        "v1.3",
+        "v1.4",
+        "v1.5",
+        "v1.6",
+        "v1.7",
+        "v1.8",
+        "v1.9",
+        "v1.10",
+        "v1.11",
+        "v1.12",
+        "v1.13",
+        "v1.14",
+        "v1.15",
+        "v1.16",
+        "v1.17",
+        "v1.18"
       ],
       "unstable_features" => %{
         "org.matrix.msc3814" => true
@@ -26,7 +41,12 @@ defmodule AxonWeb.VersionController do
         json(conn, doc)
 
       {:error, _reason} ->
-        conn |> put_status(404) |> json(%{"errcode" => "M_UNRECOGNIZED", "error" => "OAuth 2.0 delegated auth not supported"})
+        conn
+        |> put_status(404)
+        |> json(%{
+          "errcode" => "M_UNRECOGNIZED",
+          "error" => "OAuth 2.0 delegated auth not supported"
+        })
     end
   end
 
@@ -58,7 +78,8 @@ defmodule AxonWeb.VersionController do
             "8" => "stable",
             "9" => "stable",
             "10" => "stable",
-            "11" => "stable"
+            "11" => "stable",
+            "12" => "stable"
           }
         },
         "m.set_displayname" => %{"enabled" => true},

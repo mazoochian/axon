@@ -167,7 +167,12 @@ defmodule AxonRoom.RoomProcess do
             # Push notifications (fire-and-forget)
             AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
             # AppService fanout via PubSub (avoids circular dep on axon_web)
-            Phoenix.PubSub.broadcast(@pubsub, "all_events", {:new_event, state.room_id, event_map})
+            Phoenix.PubSub.broadcast(
+              @pubsub,
+              "all_events",
+              {:new_event, state.room_id, event_map}
+            )
+
             {:reply, {:ok, event["event_id"]}, new_state}
 
           {:error, reason} ->
@@ -182,7 +187,7 @@ defmodule AxonRoom.RoomProcess do
 
     auth_check_state =
       if StateResolver.needs_resolution?(pdu, state.last_event_id) do
-        StateResolver.resolve_for_auth_check(pdu, state.current_state)
+        StateResolver.resolve_for_auth_check(pdu, state.current_state, state.room_version)
       else
         state.current_state
       end
@@ -201,7 +206,13 @@ defmodule AxonRoom.RoomProcess do
             # other server in the room directly (no relay-through-us).
             broadcast(state.room_id, event_map)
             AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
-            Phoenix.PubSub.broadcast(@pubsub, "all_events", {:new_event, state.room_id, event_map})
+
+            Phoenix.PubSub.broadcast(
+              @pubsub,
+              "all_events",
+              {:new_event, state.room_id, event_map}
+            )
+
             {:reply, {:ok, event_map["event_id"]}, new_state}
 
           {:error, reason} ->
@@ -232,6 +243,7 @@ defmodule AxonRoom.RoomProcess do
       depth: state.depth,
       current_state: state.current_state
     }
+
     {:reply, ctx, state}
   end
 
@@ -355,8 +367,9 @@ defmodule AxonRoom.RoomProcess do
         import Ecto.Query
 
         AxonCore.Repo.all(
-          from e in AxonCore.Schema.Event,
+          from(e in AxonCore.Schema.Event,
             where: e.event_id in ^event_ids and e.room_id == ^room_id
+          )
         )
       end
 

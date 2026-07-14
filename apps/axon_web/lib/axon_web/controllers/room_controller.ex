@@ -65,7 +65,7 @@ defmodule AxonWeb.RoomController do
       if is_local_room do
         # Local room join
         with {:ok, _} <- EventStore.get_room(room_id),
-             {:ok, content} <- build_join_content(room_id, user_id),
+             {:ok, content} <- build_join_content(room_id, user_id, params["third_party_signed"]),
              {:ok, _event_id} <-
                RoomProcess.send_event(room_id, user_id, "m.room.member", content,
                  state_key: user_id
@@ -74,22 +74,47 @@ defmodule AxonWeb.RoomController do
         end
       else
         # Remote room — use federation join flow
-        via_servers = if hint_servers != [], do: hint_servers, else: [room_server]
-
-        case AxonFederation.RoomJoin.join_via_federation(room_id, user_id, via_servers) do
-          {:ok, _} ->
-            json(conn, %{"room_id" => room_id})
-
-          {:error, reason} ->
+        case resolve_via_servers(room_id, room_server, hint_servers) do
+          {:error, :missing_via_hint} ->
             conn
-            |> put_status(403)
+            |> put_status(400)
             |> json(%{
-              "errcode" => "M_FORBIDDEN",
-              "error" => "Could not join room: #{inspect(reason)}"
+              "errcode" => "M_MISSING_PARAM",
+              "error" =>
+                "This room's ID has no server name (room version 12+); a via/server_name hint is required to join it"
             })
+
+          {:ok, via_servers} ->
+            case AxonFederation.RoomJoin.join_via_federation(room_id, user_id, via_servers) do
+              {:ok, _} ->
+                json(conn, %{"room_id" => room_id})
+
+              {:error, reason} ->
+                conn
+                |> put_status(403)
+                |> json(%{
+                  "errcode" => "M_FORBIDDEN",
+                  "error" => "Could not join room: #{inspect(reason)}"
+                })
+            end
         end
       end
     end
+  end
+
+  # A pre-v12 room's own id doubles as a routable server hint (the part
+  # after the colon) when the caller gave none. A v12+ room_id has no
+  # domain component at all — String.split/2 on a colon-less string just
+  # returns the whole string, so `room_server == room_id` there — and
+  # federating to "that" as if it were a hostname would silently fail (bad
+  # DNS lookup / connection refused) instead of explaining what's missing.
+  defp resolve_via_servers(_room_id, _room_server, hint_servers) when hint_servers != [],
+    do: {:ok, hint_servers}
+
+  defp resolve_via_servers(room_id, room_server, []) do
+    if room_server == room_id,
+      do: {:error, :missing_via_hint},
+      else: {:ok, [room_server]}
   end
 
   # POST /_matrix/client/v1/knock/:room_id_or_alias
@@ -135,19 +160,34 @@ defmodule AxonWeb.RoomController do
           json(conn, %{"room_id" => room_id})
         end
       else
-        via_servers = if hint_servers != [], do: hint_servers, else: [room_server]
-
-        case AxonFederation.RoomKnock.knock_via_federation(room_id, user_id, via_servers, reason) do
-          {:ok, _} ->
-            json(conn, %{"room_id" => room_id})
-
-          {:error, reason} ->
+        case resolve_via_servers(room_id, room_server, hint_servers) do
+          {:error, :missing_via_hint} ->
             conn
-            |> put_status(403)
+            |> put_status(400)
             |> json(%{
-              "errcode" => "M_FORBIDDEN",
-              "error" => "Could not knock on room: #{inspect(reason)}"
+              "errcode" => "M_MISSING_PARAM",
+              "error" =>
+                "This room's ID has no server name (room version 12+); a via/server_name hint is required to knock on it"
             })
+
+          {:ok, via_servers} ->
+            case AxonFederation.RoomKnock.knock_via_federation(
+                   room_id,
+                   user_id,
+                   via_servers,
+                   reason
+                 ) do
+              {:ok, _} ->
+                json(conn, %{"room_id" => room_id})
+
+              {:error, reason} ->
+                conn
+                |> put_status(403)
+                |> json(%{
+                  "errcode" => "M_FORBIDDEN",
+                  "error" => "Could not knock on room: #{inspect(reason)}"
+                })
+            end
         end
       end
     end
@@ -304,23 +344,81 @@ defmodule AxonWeb.RoomController do
   # POST /_matrix/client/v3/rooms/:room_id/invite
   def invite(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
-    invitee = params["user_id"]
 
-    unless invitee do
-      conn
-      |> put_status(400)
-      |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user_id required"})
-    else
-      with {:ok, _event_id} <-
-             RoomProcess.send_event(
-               room_id,
-               user_id,
-               "m.room.member",
-               %{"membership" => "invite"},
-               state_key: invitee
-             ) do
-        json(conn, %{})
-      end
+    cond do
+      params["user_id"] ->
+        with {:ok, _event_id} <-
+               RoomProcess.send_event(
+                 room_id,
+                 user_id,
+                 "m.room.member",
+                 %{"membership" => "invite"},
+                 state_key: params["user_id"]
+               ) do
+          json(conn, %{})
+        end
+
+      params["medium"] && params["address"] ->
+        invite_3pid(conn, room_id, user_id, params)
+
+      true ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_MISSING_PARAM",
+          "error" => "user_id, or medium+address, required"
+        })
+    end
+  end
+
+  # Third-party (3pid) invite: no Matrix user ID is known yet, so unlike a
+  # normal invite this creates an m.room.third_party_invite state event
+  # (AuthRules rule 7) rather than an m.room.member one — the eventual
+  # invitee only gets a real membership row once they present the signed
+  # proof this generates back through /join (see AuthRules.valid_third_party_invite?/3
+  # and AxonRoom.EventBuilder for the join-side wiring).
+  #
+  # Known gap: axon has no identity-server integration, so nothing actually
+  # delivers this invite to the 3pid address (no email/SMS is sent) — the
+  # room-state mechanics and cryptographic proof are fully real and
+  # spec-shaped (self-signed with this server's own key, since there's no
+  # external identity server to delegate to), but getting the token to the
+  # invitee is left to an out-of-band channel until a real mail/identity
+  # integration exists.
+  defp invite_3pid(conn, room_id, user_id, params) do
+    medium = params["medium"]
+    address = params["address"]
+    token = :crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false)
+    server_name = AxonCrypto.KeyServer.server_name()
+    %{public_key_b64: public_key_b64} = AxonCrypto.KeyServer.server_key_info()
+    key_validity_url = "https://#{server_name}/_matrix/identity/v2/pubkey/isvalid"
+
+    content = %{
+      "display_name" => obfuscate_3pid(medium, address),
+      "key_validity_url" => key_validity_url,
+      "public_key" => public_key_b64,
+      "public_keys" => [%{"public_key" => public_key_b64, "key_validity_url" => key_validity_url}]
+    }
+
+    with {:ok, _event_id} <-
+           RoomProcess.send_event(room_id, user_id, "m.room.third_party_invite", content,
+             state_key: token
+           ) do
+      json(conn, %{})
+    end
+  end
+
+  defp obfuscate_3pid(_medium, address) do
+    case String.split(address, "@", parts: 2) do
+      [local, domain] when byte_size(local) > 3 ->
+        String.slice(local, 0, 3) <>
+          String.duplicate("*", max(byte_size(local) - 3, 3)) <> "@" <> domain
+
+      [local, domain] ->
+        String.duplicate("*", byte_size(local)) <> "@" <> domain
+
+      _ ->
+        String.duplicate("*", String.length(address))
     end
   end
 
@@ -427,7 +525,7 @@ defmodule AxonWeb.RoomController do
   # join_authorised_via_users_server when the room is restricted and the
   # user isn't already invited (MSC3083). Returns {:error, :restricted_join_denied}
   # if the room is restricted and the user isn't allow-listed either.
-  defp build_join_content(room_id, user_id) do
+  defp build_join_content(room_id, user_id, third_party_signed) do
     current_state = EventStore.get_current_state_map(room_id)
     join_rule_event = current_state[{"m.room.join_rules", ""}]
     join_rule = get_in(join_rule_event, ["content", "join_rule"]) || "invite"
@@ -436,26 +534,42 @@ defmodule AxonWeb.RoomController do
       get_in(current_state[{"m.room.member", user_id}], ["content", "membership"])
 
     with :ok <- check_guest_access(user_id, current_state, sender_membership) do
-      cond do
-        join_rule not in ["restricted", "knock_restricted"] ->
-          {:ok, %{"membership" => "join"}}
+      result =
+        cond do
+          join_rule not in ["restricted", "knock_restricted"] ->
+            {:ok, %{"membership" => "join"}}
 
-        sender_membership in ["invite", "join"] ->
-          {:ok, %{"membership" => "join"}}
+          sender_membership in ["invite", "join"] ->
+            {:ok, %{"membership" => "join"}}
 
-        true ->
-          join_rule_content = (join_rule_event && join_rule_event["content"]) || %{}
+          true ->
+            join_rule_content = (join_rule_event && join_rule_event["content"]) || %{}
 
-          case RestrictedJoin.authorise(join_rule_content, user_id, current_state) do
-            {:ok, authoriser} ->
-              {:ok, %{"membership" => "join", "join_authorised_via_users_server" => authoriser}}
+            case RestrictedJoin.authorise(join_rule_content, user_id, current_state) do
+              {:ok, authoriser} ->
+                {:ok, %{"membership" => "join", "join_authorised_via_users_server" => authoriser}}
 
-            {:error, _} = err ->
-              err
-          end
+              {:error, _} = err ->
+                err
+            end
+        end
+
+      with {:ok, content} <- result do
+        {:ok, maybe_attach_third_party_invite(content, third_party_signed)}
       end
     end
   end
+
+  # A client that obtained proof of 3pid ownership (mxid/token/signatures —
+  # see AuthRules.valid_third_party_invite?/3 for how it's verified)
+  # attaches it here; harmless to attach speculatively when absent/invalid —
+  # AuthRules just won't treat it as an authorization escape hatch, and the
+  # join falls through to the room's normal join_rule check instead.
+  defp maybe_attach_third_party_invite(content, %{"mxid" => _, "token" => _} = signed) do
+    Map.put(content, "third_party_invite", %{"signed" => signed})
+  end
+
+  defp maybe_attach_third_party_invite(content, _), do: content
 
   # Guests may only join without an existing invite when the room opts in
   # via m.room.guest_access: can_join (default is "forbidden"). An invited

@@ -12,7 +12,10 @@ defmodule AxonRoom.CreateRoomTest do
 
   defp new_user(prefix) do
     localpart = "#{prefix}_#{System.unique_integer([:positive])}"
-    {:ok, %{user_id: user_id}} = UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
+    {:ok, %{user_id: user_id}} =
+      UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
     user_id
   end
 
@@ -36,7 +39,9 @@ defmodule AxonRoom.CreateRoomTest do
 
   test "public_chat preset: public join rule, can_join guest access, invite power 50" do
     creator = new_user("alice")
-    assert {:ok, room_id} = CreateRoom.execute(creator, preset: "public_chat", server_name: "localhost")
+
+    assert {:ok, room_id} =
+             CreateRoom.execute(creator, preset: "public_chat", server_name: "localhost")
 
     assert content_of(room_id, "m.room.join_rules")["join_rule"] == "public"
     assert content_of(room_id, "m.room.guest_access")["guest_access"] == "can_join"
@@ -45,7 +50,9 @@ defmodule AxonRoom.CreateRoomTest do
 
   test "trusted_private_chat preset: invite join rule, invite power 0" do
     creator = new_user("alice")
-    assert {:ok, room_id} = CreateRoom.execute(creator, preset: "trusted_private_chat", server_name: "localhost")
+
+    assert {:ok, room_id} =
+             CreateRoom.execute(creator, preset: "trusted_private_chat", server_name: "localhost")
 
     assert content_of(room_id, "m.room.join_rules")["join_rule"] == "invite"
     assert content_of(room_id, "m.room.power_levels")["invite"] == 0
@@ -73,12 +80,19 @@ defmodule AxonRoom.CreateRoomTest do
     creator = new_user("alice")
 
     assert {:ok, room_id} =
-             CreateRoom.execute(creator, server_name: "localhost", name: "My Room", topic: "A topic")
+             CreateRoom.execute(creator,
+               server_name: "localhost",
+               name: "My Room",
+               topic: "A topic"
+             )
 
     assert content_of(room_id, "m.room.name")["name"] == "My Room"
     topic_content = content_of(room_id, "m.room.topic")
     assert topic_content["topic"] == "A topic"
-    assert get_in(topic_content, ["m.topic", "m.text"]) == [%{"body" => "A topic", "mimetype" => "text/plain"}]
+
+    assert get_in(topic_content, ["m.topic", "m.text"]) == [
+             %{"body" => "A topic", "mimetype" => "text/plain"}
+           ]
   end
 
   test "room_alias_name registers an alias and sends a canonical_alias event" do
@@ -92,7 +106,9 @@ defmodule AxonRoom.CreateRoomTest do
     assert content_of(room_id, "m.room.canonical_alias")["alias"] == expected_alias
 
     assert Repo.exists?(
-             Ecto.Query.from(a in "room_aliases", where: a.alias == ^expected_alias and a.room_id == ^room_id)
+             Ecto.Query.from(a in "room_aliases",
+               where: a.alias == ^expected_alias and a.room_id == ^room_id
+             )
            )
   end
 
@@ -121,18 +137,20 @@ defmodule AxonRoom.CreateRoomTest do
 
   test "an unsupported room version is rejected before anything is created" do
     creator = new_user("alice")
-    assert CreateRoom.execute(creator, server_name: "localhost", version: "unsupported") == {:error, :unsupported_room_version}
+
+    assert CreateRoom.execute(creator, server_name: "localhost", version: "unsupported") ==
+             {:error, :unsupported_room_version}
   end
 
   describe "check_version_supported/1" do
-    test "accepts versions 2 through 11" do
-      for v <- ~w(2 3 4 5 6 7 8 9 10 11) do
+    test "accepts versions 2 through 12" do
+      for v <- ~w(2 3 4 5 6 7 8 9 10 11 12) do
         assert CreateRoom.check_version_supported(v) == :ok
       end
     end
 
     test "rejects anything else" do
-      assert CreateRoom.check_version_supported("12") == {:error, :unsupported_room_version}
+      assert CreateRoom.check_version_supported("1") == {:error, :unsupported_room_version}
       assert CreateRoom.check_version_supported("garbage") == {:error, :unsupported_room_version}
     end
   end

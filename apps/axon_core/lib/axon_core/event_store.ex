@@ -827,6 +827,17 @@ defmodule AxonCore.EventStore do
       "hashes" => e.hashes
     }
 
+    base =
+      if e.type == "m.room.create" and e.room_version == "12" do
+        # Room v12 (MSC4297): the create event's room_id IS its own event ID
+        # (with "!" instead of "$") — the field is redundant and MUST NOT
+        # appear on the wire. Still stored internally (event_id/room_id
+        # differ only by sigil) for ordinary DB scoping.
+        Map.delete(base, "room_id")
+      else
+        base
+      end
+
     base
     |> maybe_put("state_key", e.state_key)
     |> maybe_put("unsigned", e.unsigned)
