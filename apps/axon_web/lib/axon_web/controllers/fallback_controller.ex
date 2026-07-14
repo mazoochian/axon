@@ -109,6 +109,16 @@ defmodule AxonWeb.FallbackController do
     |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Target user is not in room"})
   end
 
+  def call(conn, {:error, :cannot_replace_default_rule}) do
+    conn
+    |> put_status(400)
+    |> json(%{
+      "errcode" => "M_INVALID_PARAM",
+      "error" =>
+        "Cannot replace a server-default rule's conditions/pattern — use /enabled or /actions"
+    })
+  end
+
   def call(conn, {:error, :room_blocked}) do
     conn
     |> put_status(403)

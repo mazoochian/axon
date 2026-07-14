@@ -60,11 +60,17 @@ defmodule AxonWeb.E2E.PushPipelineFlowTest do
     alice = register("alice_#{System.unique_integer([:positive])}")
     bob = register("bob_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token, %{"preset" => "public_chat"})
-    assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{}) |> Map.get(:status) == 200
+
+    assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{}) |> Map.get(:status) ==
+             200
 
     set_pusher(bob.token, "com.example.e2e")
 
-    event_id = send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "hello bob"})
+    event_id =
+      send_event(alice.token, room_id, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "hello bob"
+      })
 
     [payload] = wait_for_delivery()
     notification = payload["notification"]
@@ -78,7 +84,11 @@ defmodule AxonWeb.E2E.PushPipelineFlowTest do
     room_id = create_room(alice.token, %{"preset" => "public_chat"})
     set_pusher(alice.token, "com.example.selfpush")
 
-    send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "talking to myself"})
+    send_event(alice.token, room_id, "m.room.message", %{
+      "msgtype" => "m.text",
+      "body" => "talking to myself"
+    })
+
     assert_no_delivery()
   end
 
@@ -86,7 +96,9 @@ defmodule AxonWeb.E2E.PushPipelineFlowTest do
     alice = register("alice_#{System.unique_integer([:positive])}")
     bob = register("bob_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token, %{"preset" => "public_chat"})
-    assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{}) |> Map.get(:status) == 200
+
+    assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{}) |> Map.get(:status) ==
+             200
 
     pushkey = "pushkey_#{System.unique_integer([:positive])}"
 
@@ -105,23 +117,57 @@ defmodule AxonWeb.E2E.PushPipelineFlowTest do
     assert setup_conn.status == 200
 
     send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "first"})
+
     delivered_before_clear = wait_for_delivery()
     assert delivered_before_clear != []
     count_before = length(delivered_before_clear)
 
     clear_conn =
       authed(bob.token)
-      |> jp("/_matrix/client/v3/pushers/set", %{"app_id" => "com.example.clearme", "pushkey" => pushkey})
+      |> jp("/_matrix/client/v3/pushers/set", %{
+        "app_id" => "com.example.clearme",
+        "pushkey" => pushkey
+      })
 
     assert clear_conn.status == 200
 
     pushers_conn = authed(bob.token) |> get("/_matrix/client/v3/pushers")
     refute Enum.any?(decode(pushers_conn)["pushers"], &(&1["app_id"] == "com.example.clearme"))
 
-    send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "second, after clearing"})
+    send_event(alice.token, room_id, "m.room.message", %{
+      "msgtype" => "m.text",
+      "body" => "second, after clearing"
+    })
+
     # No NEW delivery arrives once the pusher is cleared (the gateway already
     # holds the first, pre-clear delivery, so this must be a delta check).
     Process.sleep(100)
     assert length(FakePusherGateway.received(@port)) == count_before
+  end
+
+  test "a room-kind push rule muting a room suppresses delivery for messages in that room" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    bob = register("bob_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+    assert authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{}) |> Map.get(:status) ==
+             200
+
+    set_pusher(bob.token, "com.example.muteroom")
+
+    mute_conn =
+      authed(bob.token)
+      |> jpu("/_matrix/client/v3/pushrules/global/room/#{room_id}", %{
+        "actions" => ["dont_notify"]
+      })
+
+    assert mute_conn.status == 200
+
+    send_event(alice.token, room_id, "m.room.message", %{
+      "msgtype" => "m.text",
+      "body" => "should be muted"
+    })
+
+    assert_no_delivery()
   end
 end

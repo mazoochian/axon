@@ -162,6 +162,8 @@ defmodule AxonWeb.Router do
     delete("/media/quarantine/:server_name/:media_id", AdminController, :unquarantine_media)
 
     get("/event_reports", AdminController, :list_reports)
+
+    post("/send_server_notice", AdminController, :send_server_notice)
   end
 
   # -------------------------------------------------------------------------
@@ -366,6 +368,7 @@ defmodule AxonWeb.Router do
     get("/v1/media/download/:server_name/:media_id", MediaController, :download)
     get("/v1/media/download/:server_name/:media_id/:filename", MediaController, :download)
     get("/v1/media/thumbnail/:server_name/:media_id", MediaController, :thumbnail)
+    get("/v1/media/preview_url", MediaController, :url_preview)
     get("/v3/media/preview_url", MediaController, :url_preview)
 
     # Third-party identifiers (stub)

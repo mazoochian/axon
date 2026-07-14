@@ -232,4 +232,21 @@ defmodule AxonWeb.AdminController do
 
     json(conn, %{"event_reports" => reports, "total" => total, "next_token" => next_token})
   end
+
+  # ---------------------------------------------------------------------------
+  # Server notices
+  # ---------------------------------------------------------------------------
+
+  # POST /_synapse/admin/v1/send_server_notice
+  def send_server_notice(conn, %{"user_id" => user_id, "content" => content}) do
+    with {:ok, event_id} <- AxonWeb.ServerNotices.send_notice(user_id, content) do
+      json(conn, %{"event_id" => event_id})
+    end
+  end
+
+  def send_server_notice(conn, _params) do
+    conn
+    |> put_status(400)
+    |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user_id and content are required"})
+  end
 end
