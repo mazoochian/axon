@@ -35,9 +35,19 @@ Regression coverage: `apps/axon_federation/test/outbound_queue_test.exs` (failur
 
 Long-poll wake-up reuses `AxonSync.Manager.wait_for_events/3` unchanged, so the Phase 8 wake-up fixes (to-device, device-list, ephemeral) apply here too. Regression coverage: `apps/axon_web/test/sliding_sync_test.exs` (13 tests: list sort/ranges/filters, `room_subscriptions`, `required_state` incl. `$LAZY`/`$ME`, the long-poll wake path with a real nonzero timeout, and every extension).
 
-## Phase 11 — E2EE/verification test hardening
+## Phase 11 — E2EE/verification test hardening (done)
 
-Expand integration coverage for multi-client and multi-homeserver verification flows using realistic long-poll timeouts (the exact gap that hid the Phase 8 bugs), wildcard-device sends, and key-backup consistency. Complement-style scenario coverage for cross-signing and device verification specifically, since that surface has seen the most iterative bugfixing (MSC3967 UIA exemptions, orphaned-key cleanup) and the most room for subtle regressions.
+Two real bugs found and fixed while expanding coverage of the surface that's seen the most iterative bugfixing:
+
+- **Stale test, not a stale bug**: `e2ee_multi_device_test.exs` asserted a first-time cross-signing `master_key` upload returns 401 requiring a UIA retry. MSC3967's `uia_exempt?/4` (`key_controller.ex`) correctly exempts first-time setup (nothing on file yet to protect) and has for a while — the test just never caught up. Fixed the assertion and added a real UIA-required case alongside it (rotating to an unrelated master key that isn't signed by the one on file), so the branch that *does* still require UIA has coverage too.
+- **Key backup consistency**: `PUT /room_keys/keys` never validated its `version` query param against the user's actual current backup version — a client retrying against a stale, deleted, or superseded version would silently insert rows with no error, and `count`/`etag` on `GET /room_keys/version` would never reflect the write. Now returns `403 M_WRONG_ROOM_KEYS_VERSION` (with `current_version` in the body) per spec, covered by `apps/axon_web/test/key_backup_consistency_test.exs`.
+
+New Complement-style scenario coverage in `apps/axon_web/test/e2e/verification_flow_test.exs`:
+
+- A full `m.key.verification.*` SAS exchange (request → ready → start → key ×2 → mac ×2 → done) between two users' devices, with every hop driven through a real nonzero-timeout long-poll on both sides — not a single event checked with a short poll, which is all any prior test did.
+- The same shape across two homeservers via `AxonFederation.FakeRemoteMatrixServer`, with a realistic nonzero timeout on the inbound EDU recipient's long-poll — the existing federation EDU test only short-polled after the fact, so it couldn't catch a wake-up regression on the federated path the way it already could locally.
+- The wildcard `"*"` to-device target (`KeyStore.expand_wildcard_device/2`, added in Phase 8) had zero test coverage until now — verified against a 3-device account, confirming delivery to all three and non-delivery to an unrelated user.
+- A cross-signing trust-chain scenario: bob signs alice's master key after "verifying" her; `/keys/query` shows bob his own signature but not an uninvolved third party, exercising the visibility rule end-to-end over HTTP rather than just at the `KeyStore` unit level.
 
 ## Phase 12 — Room version / state-res compliance
 

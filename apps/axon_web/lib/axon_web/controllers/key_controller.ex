@@ -606,6 +606,45 @@ defmodule AxonWeb.KeyController do
   def put_backup_keys(conn, params) do
     user_id = conn.assigns.current_user_id
     version = params["version"]
+    current_version = current_backup_version(user_id)
+
+    cond do
+      is_nil(version) ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "version is required"})
+
+      version != current_version ->
+        # Per spec: writing to any version other than the most recently
+        # created one must fail loudly rather than silently diverge from
+        # what the client believes is the canonical backup (e.g. a client
+        # racing a version rotation on another device, or retrying against
+        # a version that's since been deleted).
+        conn
+        |> put_status(403)
+        |> json(%{
+          "errcode" => "M_WRONG_ROOM_KEYS_VERSION",
+          "error" => "Wrong backup version",
+          "current_version" => current_version
+        })
+
+      true ->
+        do_put_backup_keys(conn, user_id, version, params)
+    end
+  end
+
+  defp current_backup_version(user_id) do
+    Repo.one(
+      from(v in "room_key_backup_versions",
+        where: v.user_id == ^user_id and not v.deleted,
+        order_by: [desc: v.inserted_at],
+        limit: 1,
+        select: v.version
+      )
+    )
+  end
+
+  defp do_put_backup_keys(conn, user_id, version, params) do
     rooms = get_in(params, ["rooms"]) || %{}
 
     entries =

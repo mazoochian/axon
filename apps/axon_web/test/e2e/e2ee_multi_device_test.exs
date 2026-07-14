@@ -76,7 +76,10 @@ defmodule AxonWeb.E2E.E2eeMultiDeviceTest do
     # A shared room is required for bob to see alice's device-list changes
     # via /keys/changes (axon scopes it to users who share a room).
     room_id = create_room(bob.token, %{"preset" => "public_chat"})
-    assert authed(alice_1.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{}) |> Map.get(:status) == 200
+
+    assert authed(alice_1.token)
+           |> jp("/_matrix/client/v3/join/#{room_id}", %{})
+           |> Map.get(:status) == 200
 
     # --- bob queries alice's keys and sees BOTH devices ---
     query_conn =
@@ -91,13 +94,19 @@ defmodule AxonWeb.E2E.E2eeMultiDeviceTest do
     # --- alice's first device sends a to-device message targeted ONLY at her second device ---
     send_conn =
       authed(alice_1.token)
-      |> jpu("/_matrix/client/v3/sendToDevice/m.room_key/txn_#{System.unique_integer([:positive])}", %{
-        "messages" => %{
-          alice_1.user_id => %{
-            alice_2.device_id => %{"algorithm" => "m.megolm.v1.aes-sha2", "session_key" => "s3kr3t"}
+      |> jpu(
+        "/_matrix/client/v3/sendToDevice/m.room_key/txn_#{System.unique_integer([:positive])}",
+        %{
+          "messages" => %{
+            alice_1.user_id => %{
+              alice_2.device_id => %{
+                "algorithm" => "m.megolm.v1.aes-sha2",
+                "session_key" => "s3kr3t"
+              }
+            }
           }
         }
-      })
+      )
 
     assert send_conn.status == 200
 
@@ -121,7 +130,9 @@ defmodule AxonWeb.E2E.E2eeMultiDeviceTest do
     bob_initial = sync_once(bob.token)
     bob_since = bob_initial["next_batch"]
 
-    # --- alice uploads cross-signing keys (UIA: dummy-auth retry), which bumps her device-list version ---
+    # --- alice uploads cross-signing keys for the first time: MSC3967 exempts
+    # first-time setup from UIA (nothing on file yet to protect), so this
+    # succeeds directly with no auth round trip ---
     cross_sign_payload = %{
       "master_key" => %{
         "keys" => %{"ed25519:alice_master" => "alice_master_pub"},
@@ -130,22 +141,42 @@ defmodule AxonWeb.E2E.E2eeMultiDeviceTest do
       }
     }
 
-    uia_conn = authed(alice_1.token) |> jp("/_matrix/client/v3/keys/device_signing/upload", cross_sign_payload)
-    assert uia_conn.status == 401
-    session = decode(uia_conn)["session"]
-
     ok_conn =
       authed(alice_1.token)
-      |> jp(
-        "/_matrix/client/v3/keys/device_signing/upload",
-        Map.put(cross_sign_payload, "auth", %{"type" => "m.login.dummy", "session" => session})
-      )
+      |> jp("/_matrix/client/v3/keys/device_signing/upload", cross_sign_payload)
 
     assert ok_conn.status == 200
 
+    # --- but ROTATING to a different, unrelated master key (not signed by
+    # the one now on file) still requires UIA ---
+    rotated_payload = %{
+      "master_key" => %{
+        "keys" => %{"ed25519:alice_master_2" => "alice_master_pub_2"},
+        "usage" => ["master"],
+        "user_id" => alice_1.user_id
+      }
+    }
+
+    uia_conn =
+      authed(alice_1.token)
+      |> jp("/_matrix/client/v3/keys/device_signing/upload", rotated_payload)
+
+    assert uia_conn.status == 401
+    session = decode(uia_conn)["session"]
+
+    rotated_ok_conn =
+      authed(alice_1.token)
+      |> jp(
+        "/_matrix/client/v3/keys/device_signing/upload",
+        Map.put(rotated_payload, "auth", %{"type" => "m.login.dummy", "session" => session})
+      )
+
+    assert rotated_ok_conn.status == 200
+
     # --- bob's incremental sync (or /keys/changes) now reports alice as changed ---
     changes_conn =
-      authed(bob.token) |> get("/_matrix/client/v3/keys/changes?from=#{bob_since}&to=#{bob_since}")
+      authed(bob.token)
+      |> get("/_matrix/client/v3/keys/changes?from=#{bob_since}&to=#{bob_since}")
 
     assert changes_conn.status == 200
 
