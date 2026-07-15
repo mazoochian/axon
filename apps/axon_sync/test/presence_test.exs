@@ -25,7 +25,10 @@ defmodule AxonSync.PresenceTest do
   end
 
   test "get for a never-seen user returns the offline default" do
-    assert Presence.get(uid("neverseen")) == %{"presence" => "offline", "currently_active" => false}
+    assert Presence.get(uid("neverseen")) == %{
+             "presence" => "offline",
+             "currently_active" => false
+           }
   end
 
   test "bump_activity brings an offline user online, preserving no status_msg" do
@@ -84,6 +87,68 @@ defmodule AxonSync.PresenceTest do
     changes = Presence.changes_since([user], baseline)
     assert changes[user]["presence"] == "online"
     assert changes[user]["status_msg"] == "final state"
+  end
+
+  test "bump_activity for a completely unseen user brings them online with no status_msg" do
+    user = uid("neverbumped")
+    Presence.bump_activity(user)
+    :sys.get_state(AxonSync.Presence)
+
+    result = Presence.get(user)
+    assert result["presence"] == "online"
+    refute Map.has_key?(result, "status_msg")
+  end
+
+  describe "set_remote/4 (inbound federation m.presence EDU)" do
+    test "records the remote user's reported presence and derives last_active_ts from last_active_ago" do
+      user = uid("remoteuser")
+      :ok = Presence.set_remote(user, "unavailable", "remote status", 5_000)
+
+      result = Presence.get(user)
+      assert result["presence"] == "unavailable"
+      assert result["status_msg"] == "remote status"
+      assert result["last_active_ago"] >= 5_000
+    end
+
+    test "a non-integer last_active_ago falls back to now" do
+      user = uid("remoteuser2")
+      :ok = Presence.set_remote(user, "online", nil, nil)
+
+      result = Presence.get(user)
+      assert result["presence"] == "online"
+      assert result["last_active_ago"] < 1_000
+    end
+
+    test "set_remote does not re-broadcast to federation:fanout (no rebroadcast loop)" do
+      user = uid("remoteuser3")
+      Phoenix.PubSub.subscribe(Axon.PubSub, "federation:fanout")
+
+      :ok = Presence.set_remote(user, "online", nil, 0)
+
+      refute_receive {:presence_changed, ^user, _}, 200
+      Phoenix.PubSub.unsubscribe(Axon.PubSub, "federation:fanout")
+    end
+  end
+
+  describe "log trimming (trim_log/0, exercised past @log_max_size)" do
+    test "once the change log exceeds the max size, the oldest entry is dropped on the next write" do
+      # Use a synthetic negative-version range so these entries always sort
+      # before every real (monotonically increasing, non-negative) version
+      # written by the rest of the suite, and so they're unambiguous to
+      # clean up afterward without touching real data.
+      synthetic = for v <- -20_001..-1, do: {v, "@filler:localhost"}
+      :ets.insert(:axon_presence_log, synthetic)
+
+      oldest_before = :ets.first(:axon_presence_log)
+      assert oldest_before == -20_001
+
+      Presence.set_presence(uid("trimtrigger"), "online")
+
+      oldest_after = :ets.first(:axon_presence_log)
+      refute oldest_after == oldest_before
+
+      :ets.select_delete(:axon_presence_log, [{{:"$1", :_}, [{:<, :"$1", 0}], [true]}])
+    end
   end
 
   describe "tick-driven transitions (time-travelled via direct ETS write)" do
