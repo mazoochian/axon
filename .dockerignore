@@ -1,0 +1,13 @@
+_build/
+deps/
+.git/
+.github/
+.elixir_ls/
+*.log
+erl_crash.dump
+.env
+.env.*
+!.env.example
+e2e-client/node_modules/
+e2e-client/test-results/
+e2e-client/playwright-report/
