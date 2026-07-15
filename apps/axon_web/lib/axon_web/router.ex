@@ -3,6 +3,7 @@ defmodule AxonWeb.Router do
 
   import Plug.Conn
   import Phoenix.Controller
+  import Phoenix.LiveDashboard.Router
 
   pipeline :api do
     plug(:accepts, ["json"])
@@ -13,6 +14,7 @@ defmodule AxonWeb.Router do
     plug(:accepts, ["json"])
     plug(:fetch_query_params)
     plug(AxonWeb.Plug.AuthenticateToken)
+    plug(AxonWeb.Plug.RoomLogMetadata)
   end
 
   pipeline :admin do
@@ -25,6 +27,17 @@ defmodule AxonWeb.Router do
   # -------------------------------------------------------------------------
   # Discovery — no auth
   # -------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # Ops probes — no auth, mounted outside /_matrix so they're reachable
+  # without a Matrix-aware client (load balancers, container orchestrators)
+  # -------------------------------------------------------------------------
+  scope "/", AxonWeb do
+    pipe_through(:api)
+
+    get("/health", HealthController, :health)
+    get("/ready", HealthController, :ready)
+  end
+
   scope "/_matrix/client", AxonWeb do
     pipe_through(:api)
 
@@ -164,6 +177,19 @@ defmodule AxonWeb.Router do
     get("/event_reports", AdminController, :list_reports)
 
     post("/send_server_notice", AdminController, :send_server_notice)
+  end
+
+  # -------------------------------------------------------------------------
+  # LiveDashboard (Phase 15.3) — same :admin auth as the admin API above.
+  # LiveDashboard has no notion of Bearer tokens, so an admin visits with
+  # ?access_token=<their token> (AuthenticateToken already falls back to
+  # that query param) — consistent with this app's Synapse-style admin
+  # auth model rather than adding a separate cookie-session login flow.
+  # -------------------------------------------------------------------------
+  scope "/_synapse/admin" do
+    pipe_through(:admin)
+
+    live_dashboard("/dashboard", metrics: AxonWeb.Telemetry)
   end
 
   # -------------------------------------------------------------------------

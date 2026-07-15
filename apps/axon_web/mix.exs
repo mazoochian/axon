@@ -57,6 +57,10 @@ defmodule AxonWeb.MixProject do
       {:opentelemetry_api, "~> 1.4"},
       {:opentelemetry, "~> 1.4"},
       {:opentelemetry_exporter, "~> 1.8"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_live_dashboard, "~> 0.8"},
+      {:sentry, "~> 10.8"},
+      {:hackney, "~> 1.20"},
       {:mox, "~> 1.1", only: :test}
     ]
   end
