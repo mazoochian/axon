@@ -63,4 +63,53 @@ defmodule AxonWeb.MediaControllerTest do
 
     assert conn.status == 404
   end
+
+  test "uploading an empty body is rejected with M_MISSING_PARAM" do
+    alice = register("mediaupload_empty_#{System.unique_integer([:positive])}")
+
+    conn =
+      authed(alice.token)
+      |> put_req_header("content-type", "text/plain")
+      |> post("/_matrix/client/v3/media/upload", "")
+
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_MISSING_PARAM"
+  end
+
+  test "a thumbnail generation failure (not merely unsupported type) is reported as 500" do
+    alice = register("mediathumb_fail_#{System.unique_integer([:positive])}")
+
+    upload_conn =
+      authed(alice.token)
+      |> put_req_header("content-type", "image/png")
+      |> post("/_matrix/client/v3/media/upload", "this is not actually a valid png file")
+
+    assert upload_conn.status == 200
+    media_id = decode(upload_conn)["content_uri"] |> String.split("/") |> List.last()
+
+    conn =
+      build_conn()
+      |> get("/_matrix/media/v3/thumbnail/localhost/#{media_id}?width=32&height=32")
+
+    assert conn.status == 500
+    assert decode(conn)["errcode"] == "M_UNKNOWN"
+  end
+
+  test "downloading media from an unreachable remote server 502s instead of crashing" do
+    conn =
+      build_conn()
+      |> get("/_matrix/media/v3/download/127.0.0.1:1/some_media_id")
+
+    assert conn.status == 502
+    assert decode(conn)["errcode"] == "M_UNKNOWN"
+  end
+
+  test "thumbnailing media from an unreachable remote server 502s instead of crashing" do
+    conn =
+      build_conn()
+      |> get("/_matrix/media/v3/thumbnail/127.0.0.1:1/some_media_id?width=32&height=32")
+
+    assert conn.status == 502
+    assert decode(conn)["errcode"] == "M_UNKNOWN"
+  end
 end
