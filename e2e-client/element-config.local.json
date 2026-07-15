@@ -1,0 +1,12 @@
+{
+  "default_server_config": {
+    "m.homeserver": {
+      "base_url": "http://host.docker.internal:8008",
+      "server_name": "localhost"
+    }
+  },
+  "brand": "Axon E2E (local)",
+  "disable_guests": true,
+  "disable_custom_urls": true,
+  "show_labs_settings": false
+}
