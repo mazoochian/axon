@@ -11,6 +11,8 @@ defmodule AxonFederation.OutboundQueueTest do
 
   use AxonFederation.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias AxonFederation.{FakeRemoteMatrixServer, KeyCache, OutboundQueue}
 
   @port 18_720
@@ -123,5 +125,55 @@ defmodule AxonFederation.OutboundQueueTest do
 
     assert length(requests_for_txn) == 2
     assert List.last(requests_for_txn).body["edus"] == [%{"edu_type" => "m.test"}]
+  end
+
+  test "an unrecognized message is ignored without crashing the process" do
+    pid = Process.whereis(OutboundQueue)
+    send(OutboundQueue, {:some_unexpected_message, :whatever})
+    Process.sleep(20)
+    assert Process.alive?(pid)
+    assert Process.whereis(OutboundQueue) == pid
+  end
+
+  test "a transaction older than the max retry age is given up on and removed instead of rescheduled" do
+    FakeRemoteMatrixServer.put_response(
+      @port,
+      {"PUT", ~r{^/_matrix/federation/v1/send/}},
+      500,
+      %{"errcode" => "M_UNKNOWN", "error" => "simulated failure"}
+    )
+
+    eight_days_ago = DateTime.add(DateTime.utc_now(), -8 * 24 * 3600, :second)
+
+    {1, [%{id: id}]} =
+      Repo.insert_all(
+        "federation_outbound_transactions",
+        [
+          %{
+            destination: @server_name,
+            payload: %{"pdus" => [], "edus" => []},
+            attempts: 5,
+            next_attempt_at: DateTime.utc_now(),
+            inserted_at: eight_days_ago
+          }
+        ],
+        returning: [:id]
+      )
+
+    log =
+      capture_log(fn ->
+        send(OutboundQueue, :sweep)
+
+        wait_until(System.monotonic_time(:millisecond) + 2_000, fn ->
+          case Repo.one(
+                 from(t in "federation_outbound_transactions", where: t.id == ^id, select: t.id)
+               ) do
+            nil -> {:ok, :gone}
+            _ -> :error
+          end
+        end)
+      end)
+
+    assert log =~ "Giving up on federation transaction ##{id}"
   end
 end
