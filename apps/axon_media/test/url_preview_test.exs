@@ -88,6 +88,33 @@ defmodule AxonMedia.UrlPreviewTest do
     test "rejects a hostname that resolves to localhost" do
       assert {:error, :blocked_address} = UrlPreview.fetch("http://localhost/", "localhost")
     end
+
+    test "rejects the 0.0.0.0/8 range" do
+      assert {:error, :blocked_address} = UrlPreview.fetch("http://0.0.0.1/", "localhost")
+    end
+
+    test "rejects IPv4 multicast/reserved addresses (>= 224.0.0.0)" do
+      for host <- ["224.0.0.1", "240.0.0.1", "255.255.255.255"] do
+        assert {:error, :blocked_address} = UrlPreview.fetch("http://#{host}/", "localhost"),
+               "expected #{host} to be blocked"
+      end
+    end
+
+    test "rejects the IPv6 unspecified address ::" do
+      assert {:error, :blocked_address} = UrlPreview.fetch("http://[::]/", "localhost")
+    end
+
+    test "rejects IPv6 unique-local addresses (fc00::/7)" do
+      for host <- ["[fc00::1]", "[fd12:3456:789a::1]"] do
+        assert {:error, :blocked_address} = UrlPreview.fetch("http://#{host}/", "localhost"),
+               "expected #{host} to be blocked"
+      end
+    end
+
+    test "rejects IPv4-mapped IPv6 addresses whose unwrapped IPv4 is private" do
+      assert {:error, :blocked_address} =
+               UrlPreview.fetch("http://[::ffff:127.0.0.1]/", "localhost")
+    end
   end
 
   describe "cache" do

@@ -14,7 +14,10 @@ defmodule AxonMedia.StoreTest do
     Application.put_env(:axon_media, :storage_path, tmp)
 
     on_exit(fn ->
-      if original, do: Application.put_env(:axon_media, :storage_path, original), else: Application.delete_env(:axon_media, :storage_path)
+      if original,
+        do: Application.put_env(:axon_media, :storage_path, original),
+        else: Application.delete_env(:axon_media, :storage_path)
+
       File.rm_rf(tmp)
     end)
 
@@ -56,5 +59,53 @@ defmodule AxonMedia.StoreTest do
     {:ok, id1} = Store.upload("@alice:localhost", "text/plain", "a", "localhost")
     {:ok, id2} = Store.upload("@alice:localhost", "text/plain", "b", "localhost")
     refute id1 == id2
+  end
+
+  describe "download/1 edge cases" do
+    test "quarantined media is reported as not_found, not a distinct error" do
+      {:ok, media_id} = Store.upload("@alice:localhost", "text/plain", "secret", "localhost")
+
+      {1, _} =
+        Repo.update_all(
+          Ecto.Query.from(m in "media", where: m.media_id == ^media_id),
+          set: [quarantined: true]
+        )
+
+      assert Store.download(media_id) == {:error, :not_found}
+    end
+
+    test "a media row with no storage_path is not_found" do
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("media", [
+        %{
+          media_id: "no_path_media",
+          origin_server: "localhost",
+          content_type: "text/plain",
+          file_size: 0,
+          storage_path: nil,
+          uploader: "@alice:localhost",
+          created_at: now
+        }
+      ])
+
+      assert Store.download("no_path_media") == {:error, :not_found}
+    end
+
+    test "a media row whose file was removed from disk is not_found, not a crash" do
+      {:ok, media_id} = Store.upload("@alice:localhost", "text/plain", "content", "localhost")
+
+      %{storage_path: path} =
+        Repo.one(
+          Ecto.Query.from(m in "media",
+            where: m.media_id == ^media_id,
+            select: %{storage_path: m.storage_path}
+          )
+        )
+
+      File.rm!(path)
+
+      assert Store.download(media_id) == {:error, :not_found}
+    end
   end
 end
