@@ -1,0 +1,74 @@
+# Two ways to run this harness — see README.md:
+#
+#   local:  `docker compose --profile local up -d` starts only Element Web,
+#           pointed at host.docker.internal:8008 — pair with
+#           `./start-axon.sh` (mix phx.server against your normal local dev
+#           Postgres/axon_dev DB) for fast iteration, no image rebuild per
+#           code change.
+#
+#   ci:     `docker compose --profile ci up -d` starts a full isolated stack
+#           (dedicated Postgres, the built prod Dockerfile image, Element
+#           Web wired to the in-network "axon" service) — hermetic, used by
+#           .github/workflows/e2e-client.yml.
+#
+# Element Web is always published on host port 8080 in both profiles, so
+# playwright.config.ts's baseURL doesn't need to know which one is active.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: axon
+      POSTGRES_PASSWORD: axon
+      POSTGRES_DB: axon_e2e
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U axon"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    profiles: ["ci"]
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &axon_env
+      AXON_SERVER_NAME: localhost
+      DB_HOST: postgres
+      DB_USER: axon
+      DB_PASS: axon
+      DB_NAME: axon_e2e
+      SECRET_KEY_BASE: "e2e-client-harness-only-not-a-real-secret-0000000000000000"
+    command: ["/axon/bin/axon", "eval", "AxonCore.Release.migrate()"]
+    profiles: ["ci"]
+
+  axon:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *axon_env
+    profiles: ["ci"]
+
+  element-web-ci:
+    image: vectorim/element-web:v1.11.86
+    volumes:
+      - ./element-config.ci.json:/app/config.json:ro
+    ports:
+      - "8080:80"
+    profiles: ["ci"]
+
+  element-web-local:
+    image: vectorim/element-web:v1.11.86
+    volumes:
+      - ./element-config.local.json:/app/config.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:80"
+    profiles: ["local"]

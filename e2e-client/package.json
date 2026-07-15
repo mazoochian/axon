@@ -1,0 +1,14 @@
+{
+  "name": "axon-e2e-client",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Real-client end-to-end tests: Element Web (matrix-js-sdk) driven by Playwright against a real Axon server, as opposed to apps/axon_web/test/e2e/*.exs and complement/, which both drive raw HTTP against the Matrix API rather than an actual client.",
+  "scripts": {
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}

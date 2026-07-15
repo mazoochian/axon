@@ -1,0 +1,66 @@
+name: E2E Client Tests
+
+# Real browser + real Element Web image pull + real server boot is slow —
+# deliberately kept off the PR-blocking fast loop (.github/workflows/ci.yml)
+# and run on a schedule / on demand instead.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  e2e-client:
+    name: Playwright + Element Web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: e2e-client
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm install
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Start Postgres
+        run: docker compose --profile ci up -d postgres
+
+      - name: Run migrations
+        run: docker compose --profile ci run --rm migrate
+
+      - name: Start Axon + Element Web
+        run: docker compose --profile ci up -d --build axon element-web-ci
+
+      - name: Wait for Element Web
+        run: |
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8080 > /dev/null && exit 0
+            sleep 2
+          done
+          echo "Element Web never became reachable" >&2
+          exit 1
+
+      - name: Run Playwright tests
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e-client/playwright-report/
+          retention-days: 14
+
+      - name: Docker logs (on failure)
+        if: failure()
+        run: docker compose --profile ci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile ci down -v
