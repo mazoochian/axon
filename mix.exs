@@ -9,7 +9,11 @@ defmodule Axon.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
-      releases: releases()
+      releases: releases(),
+      dialyzer: [
+        plt_file: {:no_warn, "priv/plts/dialyzer.plt"},
+        plt_add_apps: [:mix, :ex_unit]
+      ]
     ]
   end
 
@@ -29,7 +33,9 @@ defmodule Axon.MixProject do
   end
 
   defp deps do
-    []
+    [
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
+    ]
   end
 
   defp aliases do
