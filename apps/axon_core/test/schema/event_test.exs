@@ -13,7 +13,12 @@ defmodule AxonCore.Schema.EventTest do
 
   describe "from_wire/2 origin fallback" do
     test "uses the wire map's own origin when present" do
-      params = Event.from_wire(%{"sender" => "@alice:elsewhere.example", "origin" => "explicit.example"}, "10")
+      params =
+        Event.from_wire(
+          %{"sender" => "@alice:elsewhere.example", "origin" => "explicit.example"},
+          "10"
+        )
+
       assert params.origin == "explicit.example"
     end
 
