@@ -2,6 +2,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
   @moduledoc "Extracts and validates the Bearer token, setting conn assigns."
 
   import Plug.Conn
+  require Logger
   alias AxonCore.UserStore
 
   def init(opts), do: opts
@@ -22,6 +23,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
           {:ok, {user_id, device_id}} ->
             AxonSync.Presence.bump_activity(user_id)
             UserStore.touch_device(user_id, device_id, remote_ip(conn))
+            Logger.metadata(user_id: user_id)
 
             conn
             |> assign(:current_user_id, user_id)
@@ -36,6 +38,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
               {:ok, {user_id, device_id}} ->
                 AxonSync.Presence.bump_activity(user_id)
                 UserStore.touch_device(user_id, device_id, remote_ip(conn))
+                Logger.metadata(user_id: user_id)
 
                 conn
                 |> assign(:current_user_id, user_id)
