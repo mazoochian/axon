@@ -9,6 +9,8 @@ defmodule AxonWeb.SearchController do
 
   action_fallback(AxonWeb.FallbackController)
 
+  plug(AxonWeb.Plug.RateLimit, [bucket: :search, key_by: :user] when action == :search)
+
   alias AxonCore.EventStore
 
   @default_limit 10

@@ -44,7 +44,10 @@ config :axon_web, AxonWeb.Endpoint,
 # Federation HTTP listener (separate port)
 config :axon_federation,
   http_port: 8448,
-  server_name: System.get_env("AXON_SERVER_NAME", "localhost")
+  server_name: System.get_env("AXON_SERVER_NAME", "localhost"),
+  # Max concurrent in-flight delivery attempts per remote destination —
+  # see AxonFederation.OutboundQueue's moduledoc (Phase 15.4).
+  outbound_concurrency_per_destination: 5
 
 config :axon_web, AxonWeb.FederationEndpoint,
   adapter: Bandit.PhoenixAdapter,
@@ -54,13 +57,22 @@ config :axon_web, AxonWeb.FederationEndpoint,
   render_errors: [formats: [json: AxonWeb.FallbackController], layout: false],
   pubsub_server: Axon.PubSub
 
-# Rate limits (Phase 13). Each bucket is [max: N, window_ms: M] — N
-# requests per M milliseconds, keyed per-IP (login/register) or per-user
-# (send_event). See AxonWeb.Plug.RateLimit.
+# Rate limits (Phase 13, extended Phase 15.4). Each bucket is [max: N,
+# window_ms: M] — N requests per M milliseconds, keyed per-IP
+# (login/register) or per-user (everything else). See AxonWeb.Plug.RateLimit.
+#
+# `sync` is intentionally far more generous than the others: legitimate
+# clients long-poll it continuously (and re-call immediately whenever the
+# poll returns), so a naive per-request-count limit sized like login/search
+# would false-positive on normal usage rather than actually catching abuse.
 config :axon_web, :rate_limits,
   login: [max: 10, window_ms: 60_000],
   register: [max: 5, window_ms: 60_000],
-  send_event: [max: 20, window_ms: 10_000]
+  send_event: [max: 20, window_ms: 10_000],
+  media_upload: [max: 20, window_ms: 60_000],
+  url_preview: [max: 20, window_ms: 60_000],
+  search: [max: 20, window_ms: 60_000],
+  sync: [max: 300, window_ms: 60_000]
 
 # Media storage backend: :local or :s3
 config :axon_media,
@@ -71,6 +83,15 @@ config :axon_media,
 config :logger, :console,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id, :room_id, :user_id]
+
+# Sentry (Phase 15.3) — dsn is nil here and stays nil in dev/test, in which
+# case the SDK no-ops on every capture call rather than failing. Only
+# config/runtime.exs (prod, from SENTRY_DSN) turns it on for real; the
+# logger handler in AxonWeb.Application is only attached when a dsn is set.
+config :sentry,
+  environment_name: to_string(config_env()),
+  enable_source_code_context: true,
+  root_source_code_paths: [File.cwd!()]
 
 # Phoenix PubSub
 config :axon_sync,

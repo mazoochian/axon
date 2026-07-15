@@ -15,6 +15,20 @@ defmodule AxonFederation.OutboundQueue do
   (`"axonq<id>"`), so a remote server that already processed an earlier
   attempt (but whose 200 response we missed) sees a duplicate txn_id and
   replies idempotently per the federation spec, rather than reprocessing.
+
+  Per-destination concurrency cap + circuit breaker (Phase 15.4): without
+  this, a burst of rows all targeting the same slow/down destination would
+  each spawn their own concurrent `Task.Supervisor` child, piling up
+  in-flight HTTP attempts against a server that's already struggling —
+  exponential backoff alone doesn't prevent this, since it only spaces out
+  *individual rows'* retries, not the concurrency across *different* rows
+  that happen to become due around the same time. An ETS table tracks
+  in-flight attempt counts and consecutive-failure counts per destination;
+  once a destination is at its concurrency cap, or has failed enough times
+  in a row to trip the breaker, further due rows for it are simply left
+  for the next sweep tick rather than spawned — the existing
+  `next_attempt_at`/backoff bookkeeping is untouched, so this doesn't need
+  its own separate half-open-state machine.
   """
 
   use GenServer
@@ -29,6 +43,10 @@ defmodule AxonFederation.OutboundQueue do
   @max_backoff_ms :timer.hours(1)
   @max_age_ms :timer.hours(24) * 7
   @sweep_batch_size 100
+
+  @concurrency_table :axon_federation_outbound_concurrency
+  @circuit_breaker_threshold 5
+  @circuit_breaker_cooldown_ms :timer.seconds(60)
 
   # ---------------------------------------------------------------------------
   # Client API
@@ -58,7 +76,7 @@ defmodule AxonFederation.OutboundQueue do
         returning: [:id]
       )
 
-    spawn_attempt(id)
+    spawn_attempt(id, destination)
     :ok
   end
 
@@ -68,22 +86,25 @@ defmodule AxonFederation.OutboundQueue do
 
   @impl true
   def init(:ok) do
+    :ets.new(@concurrency_table, [:named_table, :public, :set])
     Process.send_after(self(), :sweep, @tick_interval)
     {:ok, %{}}
   end
 
   @impl true
   def handle_info(:sweep, state) do
-    due_ids =
+    due_rows =
       Repo.all(
         from(t in "federation_outbound_transactions",
           where: t.next_attempt_at <= ^DateTime.utc_now(),
-          select: t.id,
+          select: %{id: t.id, destination: t.destination},
           limit: ^@sweep_batch_size
         )
       )
 
-    Enum.each(due_ids, &spawn_attempt/1)
+    Enum.each(due_rows, fn %{id: id, destination: destination} ->
+      spawn_attempt(id, destination)
+    end)
 
     Process.send_after(self(), :sweep, @tick_interval)
     {:noreply, state}
@@ -96,8 +117,25 @@ defmodule AxonFederation.OutboundQueue do
   # GenServer, so a slow/hanging remote server can't block the sweep)
   # ---------------------------------------------------------------------------
 
-  defp spawn_attempt(id) do
-    Task.Supervisor.start_child(AxonFederation.TaskSupervisor, fn -> attempt(id) end)
+  defp spawn_attempt(id, destination) do
+    cond do
+      circuit_open?(destination) ->
+        :skipped
+
+      not under_concurrency_cap?(destination) ->
+        :skipped
+
+      true ->
+        increment_inflight(destination)
+
+        Task.Supervisor.start_child(AxonFederation.TaskSupervisor, fn ->
+          try do
+            attempt(id)
+          after
+            decrement_inflight(destination)
+          end
+        end)
+    end
   end
 
   defp attempt(id) do
@@ -128,8 +166,10 @@ defmodule AxonFederation.OutboundQueue do
     case HttpClient.put(row.destination, "/_matrix/federation/v1/send/#{txn_id}", row.payload) do
       {:ok, _} ->
         Repo.delete_all(from(t in "federation_outbound_transactions", where: t.id == ^row.id))
+        reset_circuit(row.destination)
 
       {:error, reason} ->
+        record_failure(row.destination)
         reschedule(row, reason)
     end
   end
@@ -161,4 +201,63 @@ defmodule AxonFederation.OutboundQueue do
   # there's no schema field type annotation to trigger Ecto's DateTime cast.
   defp to_utc_datetime(%DateTime{} = dt), do: dt
   defp to_utc_datetime(%NaiveDateTime{} = ndt), do: DateTime.from_naive!(ndt, "Etc/UTC")
+
+  # ---------------------------------------------------------------------------
+  # Private: per-destination concurrency cap + circuit breaker (ETS-backed,
+  # same small self-contained idiom as AxonWeb.RateLimiter — resets on
+  # restart, which is fine here since a fresh boot should start optimistic
+  # about every destination anyway).
+  # ---------------------------------------------------------------------------
+
+  defp under_concurrency_cap?(destination) do
+    cap = Application.get_env(:axon_federation, :outbound_concurrency_per_destination, 5)
+    current = :ets.lookup_element(@concurrency_table, {:inflight, destination}, 2, 0)
+    current < cap
+  end
+
+  defp increment_inflight(destination) do
+    :ets.update_counter(
+      @concurrency_table,
+      {:inflight, destination},
+      {2, 1},
+      {{:inflight, destination}, 0}
+    )
+  end
+
+  defp decrement_inflight(destination) do
+    :ets.update_counter(
+      @concurrency_table,
+      {:inflight, destination},
+      {2, -1},
+      {{:inflight, destination}, 0}
+    )
+  end
+
+  defp circuit_open?(destination) do
+    case :ets.lookup(@concurrency_table, {:circuit_open_until, destination}) do
+      [{_, open_until}] -> System.monotonic_time(:millisecond) < open_until
+      [] -> false
+    end
+  end
+
+  defp record_failure(destination) do
+    count =
+      :ets.update_counter(
+        @concurrency_table,
+        {:failures, destination},
+        {2, 1},
+        {{:failures, destination}, 0}
+      )
+
+    if count >= @circuit_breaker_threshold do
+      open_until = System.monotonic_time(:millisecond) + @circuit_breaker_cooldown_ms
+      :ets.insert(@concurrency_table, {{:circuit_open_until, destination}, open_until})
+      :ets.insert(@concurrency_table, {{:failures, destination}, 0})
+    end
+  end
+
+  defp reset_circuit(destination) do
+    :ets.insert(@concurrency_table, {{:failures, destination}, 0})
+    :ets.delete(@concurrency_table, {:circuit_open_until, destination})
+  end
 end

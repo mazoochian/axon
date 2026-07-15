@@ -26,6 +26,10 @@ config :libcluster, topologies: []
 config :axon_web, :rate_limits,
   login: [max: 1_000_000, window_ms: 60_000],
   register: [max: 1_000_000, window_ms: 60_000],
-  send_event: [max: 1_000_000, window_ms: 10_000]
+  send_event: [max: 1_000_000, window_ms: 10_000],
+  media_upload: [max: 1_000_000, window_ms: 60_000],
+  url_preview: [max: 1_000_000, window_ms: 60_000],
+  search: [max: 1_000_000, window_ms: 60_000],
+  sync: [max: 1_000_000, window_ms: 60_000]
 
 config :logger, level: :warning
