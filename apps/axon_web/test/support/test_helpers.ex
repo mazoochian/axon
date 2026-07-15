@@ -54,10 +54,14 @@ defmodule AxonWeb.TestHelpers do
   def authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
 
   def jp(conn, path, body),
-    do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
 
   def jpu(conn, path, body),
-    do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
 
   def decode(conn), do: Jason.decode!(conn.resp_body)
 
@@ -71,7 +75,10 @@ defmodule AxonWeb.TestHelpers do
   @doc "Sends a message-shaped event to a room, returns the event_id."
   def send_event(token, room_id, type, content) do
     txn_id = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/#{type}/#{txn_id}", content)
+
+    conn =
+      authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/#{type}/#{txn_id}", content)
+
     assert conn.status == 200
     decode(conn)["event_id"]
   end

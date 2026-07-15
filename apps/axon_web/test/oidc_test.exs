@@ -92,11 +92,14 @@ defmodule AxonWeb.OidcTest do
     login_conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/login", Jason.encode!(%{
-        "type" => "m.login.password",
-        "identifier" => %{"user" => "alice_oidc"},
-        "password" => "whatever"
-      }))
+      |> post(
+        "/_matrix/client/v3/login",
+        Jason.encode!(%{
+          "type" => "m.login.password",
+          "identifier" => %{"user" => "alice_oidc"},
+          "password" => "whatever"
+        })
+      )
 
     assert login_conn.status == 403
     assert decode(login_conn)["errcode"] == "M_FORBIDDEN"
@@ -107,11 +110,14 @@ defmodule AxonWeb.OidcTest do
     register_conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => "should_not_work",
-        "password" => "Test1234!",
-        "kind" => "user"
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => "should_not_work",
+          "password" => "Test1234!",
+          "kind" => "user"
+        })
+      )
 
     assert register_conn.status == 403
     assert decode(register_conn)["errcode"] == "M_FORBIDDEN"

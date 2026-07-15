@@ -32,6 +32,7 @@ defmodule AxonFederation.KeyCache do
 
       _ ->
         GenServer.call(__MODULE__, {:fetch_keys, server_name}, 15_000)
+
         case :ets.lookup(@table, cache_key) do
           [{_, pub_key, valid_until}] when valid_until > now_ms -> pub_key
           _ -> nil
@@ -82,7 +83,7 @@ defmodule AxonFederation.KeyCache do
   defp cache_key_doc(server_name, doc) do
     verify_keys = doc["verify_keys"] || %{}
     # valid_until_ts may be nil for old servers; default to 24h
-    valid_until = doc["valid_until_ts"] || (System.os_time(:millisecond) + 86_400_000)
+    valid_until = doc["valid_until_ts"] || System.os_time(:millisecond) + 86_400_000
 
     Enum.each(verify_keys, fn {key_id, key_info} ->
       case Base.decode64(key_info["key"] || "", padding: false) do

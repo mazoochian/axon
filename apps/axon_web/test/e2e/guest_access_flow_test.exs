@@ -30,15 +30,24 @@ defmodule AxonWeb.E2E.GuestAccessFlowTest do
     join_conn = authed(guest.token) |> jp("/_matrix/client/v3/join/#{public_room}", %{})
     assert join_conn.status == 200
 
-    members_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{public_room}/joined_members")
+    members_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/rooms/#{public_room}/joined_members")
+
     assert Map.has_key?(decode(members_conn)["joined"], guest.user_id)
 
     # --- once admitted, the guest is otherwise indistinguishable from a full user ---
-    event_id = send_event(guest.token, public_room, "m.room.message", %{"msgtype" => "m.text", "body" => "hi, I'm a guest"})
+    event_id =
+      send_event(guest.token, public_room, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "hi, I'm a guest"
+      })
 
     sync_conn = authed(guest.token) |> get("/_matrix/client/v3/sync")
     assert sync_conn.status == 200
-    timeline_events = get_in(decode(sync_conn), ["rooms", "join", public_room, "timeline", "events"]) || []
+
+    timeline_events =
+      get_in(decode(sync_conn), ["rooms", "join", public_room, "timeline", "events"]) || []
+
     assert Enum.any?(timeline_events, &(&1["event_id"] == event_id))
 
     # a guest can even create their own room — axon does not restrict this
@@ -51,7 +60,10 @@ defmodule AxonWeb.E2E.GuestAccessFlowTest do
     guest = register_guest()
     room_id = create_room(alice.token, %{"preset" => "private_chat"})
 
-    invite_conn = authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", %{"user_id" => guest.user_id})
+    invite_conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", %{"user_id" => guest.user_id})
+
     assert invite_conn.status == 200
 
     accept_conn = authed(guest.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})

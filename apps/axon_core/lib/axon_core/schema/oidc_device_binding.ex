@@ -3,8 +3,8 @@ defmodule AxonCore.Schema.OidcDeviceBinding do
   import Ecto.Changeset
 
   schema "oidc_device_bindings" do
-    field :token_hash, :string
-    field :device_id, :string
+    field(:token_hash, :string)
+    field(:device_id, :string)
 
     timestamps(type: :utc_datetime_usec, updated_at: false)
   end

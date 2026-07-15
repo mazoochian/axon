@@ -17,12 +17,15 @@ defmodule AxonWeb.DehydratedDeviceTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -30,13 +33,21 @@ defmodule AxonWeb.DehydratedDeviceTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp dehydrated_device_payload(device_id) do
     %{
       "device_id" => device_id,
-      "device_data" => %{"algorithm" => "m.dehydration.v2", "device_pickle" => "cipherbytes", "nonce" => "abc"},
+      "device_data" => %{
+        "algorithm" => "m.dehydration.v2",
+        "device_pickle" => "cipherbytes",
+        "nonce" => "abc"
+      },
       "initial_device_display_name" => "Dehydrated device",
       "device_keys" => %{
         "user_id" => "ignored_by_server_uses_token_identity",

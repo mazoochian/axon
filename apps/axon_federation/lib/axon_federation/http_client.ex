@@ -19,11 +19,12 @@ defmodule AxonFederation.HttpClient do
     url = build_url(server_name, path)
     auth = build_auth_header(server_name, "GET", path, nil)
 
-    req = Finch.build(:get, url, [
-      {"authorization", auth},
-      {"user-agent", @user_agent},
-      {"accept", "application/json"}
-    ])
+    req =
+      Finch.build(:get, url, [
+        {"authorization", auth},
+        {"user-agent", @user_agent},
+        {"accept", "application/json"}
+      ])
 
     execute(req)
   end
@@ -36,11 +37,17 @@ defmodule AxonFederation.HttpClient do
     body_json = Jason.encode!(body_map)
     auth = build_auth_header(server_name, "PUT", path, body_map)
 
-    req = Finch.build(:put, url, [
-      {"authorization", auth},
-      {"content-type", "application/json"},
-      {"user-agent", @user_agent}
-    ], body_json)
+    req =
+      Finch.build(
+        :put,
+        url,
+        [
+          {"authorization", auth},
+          {"content-type", "application/json"},
+          {"user-agent", @user_agent}
+        ],
+        body_json
+      )
 
     execute(req)
   end
@@ -53,11 +60,17 @@ defmodule AxonFederation.HttpClient do
     body_json = Jason.encode!(body_map)
     auth = build_auth_header(server_name, "POST", path, body_map)
 
-    req = Finch.build(:post, url, [
-      {"authorization", auth},
-      {"content-type", "application/json"},
-      {"user-agent", @user_agent}
-    ], body_json)
+    req =
+      Finch.build(
+        :post,
+        url,
+        [
+          {"authorization", auth},
+          {"content-type", "application/json"},
+          {"user-agent", @user_agent}
+        ],
+        body_json
+      )
 
     execute(req)
   end

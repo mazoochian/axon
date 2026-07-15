@@ -20,7 +20,17 @@ defmodule AxonRoom.RestrictedJoinTest do
 
     Repo.insert_all(
       "users",
-      [%{user_id: user_id, localpart: localpart, is_guest: false, deactivated: false, admin: false, inserted_at: now, updated_at: now}],
+      [
+        %{
+          user_id: user_id,
+          localpart: localpart,
+          is_guest: false,
+          deactivated: false,
+          admin: false,
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
       on_conflict: :nothing
     )
   end
@@ -31,7 +41,16 @@ defmodule AxonRoom.RestrictedJoinTest do
 
     Repo.insert_all(
       "rooms",
-      [%{room_id: room_id, version: "10", creator: creator, is_public: false, inserted_at: now, updated_at: now}],
+      [
+        %{
+          room_id: room_id,
+          version: "10",
+          creator: creator,
+          is_public: false,
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
       on_conflict: :nothing
     )
   end
@@ -59,7 +78,11 @@ defmodule AxonRoom.RestrictedJoinTest do
   end
 
   defp member_event(user_id, membership) do
-    %{"type" => "m.room.member", "state_key" => user_id, "content" => %{"membership" => membership}}
+    %{
+      "type" => "m.room.member",
+      "state_key" => user_id,
+      "content" => %{"membership" => membership}
+    }
   end
 
   setup do
@@ -69,17 +92,22 @@ defmodule AxonRoom.RestrictedJoinTest do
   end
 
   test "denied when allow is empty" do
-    assert RestrictedJoin.authorise(%{"allow" => []}, @alice, %{}) == {:error, :restricted_join_denied}
+    assert RestrictedJoin.authorise(%{"allow" => []}, @alice, %{}) ==
+             {:error, :restricted_join_denied}
   end
 
   test "denied when allow only lists an unrecognized rule type" do
     allow = [%{"type" => "something_else", "room_id" => @space_room}]
-    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, %{}) == {:error, :restricted_join_denied}
+
+    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, %{}) ==
+             {:error, :restricted_join_denied}
   end
 
   test "denied when user isn't joined to any allow-listed room" do
     allow = [%{"type" => "m.room_membership", "room_id" => @space_room}]
-    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, %{}) == {:error, :restricted_join_denied}
+
+    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, %{}) ==
+             {:error, :restricted_join_denied}
   end
 
   test "denied when user is joined to the allow-listed room but no local authoriser is available" do
@@ -87,7 +115,8 @@ defmodule AxonRoom.RestrictedJoinTest do
     allow = [%{"type" => "m.room_membership", "room_id" => @space_room}]
 
     # current_state has no joined member with invite power to vouch.
-    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, %{}) == {:error, :restricted_join_denied}
+    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, %{}) ==
+             {:error, :restricted_join_denied}
   end
 
   test "authorised when user is joined to an allow-listed room and a local member can vouch" do
@@ -115,7 +144,9 @@ defmodule AxonRoom.RestrictedJoinTest do
     allow = [%{"type" => "m.room_membership", "room_id" => @space_room}]
 
     current_state = %{{"m.room.member", @creator} => member_event(@creator, "join")}
-    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) == {:error, :restricted_join_denied}
+
+    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) ==
+             {:error, :restricted_join_denied}
   end
 
   test "only a member with sufficient invite power is picked as authoriser" do
@@ -127,7 +158,10 @@ defmodule AxonRoom.RestrictedJoinTest do
     current_state = %{
       {"m.room.member", "@bob:localhost"} => member_event("@bob:localhost", "join"),
       {"m.room.member", @creator} => member_event(@creator, "join"),
-      {"m.room.power_levels", ""} => %{"type" => "m.room.power_levels", "content" => %{"invite" => 50, "users" => %{"@bob:localhost" => 0, @creator => 100}}}
+      {"m.room.power_levels", ""} => %{
+        "type" => "m.room.power_levels",
+        "content" => %{"invite" => 50, "users" => %{"@bob:localhost" => 0, @creator => 100}}
+      }
     }
 
     assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) == {:ok, @creator}
@@ -140,6 +174,7 @@ defmodule AxonRoom.RestrictedJoinTest do
     remote_user = "@remote_admin:example.org"
     current_state = %{{"m.room.member", remote_user} => member_event(remote_user, "join")}
 
-    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) == {:error, :restricted_join_denied}
+    assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) ==
+             {:error, :restricted_join_denied}
   end
 end

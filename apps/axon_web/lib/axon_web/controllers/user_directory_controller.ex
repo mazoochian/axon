@@ -15,7 +15,7 @@ defmodule AxonWeb.UserDirectoryController do
         pattern = "%#{String.downcase(term)}%"
 
         Repo.all(
-          from u in "users",
+          from(u in "users",
             left_join: p in "user_profiles",
             on: u.user_id == p.user_id,
             where:
@@ -27,6 +27,7 @@ defmodule AxonWeb.UserDirectoryController do
               avatar_url: p.avatar_url
             },
             limit: ^limit
+          )
         )
         |> Enum.map(fn row ->
           %{"user_id" => row.user_id}

@@ -9,12 +9,16 @@ defmodule AxonFederation.ServerResolverTest do
   end
 
   test "override takes priority when present" do
-    Application.put_env(:axon_federation, :server_overrides, %{"fake.test" => "http://127.0.0.1:9999"})
+    Application.put_env(:axon_federation, :server_overrides, %{
+      "fake.test" => "http://127.0.0.1:9999"
+    })
+
     assert ServerResolver.resolve("fake.test") == "http://127.0.0.1:9999"
   end
 
   test "falls back to :8448 when no override and well-known is unreachable" do
-    assert ServerResolver.resolve("nonexistent-#{System.unique_integer([:positive])}.invalid") =~ ":8448"
+    assert ServerResolver.resolve("nonexistent-#{System.unique_integer([:positive])}.invalid") =~
+             ":8448"
   end
 
   test "a real fake server is reachable via the override and serves a self-signed key doc" do
@@ -31,6 +35,7 @@ defmodule AxonFederation.ServerResolverTest do
     key_id = FakeRemoteMatrixServer.key_id(port)
     pub_key = KeyCache.get_key(server_name, key_id)
 
-    assert pub_key == FakeRemoteMatrixServer.public_key_b64(port) |> Base.decode64!(padding: false)
+    assert pub_key ==
+             FakeRemoteMatrixServer.public_key_b64(port) |> Base.decode64!(padding: false)
   end
 end

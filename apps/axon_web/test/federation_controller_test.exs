@@ -23,7 +23,11 @@ defmodule AxonWeb.FederationControllerTest do
   setup do
     start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
     KeyCache.clear()
-    Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:#{@port}"})
+
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:#{@port}"
+    })
+
     on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
     :ok
   end
@@ -59,7 +63,10 @@ defmodule AxonWeb.FederationControllerTest do
 
   defp new_local_user(prefix) do
     localpart = "#{prefix}_#{System.unique_integer([:positive])}"
-    {:ok, %{user_id: user_id}} = AxonCore.UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
+    {:ok, %{user_id: user_id}} =
+      AxonCore.UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
     user_id
   end
 
@@ -103,7 +110,10 @@ defmodule AxonWeb.FederationControllerTest do
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
       joiner = remote_user("joiner")
 
-      conn = signed_get("/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}?ver=10&ver=11")
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}?ver=10&ver=11"
+        )
 
       assert conn.status == 200
       body = decode(conn)
@@ -116,13 +126,22 @@ defmodule AxonWeb.FederationControllerTest do
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
       mismatched_user = "@someone:not-#{@server_name}"
 
-      conn = signed_get("/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(mismatched_user)}")
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(mismatched_user)}"
+        )
+
       assert conn.status == 403
     end
 
     test "404s for a room that doesn't exist locally" do
       joiner = remote_user("joiner")
-      conn = signed_get("/_matrix/federation/v1/make_join/!nonexistent:localhost/#{URI.encode(joiner)}")
+
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/!nonexistent:localhost/#{URI.encode(joiner)}"
+        )
+
       assert conn.status == 404
     end
 
@@ -131,7 +150,11 @@ defmodule AxonWeb.FederationControllerTest do
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "private_chat")
       joiner = remote_user("joiner")
 
-      conn = signed_get("/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}")
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+        )
+
       assert conn.status == 403
     end
   end
@@ -142,16 +165,24 @@ defmodule AxonWeb.FederationControllerTest do
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
       joiner = remote_user("joiner")
 
-      make_join_conn = signed_get("/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}")
+      make_join_conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+        )
+
       template = decode(make_join_conn)["event"]
 
       join_event =
-        signed_remote_event(Map.merge(template, %{
-          "event_id" => "$join_#{System.unique_integer([:positive])}",
-          "origin_server_ts" => System.os_time(:millisecond)
-        }))
+        signed_remote_event(
+          Map.merge(template, %{
+            "event_id" => "$join_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
 
-      path = "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+
       conn = signed_put(path, join_event)
 
       assert conn.status == 200
@@ -164,16 +195,19 @@ defmodule AxonWeb.FederationControllerTest do
       owner = new_local_user("owner")
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
 
-      bad_event = signed_remote_event(%{
-        "event_id" => "$bad_#{System.unique_integer([:positive])}",
-        "room_id" => room_id,
-        "type" => "m.room.message",
-        "content" => %{"membership" => "join"},
-        "sender" => remote_user("x"),
-        "origin_server_ts" => System.os_time(:millisecond)
-      })
+      bad_event =
+        signed_remote_event(%{
+          "event_id" => "$bad_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "content" => %{"membership" => "join"},
+          "sender" => remote_user("x"),
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
 
-      path = "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(bad_event["event_id"])}"
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(bad_event["event_id"])}"
+
       conn = signed_put(path, bad_event)
       assert conn.status == 400
     end
@@ -195,7 +229,9 @@ defmodule AxonWeb.FederationControllerTest do
         "signatures" => %{}
       }
 
-      path = "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(unsigned_event["event_id"])}"
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(unsigned_event["event_id"])}"
+
       conn = signed_put(path, unsigned_event)
       assert conn.status == 403
     end
@@ -205,19 +241,25 @@ defmodule AxonWeb.FederationControllerTest do
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
       banned = remote_user("banned")
 
-      {:ok, _} = RoomProcess.send_event(room_id, owner, "m.room.member", %{"membership" => "ban"}, state_key: banned)
+      {:ok, _} =
+        RoomProcess.send_event(room_id, owner, "m.room.member", %{"membership" => "ban"},
+          state_key: banned
+        )
 
-      join_event = signed_remote_event(%{
-        "event_id" => "$banned_join_#{System.unique_integer([:positive])}",
-        "room_id" => room_id,
-        "type" => "m.room.member",
-        "state_key" => banned,
-        "sender" => banned,
-        "content" => %{"membership" => "join"},
-        "origin_server_ts" => System.os_time(:millisecond)
-      })
+      join_event =
+        signed_remote_event(%{
+          "event_id" => "$banned_join_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => banned,
+          "sender" => banned,
+          "content" => %{"membership" => "join"},
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
 
-      path = "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+
       conn = signed_put(path, join_event)
       assert conn.status == 403
     end
@@ -234,7 +276,11 @@ defmodule AxonWeb.FederationControllerTest do
       member = remote_user("member")
       join_remote_member(room_id, member)
 
-      conn = signed_get("/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(member)}")
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(member)}"
+        )
+
       assert conn.status == 200
       assert decode(conn)["event"]["content"]["membership"] == "leave"
     end
@@ -245,16 +291,24 @@ defmodule AxonWeb.FederationControllerTest do
       member = remote_user("member")
       join_remote_member(room_id, member)
 
-      make_leave_conn = signed_get("/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(member)}")
+      make_leave_conn =
+        signed_get(
+          "/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(member)}"
+        )
+
       template = decode(make_leave_conn)["event"]
 
       leave_event =
-        signed_remote_event(Map.merge(template, %{
-          "event_id" => "$leave_#{System.unique_integer([:positive])}",
-          "origin_server_ts" => System.os_time(:millisecond)
-        }))
+        signed_remote_event(
+          Map.merge(template, %{
+            "event_id" => "$leave_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
 
-      path = "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}"
+      path =
+        "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}"
+
       conn = signed_put(path, leave_event)
 
       assert conn.status == 200
@@ -278,7 +332,9 @@ defmodule AxonWeb.FederationControllerTest do
         "signatures" => %{}
       }
 
-      path = "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(unsigned["event_id"])}"
+      path =
+        "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(unsigned["event_id"])}"
+
       conn = signed_put(path, unsigned)
       assert conn.status == 403
     end
@@ -295,11 +351,18 @@ defmodule AxonWeb.FederationControllerTest do
       {:ok, room_id} =
         CreateRoom.execute(owner,
           server_name: "localhost",
-          initial_state: [%{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}]
+          initial_state: [
+            %{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}
+          ]
         )
 
       knocker = remote_user("knocker")
-      conn = signed_get("/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}?ver=10")
+
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}?ver=10"
+        )
+
       assert conn.status == 200
       assert decode(conn)["event"]["content"]["membership"] == "knock"
     end
@@ -309,7 +372,11 @@ defmodule AxonWeb.FederationControllerTest do
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "private_chat")
       knocker = remote_user("knocker")
 
-      conn = signed_get("/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}")
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}"
+        )
+
       assert conn.status == 403
     end
 
@@ -320,20 +387,31 @@ defmodule AxonWeb.FederationControllerTest do
         CreateRoom.execute(owner,
           server_name: "localhost",
           name: "Knockable",
-          initial_state: [%{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}]
+          initial_state: [
+            %{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}
+          ]
         )
 
       knocker = remote_user("knocker")
-      make_knock_conn = signed_get("/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}")
+
+      make_knock_conn =
+        signed_get(
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}"
+        )
+
       template = decode(make_knock_conn)["event"]
 
       knock_event =
-        signed_remote_event(Map.merge(template, %{
-          "event_id" => "$knock_#{System.unique_integer([:positive])}",
-          "origin_server_ts" => System.os_time(:millisecond)
-        }))
+        signed_remote_event(
+          Map.merge(template, %{
+            "event_id" => "$knock_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
 
-      path = "/_matrix/federation/v1/send_knock/#{URI.encode(room_id)}/#{URI.encode(knock_event["event_id"])}"
+      path =
+        "/_matrix/federation/v1/send_knock/#{URI.encode(room_id)}/#{URI.encode(knock_event["event_id"])}"
+
       conn = signed_put(path, knock_event)
 
       assert conn.status == 200
@@ -430,7 +508,14 @@ defmodule AxonWeb.FederationControllerTest do
   describe "read-only room data endpoints" do
     setup do
       owner = new_local_user("owner")
-      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat", name: "Readable")
+
+      {:ok, room_id} =
+        CreateRoom.execute(owner,
+          server_name: "localhost",
+          preset: "public_chat",
+          name: "Readable"
+        )
+
       %{owner: owner, room_id: room_id}
     end
 
@@ -463,7 +548,10 @@ defmodule AxonWeb.FederationControllerTest do
       refute body["pdu_ids"] == []
     end
 
-    test "backfill returns events older than the given ordering, respecting limit", %{room_id: room_id, owner: owner} do
+    test "backfill returns events older than the given ordering, respecting limit", %{
+      room_id: room_id,
+      owner: owner
+    } do
       for i <- 1..5 do
         RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "msg #{i}"})
       end
@@ -496,7 +584,10 @@ defmodule AxonWeb.FederationControllerTest do
     test "query_directory resolves a known alias to a room_id" do
       owner = new_local_user("owner")
       localpart = "aliastest#{System.unique_integer([:positive])}"
-      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", room_alias_name: localpart)
+
+      {:ok, room_id} =
+        CreateRoom.execute(owner, server_name: "localhost", room_alias_name: localpart)
+
       room_alias = "##{localpart}:localhost"
 
       # URI.encode/1 deliberately leaves "#" unescaped (it's valid in a path),
@@ -509,13 +600,24 @@ defmodule AxonWeb.FederationControllerTest do
     end
 
     test "query_directory 404s for an unknown alias" do
-      conn = signed_get("/_matrix/federation/v1/query/directory?room_alias=%23nonexistent:localhost")
+      conn =
+        signed_get("/_matrix/federation/v1/query/directory?room_alias=%23nonexistent:localhost")
+
       assert conn.status == 404
     end
 
     test "query_profile returns displayname/avatar_url for a known local user (regression: was querying nonexistent users columns)" do
       user_id = new_local_user("profiled")
-      :ok = elem(AxonCore.UserStore.update_profile(user_id, %{displayname: "Cool Name", avatar_url: "mxc://localhost/abc"}), 0) |> then(fn :ok -> :ok end)
+
+      :ok =
+        elem(
+          AxonCore.UserStore.update_profile(user_id, %{
+            displayname: "Cool Name",
+            avatar_url: "mxc://localhost/abc"
+          }),
+          0
+        )
+        |> then(fn :ok -> :ok end)
 
       conn = signed_get("/_matrix/federation/v1/query/profile?user_id=#{URI.encode(user_id)}")
       assert conn.status == 200
@@ -525,7 +627,11 @@ defmodule AxonWeb.FederationControllerTest do
     end
 
     test "query_profile 404s for an unknown user" do
-      conn = signed_get("/_matrix/federation/v1/query/profile?user_id=#{URI.encode(remote_user("ghost"))}")
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/query/profile?user_id=#{URI.encode(remote_user("ghost"))}"
+        )
+
       assert conn.status == 404
     end
   end
@@ -568,7 +674,9 @@ defmodule AxonWeb.FederationControllerTest do
     end
 
     test "get_user_devices 404s for a non-local user" do
-      conn = signed_get("/_matrix/federation/v1/user/devices/#{URI.encode(remote_user("notlocal"))}")
+      conn =
+        signed_get("/_matrix/federation/v1/user/devices/#{URI.encode(remote_user("notlocal"))}")
+
       assert conn.status == 404
     end
 

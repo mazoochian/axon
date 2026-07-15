@@ -4,10 +4,14 @@ defmodule AxonCore.Schema.UserProfile do
 
   @primary_key {:user_id, :string, autogenerate: false}
   schema "user_profiles" do
-    field :displayname, :string
-    field :avatar_url, :string
+    field(:displayname, :string)
+    field(:avatar_url, :string)
 
-    belongs_to :user, AxonCore.Schema.User, foreign_key: :user_id, references: :user_id, define_field: false
+    belongs_to(:user, AxonCore.Schema.User,
+      foreign_key: :user_id,
+      references: :user_id,
+      define_field: false
+    )
 
     timestamps(type: :utc_datetime_usec)
   end

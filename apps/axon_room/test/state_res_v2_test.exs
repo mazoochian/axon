@@ -25,7 +25,13 @@ defmodule AxonRoom.StateResV2Test do
     event
   end
 
-  defp get_event_fn(store), do: fn id -> case :ets.lookup(store, id) do [{^id, e}] -> e; [] -> nil end end
+  defp get_event_fn(store),
+    do: fn id ->
+      case :ets.lookup(store, id) do
+        [{^id, e}] -> e
+        [] -> nil
+      end
+    end
 
   defp create_event do
     %{
@@ -106,7 +112,9 @@ defmodule AxonRoom.StateResV2Test do
     set_a = %{{"m.room.create", ""} => create}
     set_b = %{{"m.room.create", ""} => create}
 
-    assert StateResV2.resolve([set_a, set_b], fn _ -> nil end) == %{{"m.room.create", ""} => create}
+    assert StateResV2.resolve([set_a, set_b], fn _ -> nil end) == %{
+             {"m.room.create", ""} => create
+           }
   end
 
   # ---------------------------------------------------------------------------
@@ -120,7 +128,12 @@ defmodule AxonRoom.StateResV2Test do
       joined = put_event(store, member_event("$m1", @alice, "join", 1, [create["event_id"]]))
       # Grants alice (state_default is otherwise 50, users default 0) enough
       # power to send state events, so her topic changes pass AuthRules.check.
-      pl = put_event(store, pl_event("$pl0", @creator, 1, [create["event_id"]], %{@creator => 100, @alice => 50}))
+      pl =
+        put_event(
+          store,
+          pl_event("$pl0", @creator, 1, [create["event_id"]], %{@creator => 100, @alice => 50})
+        )
+
       unconflicted = %{
         {"m.room.create", ""} => create,
         {"m.room.member", @alice} => joined,
@@ -132,8 +145,17 @@ defmodule AxonRoom.StateResV2Test do
 
     test "resolves to exactly one of two conflicting topic events, both authorized",
          %{store: store, create: create, joined: joined, unconflicted: unconflicted} do
-      topic_a = put_event(store, topic_event("$ta", @alice, 2, [create["event_id"], joined["event_id"]], "Topic A"))
-      topic_b = put_event(store, topic_event("$tb", @alice, 3, [create["event_id"], joined["event_id"]], "Topic B"))
+      topic_a =
+        put_event(
+          store,
+          topic_event("$ta", @alice, 2, [create["event_id"], joined["event_id"]], "Topic A")
+        )
+
+      topic_b =
+        put_event(
+          store,
+          topic_event("$tb", @alice, 3, [create["event_id"], joined["event_id"]], "Topic B")
+        )
 
       set_a = Map.put(unconflicted, {"m.room.topic", ""}, topic_a)
       set_b = Map.put(unconflicted, {"m.room.topic", ""}, topic_b)
@@ -143,7 +165,8 @@ defmodule AxonRoom.StateResV2Test do
       winner = resolved[{"m.room.topic", ""}]
       assert winner["event_id"] in ["$ta", "$tb"]
       # Deterministic: re-resolving the same input always yields the same winner.
-      assert StateResV2.resolve([set_a, set_b], get_event_fn(store))[{"m.room.topic", ""}] == winner
+      assert StateResV2.resolve([set_a, set_b], get_event_fn(store))[{"m.room.topic", ""}] ==
+               winner
     end
 
     test "an event that fails the auth check is never the resolved winner",
@@ -151,8 +174,17 @@ defmodule AxonRoom.StateResV2Test do
       # A topic event from a user who was never a member of the room — always
       # fails AuthRules.check (not_joined) regardless of ordering, so the
       # *other* conflicting candidate must win instead.
-      valid_topic = put_event(store, topic_event("$tv", @alice, 2, [create["event_id"], joined["event_id"]], "Valid"))
-      invalid_topic = put_event(store, topic_event("$ti", "@intruder:localhost", 5, [create["event_id"]], "Invalid"))
+      valid_topic =
+        put_event(
+          store,
+          topic_event("$tv", @alice, 2, [create["event_id"], joined["event_id"]], "Valid")
+        )
+
+      invalid_topic =
+        put_event(
+          store,
+          topic_event("$ti", "@intruder:localhost", 5, [create["event_id"]], "Invalid")
+        )
 
       set_a = Map.put(unconflicted, {"m.room.topic", ""}, valid_topic)
       set_b = Map.put(unconflicted, {"m.room.topic", ""}, invalid_topic)
@@ -161,9 +193,19 @@ defmodule AxonRoom.StateResV2Test do
       assert resolved[{"m.room.topic", ""}]["event_id"] == "$tv"
     end
 
-    test "if neither conflicting candidate passes the auth check, the key is simply absent from the result", %{store: store, create: create} do
-      bad1 = put_event(store, topic_event("$b1", "@intruder1:localhost", 1, [create["event_id"]], "Bad1"))
-      bad2 = put_event(store, topic_event("$b2", "@intruder2:localhost", 2, [create["event_id"]], "Bad2"))
+    test "if neither conflicting candidate passes the auth check, the key is simply absent from the result",
+         %{store: store, create: create} do
+      bad1 =
+        put_event(
+          store,
+          topic_event("$b1", "@intruder1:localhost", 1, [create["event_id"]], "Bad1")
+        )
+
+      bad2 =
+        put_event(
+          store,
+          topic_event("$b2", "@intruder2:localhost", 2, [create["event_id"]], "Bad2")
+        )
 
       unconflicted = %{{"m.room.create", ""} => create}
       set_a = Map.put(unconflicted, {"m.room.topic", ""}, bad1)
@@ -178,12 +220,24 @@ defmodule AxonRoom.StateResV2Test do
     test "resolves to exactly one of the conflicting power_levels events" do
       store = events_store()
       create = put_event(store, create_event())
-      creator_joined = put_event(store, member_event("$mc", @creator, "join", 1, [create["event_id"]]))
 
-      pl_a = put_event(store, pl_event("$pla", @creator, 2, [create["event_id"]], %{@creator => 100}))
-      pl_b = put_event(store, pl_event("$plb", @creator, 3, [create["event_id"]], %{@creator => 100, @alice => 50}))
+      creator_joined =
+        put_event(store, member_event("$mc", @creator, "join", 1, [create["event_id"]]))
 
-      unconflicted = %{{"m.room.create", ""} => create, {"m.room.member", @creator} => creator_joined}
+      pl_a =
+        put_event(store, pl_event("$pla", @creator, 2, [create["event_id"]], %{@creator => 100}))
+
+      pl_b =
+        put_event(
+          store,
+          pl_event("$plb", @creator, 3, [create["event_id"]], %{@creator => 100, @alice => 50})
+        )
+
+      unconflicted = %{
+        {"m.room.create", ""} => create,
+        {"m.room.member", @creator} => creator_joined
+      }
+
       set_a = Map.put(unconflicted, {"m.room.power_levels", ""}, pl_a)
       set_b = Map.put(unconflicted, {"m.room.power_levels", ""}, pl_b)
 

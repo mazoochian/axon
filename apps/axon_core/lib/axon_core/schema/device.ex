@@ -4,13 +4,17 @@ defmodule AxonCore.Schema.Device do
 
   @primary_key false
   schema "devices" do
-    field :device_id, :string
-    field :user_id, :string
-    field :display_name, :string
-    field :last_seen_ts, :integer
-    field :last_seen_ip, :string
+    field(:device_id, :string)
+    field(:user_id, :string)
+    field(:display_name, :string)
+    field(:last_seen_ts, :integer)
+    field(:last_seen_ip, :string)
 
-    belongs_to :user, AxonCore.Schema.User, foreign_key: :user_id, references: :user_id, define_field: false
+    belongs_to(:user, AxonCore.Schema.User,
+      foreign_key: :user_id,
+      references: :user_id,
+      define_field: false
+    )
 
     timestamps(type: :utc_datetime_usec)
   end

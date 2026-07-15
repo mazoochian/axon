@@ -7,12 +7,15 @@ defmodule AxonWeb.SearchControllerTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -20,8 +23,17 @@ defmodule AxonWeb.SearchControllerTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
-  defp jpu(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
+  defp jpu(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts \\ %{}) do
@@ -32,13 +44,23 @@ defmodule AxonWeb.SearchControllerTest do
 
   defp send_message(token, room_id, body) do
     txn = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn}", %{"msgtype" => "m.text", "body" => body})
+
+    conn =
+      authed(token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn}", %{
+        "msgtype" => "m.text",
+        "body" => body
+      })
+
     assert conn.status == 200
     decode(conn)["event_id"]
   end
 
   defp search(token, term, extra \\ %{}) do
-    body = %{"search_categories" => %{"room_events" => Map.merge(%{"search_term" => term}, extra)}}
+    body = %{
+      "search_categories" => %{"room_events" => Map.merge(%{"search_term" => term}, extra)}
+    }
+
     authed(token) |> jp("/_matrix/client/v3/search", body)
   end
 
@@ -69,7 +91,11 @@ defmodule AxonWeb.SearchControllerTest do
 
   test "missing search_term is a required-param error" do
     alice = register("alice_#{System.unique_integer([:positive])}")
-    conn = authed(alice.token) |> jp("/_matrix/client/v3/search", %{"search_categories" => %{"room_events" => %{}}})
+
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/search", %{"search_categories" => %{"room_events" => %{}}})
+
     assert conn.status == 400
     assert decode(conn)["errcode"] == "M_MISSING_PARAM"
   end

@@ -11,12 +11,15 @@ defmodule AxonWeb.RoomUpgradeTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -24,7 +27,13 @@ defmodule AxonWeb.RoomUpgradeTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts \\ %{}) do
@@ -42,7 +51,10 @@ defmodule AxonWeb.RoomUpgradeTest do
     alice = register("alice_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token, %{"name" => "Old Room", "preset" => "public_chat"})
 
-    conn = authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "10"})
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "10"})
+
     assert conn.status == 200
     new_room_id = decode(conn)["replacement_room"]
     assert new_room_id != room_id
@@ -70,7 +82,10 @@ defmodule AxonWeb.RoomUpgradeTest do
     bob = register("bob_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token)
 
-    conn = authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "10"})
+    conn =
+      authed(bob.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "10"})
+
     assert conn.status == 403
     assert decode(conn)["errcode"] == "M_FORBIDDEN"
   end
@@ -83,7 +98,10 @@ defmodule AxonWeb.RoomUpgradeTest do
     join_conn = authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
     assert join_conn.status == 200
 
-    conn = authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "10"})
+    conn =
+      authed(bob.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "10"})
+
     assert conn.status == 403
     assert decode(conn)["errcode"] == "M_FORBIDDEN"
   end
@@ -92,7 +110,10 @@ defmodule AxonWeb.RoomUpgradeTest do
     alice = register("alice_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token)
 
-    conn = authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "999"})
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "999"})
+
     assert conn.status == 400
     assert decode(conn)["errcode"] == "M_UNSUPPORTED_ROOM_VERSION"
   end

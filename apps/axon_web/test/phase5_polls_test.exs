@@ -17,12 +17,15 @@ defmodule AxonWeb.Phase5PollsTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -30,8 +33,17 @@ defmodule AxonWeb.Phase5PollsTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
-  defp jpu(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
+  defp jpu(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts) do
@@ -42,7 +54,10 @@ defmodule AxonWeb.Phase5PollsTest do
 
   defp send_event(token, room_id, type, content) do
     txn_id = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/#{type}/#{txn_id}", content)
+
+    conn =
+      authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/#{type}/#{txn_id}", content)
+
     assert conn.status == 200
     decode(conn)["event_id"]
   end
@@ -57,7 +72,10 @@ defmodule AxonWeb.Phase5PollsTest do
     alice = register("alice_#{System.unique_integer([:positive])}")
     bob = register("bob_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token, %{"preset" => "public_chat"})
-    assert authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{}) |> Map.get(:status) == 200
+
+    assert authed(bob.token)
+           |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+           |> Map.get(:status) == 200
 
     poll_id =
       send_event(alice.token, room_id, "m.poll.start", %{
@@ -87,7 +105,12 @@ defmodule AxonWeb.Phase5PollsTest do
     poll_event = get_event(alice.token, room_id, poll_id)
     assert get_in(poll_event, ["unsigned", "m.relations", "m.reference", "count"]) == 2
 
-    conn = authed(alice.token) |> get("/_matrix/client/v1/rooms/#{room_id}/relations/#{poll_id}/m.reference/m.poll.response")
+    conn =
+      authed(alice.token)
+      |> get(
+        "/_matrix/client/v1/rooms/#{room_id}/relations/#{poll_id}/m.reference/m.poll.response"
+      )
+
     assert conn.status == 200
     body = decode(conn)
     ids = Enum.map(body["chunk"], & &1["event_id"])

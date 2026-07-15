@@ -44,7 +44,8 @@ defmodule AxonWeb.Oidc do
   def introspect(raw_token) do
     with true <- enabled?(),
          {:ok, meta} <- metadata(),
-         introspection_endpoint when is_binary(introspection_endpoint) <- meta["introspection_endpoint"],
+         introspection_endpoint when is_binary(introspection_endpoint) <-
+           meta["introspection_endpoint"],
          {:ok, %{"active" => true} = claims} <- do_introspect(introspection_endpoint, raw_token),
          {:ok, device_id} <- extract_device_id(claims, raw_token),
          true <- has_api_scope?(claims),
@@ -53,7 +54,9 @@ defmodule AxonWeb.Oidc do
       subject = claims["sub"] || localpart
 
       case UserStore.authenticate_via_oidc(subject, localpart, device_id, server_name) do
-        {:ok, result} -> {:ok, result}
+        {:ok, result} ->
+          {:ok, result}
+
         {:error, reason} ->
           Logger.warning("OIDC introspection ok but provisioning failed: #{inspect(reason)}")
           :error
@@ -64,7 +67,10 @@ defmodule AxonWeb.Oidc do
   end
 
   defp do_introspect(introspection_endpoint, raw_token) do
-    headers = [{"content-type", "application/x-www-form-urlencoded"}, {"accept", "application/json"}]
+    headers = [
+      {"content-type", "application/x-www-form-urlencoded"},
+      {"accept", "application/json"}
+    ]
 
     {headers, body} =
       case config()[:client_auth_method] do
@@ -161,6 +167,7 @@ defmodule AxonWeb.Oidc do
   end
 
   defp sanitize_localpart(nil), do: nil
+
   defp sanitize_localpart(sub) do
     sub |> to_string() |> String.downcase() |> String.replace(~r/[^a-z0-9._=\-\/]/, "_")
   end

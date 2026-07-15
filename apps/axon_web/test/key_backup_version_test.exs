@@ -16,12 +16,15 @@ defmodule AxonWeb.KeyBackupVersionTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -29,7 +32,13 @@ defmodule AxonWeb.KeyBackupVersionTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_version(token) do
@@ -43,8 +52,8 @@ defmodule AxonWeb.KeyBackupVersionTest do
   test "consecutive backup version creations succeed with distinct versions" do
     alice = register("alice_#{System.unique_integer([:positive])}")
 
-    v1 = create_version(alice.token) |> tap(&(assert &1.status == 200)) |> decode()
-    v2 = create_version(alice.token) |> tap(&(assert &1.status == 200)) |> decode()
+    v1 = create_version(alice.token) |> tap(&assert &1.status == 200) |> decode()
+    v2 = create_version(alice.token) |> tap(&assert &1.status == 200) |> decode()
 
     assert v1["version"] != v2["version"]
   end
@@ -52,7 +61,7 @@ defmodule AxonWeb.KeyBackupVersionTest do
   test "version generation survives a simulated node restart without colliding" do
     alice = register("alice_#{System.unique_integer([:positive])}")
 
-    v1 = create_version(alice.token) |> tap(&(assert &1.status == 200)) |> decode()
+    v1 = create_version(alice.token) |> tap(&assert &1.status == 200) |> decode()
 
     # Simulate what used to happen after a BEAM restart: System.unique_integer/1
     # would restart counting from 1, potentially re-issuing a version number
@@ -65,8 +74,6 @@ defmodule AxonWeb.KeyBackupVersionTest do
     assert String.to_integer(v2["version"]) > String.to_integer(v1["version"])
 
     # And the row actually persisted under the returned version (no silent drop).
-    assert Repo.exists?(
-             from(v in "room_key_backup_versions", where: v.version == ^v2["version"])
-           )
+    assert Repo.exists?(from(v in "room_key_backup_versions", where: v.version == ^v2["version"]))
   end
 end

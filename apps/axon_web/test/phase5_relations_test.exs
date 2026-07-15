@@ -9,12 +9,15 @@ defmodule AxonWeb.Phase5RelationsTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -22,8 +25,17 @@ defmodule AxonWeb.Phase5RelationsTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
-  defp jpu(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
+  defp jpu(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts \\ %{}) do
@@ -34,13 +46,19 @@ defmodule AxonWeb.Phase5RelationsTest do
 
   defp send_event(token, room_id, type, content) do
     txn_id = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/#{type}/#{txn_id}", content)
+
+    conn =
+      authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/#{type}/#{txn_id}", content)
+
     assert conn.status == 200
     decode(conn)["event_id"]
   end
 
   defp send_state(token, room_id, type, state_key, content) do
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/#{type}/#{state_key}", content)
+    conn =
+      authed(token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/#{type}/#{state_key}", content)
+
     assert conn.status == 200
     decode(conn)["event_id"]
   end
@@ -56,14 +74,20 @@ defmodule AxonWeb.Phase5RelationsTest do
       alice = register("alice_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token)
 
-      msg_id = send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "hi"})
+      msg_id =
+        send_event(alice.token, room_id, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => "hi"
+        })
 
       send_event(alice.token, room_id, "m.reaction", %{
         "m.relates_to" => %{"rel_type" => "m.annotation", "event_id" => msg_id, "key" => "👍"}
       })
+
       send_event(alice.token, room_id, "m.reaction", %{
         "m.relates_to" => %{"rel_type" => "m.annotation", "event_id" => msg_id, "key" => "👍"}
       })
+
       send_event(alice.token, room_id, "m.reaction", %{
         "m.relates_to" => %{"rel_type" => "m.annotation", "event_id" => msg_id, "key" => "🎉"}
       })
@@ -79,7 +103,11 @@ defmodule AxonWeb.Phase5RelationsTest do
       alice = register("alice_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token)
 
-      msg_id = send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "hi"})
+      msg_id =
+        send_event(alice.token, room_id, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => "hi"
+        })
 
       reaction_id =
         send_event(alice.token, room_id, "m.reaction", %{
@@ -99,7 +127,11 @@ defmodule AxonWeb.Phase5RelationsTest do
       alice = register("alice_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token)
 
-      root_id = send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "root"})
+      root_id =
+        send_event(alice.token, room_id, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => "root"
+        })
 
       send_event(alice.token, room_id, "m.room.message", %{
         "msgtype" => "m.text",

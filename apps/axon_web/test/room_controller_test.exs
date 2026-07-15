@@ -12,12 +12,15 @@ defmodule AxonWeb.RoomControllerTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -25,8 +28,17 @@ defmodule AxonWeb.RoomControllerTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
-  defp jpu(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
+  defp jpu(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts) do
@@ -47,10 +59,18 @@ defmodule AxonWeb.RoomControllerTest do
       room_id = create_room(alice.token, %{"preset" => "public_chat"})
       join(bob.token, room_id)
 
-      conn = authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id, "reason" => "spamming"})
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{
+          "user_id" => bob.user_id,
+          "reason" => "spamming"
+        })
+
       assert conn.status == 200
 
-      members_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/members?membership=leave")
+      members_conn =
+        authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/members?membership=leave")
+
       assert Enum.any?(decode(members_conn)["chunk"], &(&1["state_key"] == bob.user_id))
     end
 
@@ -62,7 +82,10 @@ defmodule AxonWeb.RoomControllerTest do
       join(bob.token, room_id)
       join(charlie.token, room_id)
 
-      conn = authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => charlie.user_id})
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => charlie.user_id})
+
       assert conn.status in [400, 403]
     end
   end
@@ -74,13 +97,22 @@ defmodule AxonWeb.RoomControllerTest do
       room_id = create_room(alice.token, %{"preset" => "public_chat"})
       join(bob.token, room_id)
 
-      ban_conn = authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/ban", %{"user_id" => bob.user_id, "reason" => "rule violation"})
+      ban_conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/ban", %{
+          "user_id" => bob.user_id,
+          "reason" => "rule violation"
+        })
+
       assert ban_conn.status == 200
 
       rejoin_conn = authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})
       assert rejoin_conn.status == 403
 
-      unban_conn = authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/unban", %{"user_id" => bob.user_id})
+      unban_conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/unban", %{"user_id" => bob.user_id})
+
       assert unban_conn.status == 200
 
       rejoin_conn2 = authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})
@@ -95,11 +127,17 @@ defmodule AxonWeb.RoomControllerTest do
       room_id =
         create_room(alice.token, %{
           "name" => "Knockable Room",
-          "initial_state" => [%{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}]
+          "initial_state" => [
+            %{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}
+          ]
         })
 
       bob = register("bob_#{System.unique_integer([:positive])}")
-      conn = authed(bob.token) |> jp("/_matrix/client/v3/knock/#{room_id}", %{"reason" => "let me in please"})
+
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/knock/#{room_id}", %{"reason" => "let me in please"})
+
       assert conn.status == 200
       assert decode(conn)["room_id"] == room_id
     end
@@ -132,9 +170,13 @@ defmodule AxonWeb.RoomControllerTest do
       bob = register("bob_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token, %{"preset" => "public_chat"})
       join(bob.token, room_id)
-      authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
 
-      conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/members?membership=join")
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
+
+      conn =
+        authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/members?membership=join")
+
       state_keys = decode(conn)["chunk"] |> Enum.map(& &1["state_key"])
       assert alice.user_id in state_keys
       refute bob.user_id in state_keys
@@ -164,7 +206,13 @@ defmodule AxonWeb.RoomControllerTest do
       alice = register("alice_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token, %{})
 
-      conn = authed(alice.token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/typing/#{alice.user_id}", %{"typing" => true, "timeout" => 30_000})
+      conn =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/rooms/#{room_id}/typing/#{alice.user_id}", %{
+          "typing" => true,
+          "timeout" => 30_000
+        })
+
       assert conn.status == 200
       assert decode(conn) == %{}
     end

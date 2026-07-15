@@ -21,14 +21,21 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
   setup do
     start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
     KeyCache.clear()
-    Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:#{@port}"})
+
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:#{@port}"
+    })
+
     on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
     :ok
   end
 
   defp new_local_user(prefix) do
     localpart = "#{prefix}_#{System.unique_integer([:positive])}"
-    {:ok, %{user_id: user_id}} = AxonCore.UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
+    {:ok, %{user_id: user_id}} =
+      AxonCore.UserStore.register(localpart, "Test1234!", server_name: "localhost")
+
     user_id
   end
 
@@ -56,36 +63,60 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
 
   defp wait_until(fun, retries \\ 50) do
     case fun.() do
-      nil when retries > 0 -> Process.sleep(20); wait_until(fun, retries - 1)
-      false when retries > 0 -> Process.sleep(20); wait_until(fun, retries - 1)
-      result -> result
+      nil when retries > 0 ->
+        Process.sleep(20)
+        wait_until(fun, retries - 1)
+
+      false when retries > 0 ->
+        Process.sleep(20)
+        wait_until(fun, retries - 1)
+
+      result ->
+        result
     end
   end
 
   test "full lifecycle: remote joins, messages flow both directions, remote leaves" do
     owner = new_local_user("owner")
-    {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat", name: "Federated Room")
+
+    {:ok, room_id} =
+      CreateRoom.execute(owner,
+        server_name: "localhost",
+        preset: "public_chat",
+        name: "Federated Room"
+      )
+
     remote_member = remote_user("member")
 
     # --- Remote joins via make_join/send_join ---
-    make_join_conn = signed_get("/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(remote_member)}")
+    make_join_conn =
+      signed_get(
+        "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(remote_member)}"
+      )
+
     assert make_join_conn.status == 200
     template = decode(make_join_conn)["event"]
 
     join_event =
-      signed_remote_event(Map.merge(template, %{
-        "event_id" => "$join_#{System.unique_integer([:positive])}",
-        "origin_server_ts" => System.os_time(:millisecond)
-      }))
+      signed_remote_event(
+        Map.merge(template, %{
+          "event_id" => "$join_#{System.unique_integer([:positive])}",
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+      )
 
     send_join_conn =
-      signed_put("/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}", join_event)
+      signed_put(
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}",
+        join_event
+      )
 
     assert send_join_conn.status == 200
     assert EventStore.get_membership(room_id, remote_member) == {:ok, "join"}
 
     # --- A local message fans out to the now-remote member via FederationFanout ---
-    {:ok, local_event_id} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "hello from axon"})
+    {:ok, local_event_id} =
+      RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "hello from axon"})
 
     fanned_out =
       wait_until(fn ->
@@ -130,18 +161,27 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
     assert new_last_event_id == inbound_pdu["event_id"]
 
     # --- The remote member leaves via make_leave/send_leave ---
-    make_leave_conn = signed_get("/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(remote_member)}")
+    make_leave_conn =
+      signed_get(
+        "/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(remote_member)}"
+      )
+
     assert make_leave_conn.status == 200
     leave_template = decode(make_leave_conn)["event"]
 
     leave_event =
-      signed_remote_event(Map.merge(leave_template, %{
-        "event_id" => "$leave_#{System.unique_integer([:positive])}",
-        "origin_server_ts" => System.os_time(:millisecond)
-      }))
+      signed_remote_event(
+        Map.merge(leave_template, %{
+          "event_id" => "$leave_#{System.unique_integer([:positive])}",
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+      )
 
     send_leave_conn =
-      signed_put("/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}", leave_event)
+      signed_put(
+        "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}",
+        leave_event
+      )
 
     assert send_leave_conn.status == 200
     assert EventStore.get_membership(room_id, remote_member) == {:ok, "leave"}

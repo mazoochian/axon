@@ -21,12 +21,15 @@ defmodule AxonWeb.StateResolverTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -34,7 +37,13 @@ defmodule AxonWeb.StateResolverTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts) do
@@ -59,7 +68,10 @@ defmodule AxonWeb.StateResolverTest do
     alice = register("alice_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token, %{"preset" => "public_chat"})
     bob = register("bob_#{System.unique_integer([:positive])}")
-    assert authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{}) |> Map.get(:status) == 200
+
+    assert authed(bob.token)
+           |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+           |> Map.get(:status) == 200
 
     {:ok, create_event} = EventStore.get_state_event(room_id, "m.room.create", "")
     {:ok, old_pl_event} = EventStore.get_state_event(room_id, "m.room.power_levels", "")
@@ -69,9 +81,17 @@ defmodule AxonWeb.StateResolverTest do
 
     # A legitimate power_levels change granting bob elevated power — this
     # becomes the room's real, accepted head.
-    new_pl_content = Map.put(old_pl_event.content, "users", Map.put(old_pl_event.content["users"] || %{}, bob.user_id, 60))
+    new_pl_content =
+      Map.put(
+        old_pl_event.content,
+        "users",
+        Map.put(old_pl_event.content["users"] || %{}, bob.user_id, 60)
+      )
+
     assert {:ok, _pl_change_id} =
-             RoomProcess.send_event(room_id, alice.user_id, "m.room.power_levels", new_pl_content, state_key: "")
+             RoomProcess.send_event(room_id, alice.user_id, "m.room.power_levels", new_pl_content,
+               state_key: ""
+             )
 
     {head1, _depth1} = RoomProcess.get_position(room_id)
     assert head1 != head0
@@ -100,7 +120,12 @@ defmodule AxonWeb.StateResolverTest do
     resolved = StateResolver.resolve_for_auth_check(pdu_b, current_state)
 
     pl_resolved = resolved[{"m.room.power_levels", ""}]
-    assert pl_resolved["event_id"] in [old_pl_event.event_id, current_state[{"m.room.power_levels", ""}]["event_id"]]
+
+    assert pl_resolved["event_id"] in [
+             old_pl_event.event_id,
+             current_state[{"m.room.power_levels", ""}]["event_id"]
+           ]
+
     assert resolved[{"m.room.create", ""}]["event_id"] == create_event.event_id
 
     resolved_again = StateResolver.resolve_for_auth_check(pdu_b, current_state)
@@ -113,12 +138,20 @@ defmodule AxonWeb.StateResolverTest do
 
     {:ok, create_event} = EventStore.get_state_event(room_id, "m.room.create", "")
     {:ok, pl_event} = EventStore.get_state_event(room_id, "m.room.power_levels", "")
-    {:ok, alice_member_event} = EventStore.get_state_event(room_id, "m.room.member", alice.user_id)
+
+    {:ok, alice_member_event} =
+      EventStore.get_state_event(room_id, "m.room.member", alice.user_id)
 
     {head0, depth0} = RoomProcess.get_position(room_id)
 
     assert {:ok, _} =
-             RoomProcess.send_event(room_id, alice.user_id, "m.room.topic", %{"topic" => "unrelated change"}, state_key: "")
+             RoomProcess.send_event(
+               room_id,
+               alice.user_id,
+               "m.room.topic",
+               %{"topic" => "unrelated change"},
+               state_key: ""
+             )
 
     forking_pdu = %{
       "event_id" => "$branchC_#{System.unique_integer([:positive])}:remote.example",

@@ -32,9 +32,9 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
 
   alias AxonCrypto.{CanonicalJSON, EventHash, KeyServer}
 
-  plug Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: Jason
-  plug :match
-  plug :dispatch
+  plug(Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: Jason)
+  plug(:match)
+  plug(:dispatch)
 
   # ---------------------------------------------------------------------------
   # Supervision
@@ -111,7 +111,12 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
     destination = Application.get_env(:axon_web, :server_name, "localhost")
 
     signable =
-      %{"method" => method, "uri" => path, "origin" => s.server_name, "destination" => destination}
+      %{
+        "method" => method,
+        "uri" => path,
+        "origin" => s.server_name,
+        "destination" => destination
+      }
       |> maybe_add_content(body)
       |> CanonicalJSON.encode_to_binary()
 
@@ -162,7 +167,8 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
 
     put_response(
       port,
-      {"GET", ~r{^/_matrix/federation/v1/make_join/#{Regex.escape(URI.encode(room_id))}/#{Regex.escape(URI.encode(user_id))}}},
+      {"GET",
+       ~r{^/_matrix/federation/v1/make_join/#{Regex.escape(URI.encode(room_id))}/#{Regex.escape(URI.encode(user_id))}}},
       200,
       %{"event" => template, "room_version" => room_version}
     )
@@ -194,7 +200,8 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
 
     put_response(
       port,
-      {"GET", ~r{^/_matrix/federation/v1/make_knock/#{Regex.escape(URI.encode(room_id))}/#{Regex.escape(URI.encode(user_id))}}},
+      {"GET",
+       ~r{^/_matrix/federation/v1/make_knock/#{Regex.escape(URI.encode(room_id))}/#{Regex.escape(URI.encode(user_id))}}},
       200,
       %{"event" => template, "room_version" => room_version}
     )
@@ -229,7 +236,10 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
   end
 
   defp handle_builtin(conn) do
-    send_json(conn, 404, %{"errcode" => "M_NOT_FOUND", "error" => "no canned response registered for this route"})
+    send_json(conn, 404, %{
+      "errcode" => "M_NOT_FOUND",
+      "error" => "no canned response registered for this route"
+    })
   end
 
   defp find_override(conn) do
@@ -266,7 +276,12 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
       "verify_keys" => %{s.key_id => %{"key" => public_key_b64}}
     }
 
-    sig_bytes = :crypto.sign(:eddsa, :none, CanonicalJSON.encode_to_binary(unsigned_doc), [s.private_key, :ed25519])
+    sig_bytes =
+      :crypto.sign(:eddsa, :none, CanonicalJSON.encode_to_binary(unsigned_doc), [
+        s.private_key,
+        :ed25519
+      ])
+
     sig_b64 = Base.encode64(sig_bytes, padding: false)
 
     Map.merge(unsigned_doc, %{

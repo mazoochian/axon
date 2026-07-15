@@ -64,9 +64,11 @@ defmodule AxonWeb.AppService.Manager do
   @impl true
   def handle_info({:new_event, room_id, event_map}, state) do
     registrations = list_registrations()
+
     if registrations != [] do
       Task.start(fn -> do_dispatch(event_map, room_id, registrations) end)
     end
+
     {:noreply, state}
   end
 
@@ -92,12 +94,15 @@ defmodule AxonWeb.AppService.Manager do
           {:ok, list} when is_list(list) ->
             Logger.info("Loaded #{length(list)} app service registration(s) from #{path}")
             list
+
           {:error, reason} ->
             Logger.warning("Failed to parse #{path}: #{inspect(reason)}")
             []
         end
+
       {:error, :enoent} ->
         []
+
       {:error, reason} ->
         Logger.warning("Failed to read #{path}: #{inspect(reason)}")
         []
@@ -127,6 +132,7 @@ defmodule AxonWeb.AppService.Manager do
   end
 
   defp regex_match?(nil, _), do: false
+
   defp regex_match?(pattern, string) do
     case Regex.compile(pattern) do
       {:ok, re} -> Regex.match?(re, string)
@@ -139,22 +145,26 @@ defmodule AxonWeb.AppService.Manager do
     hs_token = reg["hs_token"]
     txn_id = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
 
-    body = Jason.encode!(%{
-      "events" => [Map.put(event, "room_id", event["room_id"] || room_id)]
-    })
+    body =
+      Jason.encode!(%{
+        "events" => [Map.put(event, "room_id", event["room_id"] || room_id)]
+      })
 
-    req = Finch.build(
-      :put,
-      "#{url}/_matrix/app/v1/transactions/#{txn_id}",
-      [{"content-type", "application/json"}, {"authorization", "Bearer #{hs_token}"}],
-      body
-    )
+    req =
+      Finch.build(
+        :put,
+        "#{url}/_matrix/app/v1/transactions/#{txn_id}",
+        [{"content-type", "application/json"}, {"authorization", "Bearer #{hs_token}"}],
+        body
+      )
 
     case Finch.request(req, Axon.Finch, receive_timeout: 10_000) do
       {:ok, %Finch.Response{status: status}} when status in 200..299 ->
         :ok
+
       {:ok, %Finch.Response{status: status}} ->
         Logger.warning("AppService #{reg["id"]} returned #{status} for txn #{txn_id}")
+
       {:error, reason} ->
         Logger.warning("AppService #{reg["id"]} delivery failed: #{inspect(reason)}")
     end

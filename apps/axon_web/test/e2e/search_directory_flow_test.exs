@@ -21,6 +21,7 @@ defmodule AxonWeb.E2E.SearchDirectoryFlowTest do
     stranger = register("stranger_#{System.unique_integer([:positive])}")
 
     unique = "zorkspace#{System.unique_integer([:positive])}"
+
     room_id =
       create_room(alice.token, %{
         "preset" => "public_chat",
@@ -29,7 +30,13 @@ defmodule AxonWeb.E2E.SearchDirectoryFlowTest do
       })
 
     room_alias = "##{unique}:localhost"
-    alias_conn = authed(alice.token) |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{"room_id" => room_id})
+
+    alias_conn =
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{
+        "room_id" => room_id
+      })
+
     assert alias_conn.status == 200
 
     # --- dana discovers the room via publicRooms, by name ---
@@ -40,16 +47,27 @@ defmodule AxonWeb.E2E.SearchDirectoryFlowTest do
     assert Enum.any?(decode(directory_conn)["chunk"], &(&1["room_id"] == room_id))
 
     # --- dana also discovers alice herself via the user directory ---
-    ud_conn = authed(dana.token) |> jp("/_matrix/client/v3/user_directory/search", %{"search_term" => "alice_"})
+    ud_conn =
+      authed(dana.token)
+      |> jp("/_matrix/client/v3/user_directory/search", %{"search_term" => "alice_"})
+
     assert Enum.any?(decode(ud_conn)["results"], &(&1["user_id"] == alice.user_id))
 
     # --- dana joins by ALIAS, not room_id ---
-    join_conn = authed(dana.token) |> jp("/_matrix/client/v3/join/#{encode_alias(room_alias)}", %{})
+    join_conn =
+      authed(dana.token) |> jp("/_matrix/client/v3/join/#{encode_alias(room_alias)}", %{})
+
     assert join_conn.status == 200
     assert decode(join_conn)["room_id"] == room_id
 
     unique_phrase = "findme#{System.unique_integer([:positive])}"
-    message_event_id = send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "#{unique_phrase} secrets"})
+
+    message_event_id =
+      send_event(alice.token, room_id, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "#{unique_phrase} secrets"
+      })
+
     assert is_binary(message_event_id)
 
     # --- dana (now joined) can find the message via search ---
@@ -76,7 +94,9 @@ defmodule AxonWeb.E2E.SearchDirectoryFlowTest do
     refute Enum.any?(decode(after_conn)["chunk"], &(&1["room_id"] == room_id))
 
     # --- but the alias itself still resolves (unpublishing != removing the alias) ---
-    resolve_conn = build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+    resolve_conn =
+      build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+
     assert resolve_conn.status == 200
     assert decode(resolve_conn)["room_id"] == room_id
   end
