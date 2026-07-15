@@ -21,3 +21,11 @@ erl_crash.dump
 
 # Local runtime logs
 *.log
+
+# Local secrets (see .env.example)
+.env
+
+# e2e-client (Playwright + Element Web harness)
+e2e-client/node_modules/
+e2e-client/test-results/
+e2e-client/playwright-report/

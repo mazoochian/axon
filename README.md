@@ -123,20 +123,35 @@ The server is now listening at `http://localhost:8008`. You can point any Matrix
 | `DB_HOST` | `localhost` | PostgreSQL host |
 | `DB_PORT` | `5432` | PostgreSQL port |
 | `DB_USER` | `axon` | PostgreSQL user |
-| `DB_PASS` | `axon` | PostgreSQL password |
+| `DB_PASS` | `axon` (dev/test only) | PostgreSQL password. **Required in production** — the release refuses to boot without it |
 | `DB_NAME` | `axon_prod` | PostgreSQL database name |
 | `POOL_SIZE` | `20` | Ecto connection pool size |
-| `SECRET_KEY_BASE` | *(generated)* | 64-byte Phoenix secret key — **set this in production** |
+| `SECRET_KEY_BASE` | *none* | 64-byte Phoenix secret key. **Required in production** — the release refuses to boot without it (generate with `openssl rand -hex 32`) |
+| `SENTRY_DSN` | *unset* | Optional. Enables crash reporting via [Sentry](https://sentry.io) when set; the app runs normally without it |
 
 ## Deploying with Docker
 
-### Build the image
+The repo has two Dockerfiles for two different purposes: `complement/Dockerfile` bundles its own throwaway Postgres and mints an ephemeral secret at boot, purpose-built for the [Complement](#compliance-testing) test harness — don't use it for a real deployment. The root `Dockerfile` is the production-oriented one: it runs as a non-root user, ships a `HEALTHCHECK`, expects Postgres and all secrets from the environment, and never auto-runs migrations on boot.
+
+### Quick start with Docker Compose
 
 ```bash
-docker build -f complement/Dockerfile -t axon:latest .
+cp .env.example .env
+# edit .env: set DB_PASS and SECRET_KEY_BASE (openssl rand -hex 32), etc.
+
+docker compose run --rm migrate   # run once, and again after every deploy that adds migrations
+docker compose up -d axon
 ```
 
-### Run
+This builds the root `Dockerfile`, starts a `postgres` service with a persistent volume, and starts `axon` on ports 8008 (CS API) and 8448 (federation) once Postgres is healthy.
+
+### Build the image manually
+
+```bash
+docker build -t axon:latest .
+```
+
+### Run manually (external Postgres)
 
 ```bash
 docker run -d \
@@ -151,6 +166,8 @@ docker run -d \
   -p 8448:8448 \
   axon:latest
 ```
+
+Run migrations once before starting traffic: `docker run --rm <same -e flags> axon:latest /axon/bin/axon eval "AxonCore.Release.migrate()"`.
 
 ### Building a production release
 
@@ -240,6 +257,14 @@ _matrix-fed._tcp.example.com. 3600 IN SRV 10 5 8448 matrix.example.com.
 certbot certonly --nginx -d matrix.example.com
 ```
 
+## Observability
+
+- `GET /health` — liveness probe, always 200 while the process is up. Used by the Docker image's `HEALTHCHECK`.
+- `GET /ready` — readiness probe, 503 if the database is unreachable.
+- `/_synapse/admin/dashboard` — [Phoenix LiveDashboard](https://github.com/phoenixframework/phoenix_live_dashboard) (Phoenix/Ecto/VM metrics, live process/ETS inspection). Gated by the same admin auth as the rest of `/_synapse/admin` — visit with `?access_token=<an admin user's token>`.
+- Set `SENTRY_DSN` to enable crash reporting; unset, the app runs normally with no error tracking.
+- Structured `Logger` metadata (`request_id`, `user_id`, `room_id`) is attached automatically once a request is authenticated/scoped to a room.
+
 ## Testing with Matrix clients
 
 Any Matrix client can connect to Axon today:
@@ -288,6 +313,10 @@ COMPLEMENT_BASE_IMAGE=axon-complement:latest \
 ### Current results
 
 The last full Complement run (37/50 CS API tests) predates Phases 3–7 and is stale — most of its 13 failures (media, presence, search) are in areas that have since been built out. Re-run the suite above for current numbers.
+
+### Real-client end-to-end tests
+
+Complement and `apps/axon_web/test/e2e/*.exs` are both black-box but drive raw HTTP against the Matrix API, not an actual client. `e2e-client/` instead drives real [Element Web](https://github.com/element-hq/element-web) instances with [Playwright](https://playwright.dev/) — two at once, so they can message each other — to catch the kind of bug that only shows up when the server is used in practice. See `e2e-client/README.md`. Runs nightly/on-demand in CI (`.github/workflows/e2e-client.yml`), not on every PR, since it's much slower than the rest of the suite.
 
 ## Media storage
 
