@@ -1,6 +1,8 @@
 defmodule AxonWeb.SyncController do
   use Phoenix.Controller, formats: [:json]
 
+  plug(AxonWeb.Plug.RateLimit, [bucket: :sync, key_by: :user] when action == :sync)
+
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
   alias AxonSync.Manager, as: SyncManager

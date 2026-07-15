@@ -3,6 +3,13 @@ defmodule AxonWeb.MediaController do
 
   require Logger
 
+  plug(AxonWeb.Plug.RateLimit, [bucket: :media_upload, key_by: :user] when action == :upload)
+
+  plug(
+    AxonWeb.Plug.RateLimit,
+    [bucket: :url_preview, key_by: :user] when action == :url_preview
+  )
+
   alias AxonMedia.{Store, Thumbnailer}
 
   # POST /_matrix/media/v3/upload  (also /_matrix/client/v3/media/upload)
