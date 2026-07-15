@@ -8,9 +8,9 @@ defmodule AxonPush.FakePusherGateway do
   use Plug.Router
   use Agent
 
-  plug Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: Jason
-  plug :match
-  plug :dispatch
+  plug(Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: Jason)
+  plug(:match)
+  plug(:dispatch)
 
   def child_spec(opts) do
     port = Keyword.fetch!(opts, :port)
@@ -27,8 +27,14 @@ defmodule AxonPush.FakePusherGateway do
 
     Supervisor.start_link(
       [
-        %{id: agent_name(port), start: {Agent, :start_link, [fn -> [] end, [name: agent_name(port)]]}},
-        %{id: {:bandit, port}, start: {Bandit, :start_link, [[plug: __MODULE__, ip: {127, 0, 0, 1}, port: port]]}}
+        %{
+          id: agent_name(port),
+          start: {Agent, :start_link, [fn -> [] end, [name: agent_name(port)]]}
+        },
+        %{
+          id: {:bandit, port},
+          start: {Bandit, :start_link, [[plug: __MODULE__, ip: {127, 0, 0, 1}, port: port]]}
+        }
       ],
       strategy: :one_for_all,
       name: :"#{inspect(__MODULE__)}.Supervisor#{port}"

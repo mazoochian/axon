@@ -9,7 +9,7 @@ defmodule AxonWeb.SpaceController do
 
   use Phoenix.Controller, formats: [:json]
 
-  action_fallback AxonWeb.FallbackController
+  action_fallback(AxonWeb.FallbackController)
 
   import Ecto.Query
 
@@ -26,7 +26,9 @@ defmodule AxonWeb.SpaceController do
     limit = parse_int(params["limit"], @default_limit)
 
     if not accessible?(room_id, user_id) do
-      conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found or not accessible"})
+      conn
+      |> put_status(404)
+      |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found or not accessible"})
     else
       rooms = walk(room_id, user_id, max_depth, limit, suggested_only)
       json(conn, %{"rooms" => rooms})
@@ -34,22 +36,26 @@ defmodule AxonWeb.SpaceController do
   end
 
   defp parse_int(nil, default), do: default
+
   defp parse_int(v, default) when is_binary(v) do
     case Integer.parse(v) do
       {n, _} -> n
       :error -> default
     end
   end
+
   defp parse_int(v, _default) when is_integer(v), do: v
 
   defp walk(root_room_id, user_id, max_depth, limit, suggested_only) do
     walk([{root_room_id, 0}], MapSet.new(), [], user_id, max_depth, limit, suggested_only)
   end
 
-  defp walk([], _visited, acc, _user_id, _max_depth, _limit, _suggested_only), do: Enum.reverse(acc)
-
-  defp walk(_queue, _visited, acc, _user_id, _max_depth, limit, _suggested_only) when length(acc) >= limit,
+  defp walk([], _visited, acc, _user_id, _max_depth, _limit, _suggested_only),
     do: Enum.reverse(acc)
+
+  defp walk(_queue, _visited, acc, _user_id, _max_depth, limit, _suggested_only)
+       when length(acc) >= limit,
+       do: Enum.reverse(acc)
 
   defp walk([{room_id, depth} | rest], visited, acc, user_id, max_depth, limit, suggested_only) do
     cond do
@@ -87,9 +93,11 @@ defmodule AxonWeb.SpaceController do
 
   defp is_member?(room_id, user_id) do
     Repo.one(
-      from m in "room_memberships",
-        where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership in ["join", "invite"],
+      from(m in "room_memberships",
+        where:
+          m.room_id == ^room_id and m.user_id == ^user_id and m.membership in ["join", "invite"],
         select: 1
+      )
     ) != nil
   end
 
@@ -102,10 +110,12 @@ defmodule AxonWeb.SpaceController do
 
   defp current_state_map(room_id, types) do
     Repo.all(
-      from s in "current_room_state",
-        join: e in "events", on: e.event_id == s.event_id,
+      from(s in "current_room_state",
+        join: e in "events",
+        on: e.event_id == s.event_id,
         where: s.room_id == ^room_id and s.type in ^types,
         select: %{type: s.type, content: e.content}
+      )
     )
     |> Enum.into(%{}, fn r -> {r.type, r.content} end)
   end
@@ -114,10 +124,17 @@ defmodule AxonWeb.SpaceController do
     # m.space.child with empty content means "removed" — exclude those.
     rows =
       Repo.all(
-        from s in "current_room_state",
-          join: e in "events", on: e.event_id == s.event_id,
+        from(s in "current_room_state",
+          join: e in "events",
+          on: e.event_id == s.event_id,
           where: s.room_id == ^room_id and s.type == "m.space.child",
-          select: %{state_key: s.state_key, content: e.content, sender: e.sender, origin_server_ts: e.origin_server_ts}
+          select: %{
+            state_key: s.state_key,
+            content: e.content,
+            sender: e.sender,
+            origin_server_ts: e.origin_server_ts
+          }
+        )
       )
       |> Enum.reject(&(&1.content == %{} or &1.content == nil))
 
@@ -152,14 +169,18 @@ defmodule AxonWeb.SpaceController do
 
     num_joined =
       Repo.one(
-        from m in "room_memberships",
+        from(m in "room_memberships",
           where: m.room_id == ^room_id and m.membership == "join",
           select: count(m.user_id)
+        )
       ) || 0
 
     room_type = get_in(state, ["m.room.create", "type"])
     guest_access = get_in(state, ["m.room.guest_access", "guest_access"]) || "forbidden"
-    history_visibility = get_in(state, ["m.room.history_visibility", "history_visibility"]) || "shared"
+
+    history_visibility =
+      get_in(state, ["m.room.history_visibility", "history_visibility"]) || "shared"
+
     join_rule = get_in(state, ["m.room.join_rules", "join_rule"]) || "invite"
 
     entry = %{

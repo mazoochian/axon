@@ -10,9 +10,9 @@ defmodule AxonWeb.FakeOidcServer do
 
   use Plug.Router
 
-  plug :match
-  plug Plug.Parsers, parsers: [:urlencoded], pass: ["*/*"]
-  plug :dispatch
+  plug(:match)
+  plug(Plug.Parsers, parsers: [:urlencoded], pass: ["*/*"])
+  plug(:dispatch)
 
   @valid_token "fake-as-valid-token"
   @valid_token_no_device_scope "fake-as-valid-token-no-device-scope"
@@ -29,6 +29,7 @@ defmodule AxonWeb.FakeOidcServer do
 
   def child_spec(opts) do
     port = Keyword.fetch!(opts, :port)
+
     %{
       id: {__MODULE__, port},
       start: {Bandit, :start_link, [[plug: __MODULE__, ip: {127, 0, 0, 1}, port: port]]}
@@ -60,7 +61,8 @@ defmodule AxonWeb.FakeOidcServer do
           "active" => true,
           "sub" => "oidc-subject-abc123",
           "username" => "alice_oidc",
-          "scope" => "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:OIDCDEV1"
+          "scope" =>
+            "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:OIDCDEV1"
         })
 
       @valid_token_no_device_scope ->

@@ -22,22 +22,57 @@ defmodule AxonPush.DispatcherTest do
     Repo.insert_all(
       "users",
       [
-        %{user_id: @sender, localpart: "alice", is_guest: false, deactivated: false, admin: false, inserted_at: now, updated_at: now},
-        %{user_id: @recipient, localpart: "bob", is_guest: false, deactivated: false, admin: false, inserted_at: now, updated_at: now}
+        %{
+          user_id: @sender,
+          localpart: "alice",
+          is_guest: false,
+          deactivated: false,
+          admin: false,
+          inserted_at: now,
+          updated_at: now
+        },
+        %{
+          user_id: @recipient,
+          localpart: "bob",
+          is_guest: false,
+          deactivated: false,
+          admin: false,
+          inserted_at: now,
+          updated_at: now
+        }
       ],
       on_conflict: :nothing
     )
 
     Repo.insert_all(
       "rooms",
-      [%{room_id: @room, version: "10", creator: @sender, is_public: false, inserted_at: now, updated_at: now}],
+      [
+        %{
+          room_id: @room,
+          version: "10",
+          creator: @sender,
+          is_public: false,
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
       on_conflict: :nothing
     )
 
     for u <- [@sender, @recipient] do
       Repo.insert_all(
         "room_memberships",
-        [%{room_id: @room, user_id: u, membership: "join", event_id: "$#{System.unique_integer([:positive])}", sender: u, inserted_at: now, updated_at: now}],
+        [
+          %{
+            room_id: @room,
+            user_id: u,
+            membership: "join",
+            event_id: "$#{System.unique_integer([:positive])}",
+            sender: u,
+            inserted_at: now,
+            updated_at: now
+          }
+        ],
         on_conflict: {:replace, [:membership]},
         conflict_target: [:room_id, :user_id]
       )
@@ -81,7 +116,13 @@ defmodule AxonPush.DispatcherTest do
   test "dispatches an HTTP push to a registered pusher for a matching event" do
     register_pusher(@recipient)
 
-    event = %{"event_id" => "$abc", "type" => "m.room.message", "sender" => @sender, "content" => %{"msgtype" => "m.text", "body" => "hello"}}
+    event = %{
+      "event_id" => "$abc",
+      "type" => "m.room.message",
+      "sender" => @sender,
+      "content" => %{"msgtype" => "m.text", "body" => "hello"}
+    }
+
     Dispatcher.dispatch_event(event, @room)
 
     [payload] = wait_for_delivery()
@@ -95,7 +136,13 @@ defmodule AxonPush.DispatcherTest do
   test "never pushes to the sender of the event" do
     register_pusher(@sender)
 
-    event = %{"event_id" => "$xyz", "type" => "m.room.message", "sender" => @sender, "content" => %{"msgtype" => "m.text", "body" => "hi"}}
+    event = %{
+      "event_id" => "$xyz",
+      "type" => "m.room.message",
+      "sender" => @sender,
+      "content" => %{"msgtype" => "m.text", "body" => "hi"}
+    }
+
     Dispatcher.dispatch_event(event, @room)
 
     # Give the fire-and-forget task a moment; nothing should ever arrive.
@@ -106,7 +153,13 @@ defmodule AxonPush.DispatcherTest do
   test "does not dispatch for a muted event type (m.notice suppressed by default rules)" do
     register_pusher(@recipient)
 
-    event = %{"event_id" => "$n1", "type" => "m.room.message", "sender" => @sender, "content" => %{"msgtype" => "m.notice", "body" => "automated"}}
+    event = %{
+      "event_id" => "$n1",
+      "type" => "m.room.message",
+      "sender" => @sender,
+      "content" => %{"msgtype" => "m.notice", "body" => "automated"}
+    }
+
     Dispatcher.dispatch_event(event, @room)
 
     Process.sleep(100)
@@ -114,7 +167,13 @@ defmodule AxonPush.DispatcherTest do
   end
 
   test "a recipient with no registered pusher never gets an HTTP request" do
-    event = %{"event_id" => "$np", "type" => "m.room.message", "sender" => @sender, "content" => %{"msgtype" => "m.text", "body" => "hi"}}
+    event = %{
+      "event_id" => "$np",
+      "type" => "m.room.message",
+      "sender" => @sender,
+      "content" => %{"msgtype" => "m.text", "body" => "hi"}
+    }
+
     Dispatcher.dispatch_event(event, @room)
 
     Process.sleep(100)
@@ -141,7 +200,13 @@ defmodule AxonPush.DispatcherTest do
       on_conflict: :nothing
     )
 
-    event = %{"event_id" => "$d1", "type" => "m.room.message", "sender" => @sender, "content" => %{"msgtype" => "m.text", "body" => "hi"}}
+    event = %{
+      "event_id" => "$d1",
+      "type" => "m.room.message",
+      "sender" => @sender,
+      "content" => %{"msgtype" => "m.text", "body" => "hi"}
+    }
+
     Dispatcher.dispatch_event(event, @room)
 
     Process.sleep(100)

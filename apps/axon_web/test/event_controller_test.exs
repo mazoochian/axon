@@ -7,12 +7,15 @@ defmodule AxonWeb.EventControllerTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -20,8 +23,17 @@ defmodule AxonWeb.EventControllerTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
-  defp jpu(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
+  defp jpu(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts \\ %{"preset" => "public_chat"}) do
@@ -32,7 +44,11 @@ defmodule AxonWeb.EventControllerTest do
 
   defp send_message(token, room_id) do
     txn = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn}", %{"body" => "hi"})
+
+    conn =
+      authed(token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn}", %{"body" => "hi"})
+
     assert conn.status == 200
     decode(conn)["event_id"]
   end
@@ -43,7 +59,13 @@ defmodule AxonWeb.EventControllerTest do
     event_id = send_message(alice.token, room_id)
 
     txn = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(alice.token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{"reason" => "oops"})
+
+    conn =
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{
+        "reason" => "oops"
+      })
+
     assert conn.status == 200
     assert is_binary(decode(conn)["event_id"])
   end
@@ -56,7 +78,11 @@ defmodule AxonWeb.EventControllerTest do
     event_id = send_message(bob.token, room_id)
 
     txn = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(alice.token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
+
+    conn =
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
+
     assert conn.status == 200
   end
 
@@ -83,7 +109,11 @@ defmodule AxonWeb.EventControllerTest do
     event_id = send_message(bob.token, room_id)
 
     txn = "txn_#{System.unique_integer([:positive])}"
-    conn = authed(charlie.token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
+
+    conn =
+      authed(charlie.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
+
     assert conn.status == 200
   end
 
@@ -105,7 +135,9 @@ defmodule AxonWeb.EventControllerTest do
     state_conn = authed(stranger.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state")
     assert state_conn.status == 403
 
-    state_event_conn = authed(stranger.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.create/")
+    state_event_conn =
+      authed(stranger.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.create/")
+
     assert state_event_conn.status == 403
   end
 
@@ -114,8 +146,13 @@ defmodule AxonWeb.EventControllerTest do
     room_id = create_room(alice.token, %{"preset" => "private_chat"})
     send_message(alice.token, room_id)
 
-    assert authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/messages") |> Map.get(:status) == 200
-    assert authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state") |> Map.get(:status) == 200
+    assert authed(alice.token)
+           |> get("/_matrix/client/v3/rooms/#{room_id}/messages")
+           |> Map.get(:status) == 200
+
+    assert authed(alice.token)
+           |> get("/_matrix/client/v3/rooms/#{room_id}/state")
+           |> Map.get(:status) == 200
 
     conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.create/")
     assert conn.status == 200
@@ -127,8 +164,13 @@ defmodule AxonWeb.EventControllerTest do
     event_id = send_message(alice.token, room_id)
     txn = "txn_#{System.unique_integer([:positive])}"
 
-    conn1 = authed(alice.token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
-    conn2 = authed(alice.token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
+    conn1 =
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
+
+    conn2 =
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
 
     assert decode(conn1)["event_id"] == decode(conn2)["event_id"]
   end

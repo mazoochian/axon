@@ -99,7 +99,10 @@ defmodule AxonCrypto.EventHashTest do
                EventHash.verify_signature(event, "example.com", "ed25519:abc", pub)
     end
 
-    test "signature is invalidated if event content changes", %{public_key: pub, private_key: priv} do
+    test "signature is invalidated if event content changes", %{
+      public_key: pub,
+      private_key: priv
+    } do
       event = %{"type" => "m.room.message", "content" => %{"body" => "original"}}
       signed = EventHash.sign_event(event, "example.com", "ed25519:abc", priv)
 

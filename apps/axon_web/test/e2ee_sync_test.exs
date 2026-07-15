@@ -18,12 +18,15 @@ defmodule AxonWeb.E2EESyncTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -45,7 +48,11 @@ defmodule AxonWeb.E2EESyncTest do
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp sync(token, since \\ nil) do
-    path = if since, do: "/_matrix/client/v3/sync?since=#{since}&timeout=0", else: "/_matrix/client/v3/sync?timeout=0"
+    path =
+      if since,
+        do: "/_matrix/client/v3/sync?since=#{since}&timeout=0",
+        else: "/_matrix/client/v3/sync?timeout=0"
+
     conn = authed(token) |> get(path)
     assert conn.status == 200
     decode(conn)
@@ -70,6 +77,7 @@ defmodule AxonWeb.E2EESyncTest do
           "curve25519:OTK2" => %{"key" => "otk2_#{device_id}"}
         }
       })
+
     assert conn.status == 200
     conn
   end
@@ -82,6 +90,7 @@ defmodule AxonWeb.E2EESyncTest do
         "invite" => [invitee_user_id],
         "preset" => "private_chat"
       })
+
     assert conn.status == 200
     decode(conn)["room_id"]
   end
@@ -103,16 +112,19 @@ defmodule AxonWeb.E2EESyncTest do
       # Alice sends a to-device message to Bob
       conn =
         authed(alice.token)
-        |> jpu("/_matrix/client/v3/sendToDevice/m.room.encrypted/txn#{System.unique_integer()}", %{
-          "messages" => %{
-            bob.user_id => %{
-              bob.device_id => %{
-                "algorithm" => "m.olm.v1.curve25519-aes-sha2",
-                "ciphertext" => "encrypted_payload_for_bob"
+        |> jpu(
+          "/_matrix/client/v3/sendToDevice/m.room.encrypted/txn#{System.unique_integer()}",
+          %{
+            "messages" => %{
+              bob.user_id => %{
+                bob.device_id => %{
+                  "algorithm" => "m.olm.v1.curve25519-aes-sha2",
+                  "ciphertext" => "encrypted_payload_for_bob"
+                }
               }
             }
           }
-        })
+        )
 
       assert conn.status == 200
 
@@ -142,13 +154,16 @@ defmodule AxonWeb.E2EESyncTest do
       # Bob has only one device in this test — just confirm message targets that device
       conn =
         authed(alice.token)
-        |> jpu("/_matrix/client/v3/sendToDevice/m.key.verification.request/txn#{System.unique_integer()}", %{
-          "messages" => %{
-            bob1.user_id => %{
-              bob1.device_id => %{"from_device" => alice.device_id, "methods" => ["m.sas.v1"]}
+        |> jpu(
+          "/_matrix/client/v3/sendToDevice/m.key.verification.request/txn#{System.unique_integer()}",
+          %{
+            "messages" => %{
+              bob1.user_id => %{
+                bob1.device_id => %{"from_device" => alice.device_id, "methods" => ["m.sas.v1"]}
+              }
             }
           }
-        })
+        )
 
       assert conn.status == 200
 

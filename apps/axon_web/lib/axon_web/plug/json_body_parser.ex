@@ -18,7 +18,10 @@ defmodule AxonWeb.Plug.JsonBodyParser do
     _e in Plug.Parsers.ParseError ->
       conn
       |> put_resp_content_type("application/json")
-      |> send_resp(400, Jason.encode!(%{"errcode" => "M_NOT_JSON", "error" => "Request body is not valid JSON"}))
+      |> send_resp(
+        400,
+        Jason.encode!(%{"errcode" => "M_NOT_JSON", "error" => "Request body is not valid JSON"})
+      )
       |> halt()
   end
 end

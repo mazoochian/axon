@@ -7,12 +7,15 @@ defmodule AxonWeb.DirectoryControllerTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -20,8 +23,17 @@ defmodule AxonWeb.DirectoryControllerTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
-  defp jpu(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
+  defp jpu(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts) do
@@ -39,7 +51,13 @@ defmodule AxonWeb.DirectoryControllerTest do
   describe "publicRooms" do
     test "lists a room published to the directory" do
       alice = register("alice_#{System.unique_integer([:positive])}")
-      room_id = create_room(alice.token, %{"preset" => "public_chat", "name" => "Public Room", "visibility" => "public"})
+
+      room_id =
+        create_room(alice.token, %{
+          "preset" => "public_chat",
+          "name" => "Public Room",
+          "visibility" => "public"
+        })
 
       conn = authed(alice.token) |> get("/_matrix/client/v3/publicRooms")
       assert conn.status == 200
@@ -59,7 +77,13 @@ defmodule AxonWeb.DirectoryControllerTest do
     test "search filter matches on room name" do
       alice = register("alice_#{System.unique_integer([:positive])}")
       unique = "Zorblaxx#{System.unique_integer([:positive])}"
-      room_id = create_room(alice.token, %{"preset" => "public_chat", "name" => unique, "visibility" => "public"})
+
+      room_id =
+        create_room(alice.token, %{
+          "preset" => "public_chat",
+          "name" => unique,
+          "visibility" => "public"
+        })
 
       conn =
         authed(alice.token)
@@ -101,10 +125,17 @@ defmodule AxonWeb.DirectoryControllerTest do
       room_id = create_room(alice.token, %{})
       room_alias = "#testalias#{System.unique_integer([:positive])}:localhost"
 
-      put_conn = authed(alice.token) |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{"room_id" => room_id})
+      put_conn =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{
+          "room_id" => room_id
+        })
+
       assert put_conn.status == 200
 
-      get_conn = build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+      get_conn =
+        build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+
       assert get_conn.status == 200
       assert decode(get_conn)["room_id"] == room_id
     end
@@ -113,7 +144,10 @@ defmodule AxonWeb.DirectoryControllerTest do
       alice = register("alice_#{System.unique_integer([:positive])}")
       room_alias = "#noroomid#{System.unique_integer([:positive])}:localhost"
 
-      conn = authed(alice.token) |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{})
+      conn =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{})
+
       assert conn.status == 400
     end
 
@@ -135,7 +169,11 @@ defmodule AxonWeb.DirectoryControllerTest do
       alice = register("alice_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token, %{})
       room_alias = "#listtest#{System.unique_integer([:positive])}:localhost"
-      authed(alice.token) |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{"room_id" => room_id})
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{
+        "room_id" => room_id
+      })
 
       conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/aliases")
       assert conn.status == 200
@@ -146,12 +184,21 @@ defmodule AxonWeb.DirectoryControllerTest do
       alice = register("alice_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token, %{})
       room_alias = "#deletetest#{System.unique_integer([:positive])}:localhost"
-      authed(alice.token) |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{"room_id" => room_id})
 
-      del_conn = authed(alice.token) |> delete("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{
+        "room_id" => room_id
+      })
+
+      del_conn =
+        authed(alice.token)
+        |> delete("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+
       assert del_conn.status == 200
 
-      get_conn = build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+      get_conn =
+        build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+
       assert get_conn.status == 404
     end
 
@@ -160,17 +207,28 @@ defmodule AxonWeb.DirectoryControllerTest do
       bob = register("bob_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token, %{preset: "public_chat"})
       room_alias = "#protectedalias#{System.unique_integer([:positive])}:localhost"
-      authed(alice.token) |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{"room_id" => room_id})
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{
+        "room_id" => room_id
+      })
 
       authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})
 
-      del_conn = authed(bob.token) |> delete("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+      del_conn =
+        authed(bob.token)
+        |> delete("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+
       assert del_conn.status == 403
     end
 
     test "deleting an unknown alias 404s" do
       alice = register("alice_#{System.unique_integer([:positive])}")
-      conn = authed(alice.token) |> delete("/_matrix/client/v3/directory/room/%23doesnotexist:localhost")
+
+      conn =
+        authed(alice.token)
+        |> delete("/_matrix/client/v3/directory/room/%23doesnotexist:localhost")
+
       assert conn.status == 404
     end
   end

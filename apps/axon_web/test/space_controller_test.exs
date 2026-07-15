@@ -10,12 +10,15 @@ defmodule AxonWeb.SpaceControllerTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -23,8 +26,17 @@ defmodule AxonWeb.SpaceControllerTest do
   end
 
   defp authed(token), do: build_conn() |> put_req_header("authorization", "Bearer #{token}")
-  defp jp(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
-  defp jpu(conn, path, body), do: conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
+  defp jp(conn, path, body),
+    do:
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
+
+  defp jpu(conn, path, body),
+    do:
+      conn |> put_req_header("content-type", "application/json") |> put(path, Jason.encode!(body))
+
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
   defp create_room(token, opts) do
@@ -35,7 +47,11 @@ defmodule AxonWeb.SpaceControllerTest do
 
   defp add_child(token, space_id, child_id, extra_content \\ %{}) do
     content = Map.merge(%{"via" => ["localhost"]}, extra_content)
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{space_id}/state/m.space.child/#{child_id}", content)
+
+    conn =
+      authed(token)
+      |> jpu("/_matrix/client/v3/rooms/#{space_id}/state/m.space.child/#{child_id}", content)
+
     assert conn.status == 200
   end
 
@@ -65,7 +81,9 @@ defmodule AxonWeb.SpaceControllerTest do
     add_child(alice.token, top, suggested_child, %{"suggested" => true})
     add_child(alice.token, top, plain_child, %{"suggested" => false})
 
-    conn = authed(alice.token) |> get("/_matrix/client/v1/rooms/#{top}/hierarchy?suggested_only=true")
+    conn =
+      authed(alice.token) |> get("/_matrix/client/v1/rooms/#{top}/hierarchy?suggested_only=true")
+
     room_ids = decode(conn)["rooms"] |> Enum.map(& &1["room_id"])
     assert suggested_child in room_ids
     refute plain_child in room_ids

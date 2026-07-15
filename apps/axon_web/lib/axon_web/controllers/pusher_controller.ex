@@ -10,7 +10,7 @@ defmodule AxonWeb.PusherController do
 
     pushers =
       Repo.all(
-        from p in "pushers",
+        from(p in "pushers",
           where: p.user_id == ^user_id,
           select: %{
             kind: p.kind,
@@ -22,6 +22,7 @@ defmodule AxonWeb.PusherController do
             data: p.data,
             enabled: p.enabled
           }
+        )
       )
       |> Enum.map(fn p ->
         %{
@@ -51,9 +52,11 @@ defmodule AxonWeb.PusherController do
       # Deletion: kind nil or empty, or append=false with empty pushkey
       is_nil(kind) or kind == "" ->
         Repo.delete_all(
-          from p in "pushers",
+          from(p in "pushers",
             where: p.user_id == ^user_id and p.app_id == ^app_id and p.pushkey == ^pushkey
+          )
         )
+
         json(conn, %{})
 
       pushkey == "" ->
@@ -76,7 +79,9 @@ defmodule AxonWeb.PusherController do
         }
 
         Repo.insert_all("pushers", [row],
-          on_conflict: {:replace, [:kind, :app_display_name, :device_display_name, :lang, :data, :enabled, :device_id]},
+          on_conflict:
+            {:replace,
+             [:kind, :app_display_name, :device_display_name, :lang, :data, :enabled, :device_id]},
           conflict_target: [:user_id, :app_id, :pushkey]
         )
 

@@ -3,12 +3,12 @@ defmodule AxonCore.Schema.ToDeviceMessage do
   import Ecto.Changeset
 
   schema "to_device_messages" do
-    field :sender, :string
-    field :target_user_id, :string
-    field :target_device_id, :string
-    field :type, :string
-    field :content, :map
-    field :stream_ordering, :integer
+    field(:sender, :string)
+    field(:target_user_id, :string)
+    field(:target_device_id, :string)
+    field(:type, :string)
+    field(:content, :map)
+    field(:stream_ordering, :integer)
 
     timestamps(type: :utc_datetime_usec, updated_at: false)
   end

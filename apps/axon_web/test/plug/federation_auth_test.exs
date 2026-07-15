@@ -18,7 +18,11 @@ defmodule AxonWeb.Plug.FederationAuthTest do
   setup do
     start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
     KeyCache.clear()
-    Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:#{@port}"})
+
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:#{@port}"
+    })
+
     on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
     :ok
   end
@@ -43,7 +47,11 @@ defmodule AxonWeb.Plug.FederationAuthTest do
   end
 
   test "a malformed X-Matrix header (missing required params) is rejected" do
-    conn = build_conn() |> put_req_header("authorization", "X-Matrix origin=\"#{@server_name}\"") |> get(@path)
+    conn =
+      build_conn()
+      |> put_req_header("authorization", "X-Matrix origin=\"#{@server_name}\"")
+      |> get(@path)
+
     assert conn.status == 401
   end
 
@@ -54,8 +62,10 @@ defmodule AxonWeb.Plug.FederationAuthTest do
 
   test "a request whose destination doesn't match this server's name is rejected" do
     header = FakeRemoteMatrixServer.sign_request(@port, "GET", @path)
+
     # Corrupt just the destination param, leaving a validly-formatted but wrong-destination header.
-    bad_header = String.replace(header, ~s(destination="localhost"), ~s(destination="somewhere-else.test"))
+    bad_header =
+      String.replace(header, ~s(destination="localhost"), ~s(destination="somewhere-else.test"))
 
     conn = build_conn() |> put_req_header("authorization", bad_header) |> get(@path)
     assert conn.status == 401
@@ -68,7 +78,10 @@ defmodule AxonWeb.Plug.FederationAuthTest do
   end
 
   test "an origin whose key server can't be reached is rejected" do
-    Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:1"})
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:1"
+    })
+
     header = FakeRemoteMatrixServer.sign_request(@port, "GET", @path)
 
     conn = build_conn() |> put_req_header("authorization", header) |> get(@path)

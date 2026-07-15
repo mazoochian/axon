@@ -15,7 +15,11 @@ defmodule AxonWeb.ProfileRemoteTest do
   setup do
     start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
     KeyCache.clear()
-    Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:#{@port}"})
+
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:#{@port}"
+    })
+
     on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
     :ok
   end
@@ -24,12 +28,15 @@ defmodule AxonWeb.ProfileRemoteTest do
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> post("/_matrix/client/v3/register", Jason.encode!(%{
-        "username" => username,
-        "password" => "Test1234!",
-        "kind" => "user",
-        "auth" => %{"type" => "m.login.dummy"}
-      }))
+      |> post(
+        "/_matrix/client/v3/register",
+        Jason.encode!(%{
+          "username" => username,
+          "password" => "Test1234!",
+          "kind" => "user",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+      )
 
     assert conn.status == 200
     %{token: Jason.decode!(conn.resp_body)["access_token"]}

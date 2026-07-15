@@ -13,7 +13,11 @@ defmodule AxonFederation.KeyCacheTest do
   setup do
     start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
     KeyCache.clear()
-    Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:#{@port}"})
+
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:#{@port}"
+    })
+
     on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
     :ok
   end
@@ -39,7 +43,10 @@ defmodule AxonFederation.KeyCacheTest do
   end
 
   test "an unreachable server returns nil rather than raising" do
-    Application.put_env(:axon_federation, :server_overrides, %{@server_name => "http://127.0.0.1:1"})
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:1"
+    })
+
     assert KeyCache.get_key(@server_name, "ed25519:whatever") == nil
   end
 
@@ -68,7 +75,11 @@ defmodule AxonFederation.KeyCacheTest do
     FakeRemoteMatrixServer.put_response(@port, {"GET", "/_matrix/key/v2/server"}, 200, %{
       "server_name" => "totally-different-server.example",
       "valid_until_ts" => System.os_time(:millisecond) + 60_000,
-      "verify_keys" => %{"ed25519:unverified" => %{"key" => Base.encode64(:crypto.strong_rand_bytes(32), padding: false)}},
+      "verify_keys" => %{
+        "ed25519:unverified" => %{
+          "key" => Base.encode64(:crypto.strong_rand_bytes(32), padding: false)
+        }
+      },
       "signatures" => %{}
     })
 

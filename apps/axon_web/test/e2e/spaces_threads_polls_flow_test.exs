@@ -15,7 +15,10 @@ defmodule AxonWeb.E2E.SpacesThreadsPollsFlowTest do
   import AxonWeb.TestHelpers
 
   defp send_state(token, room_id, type, state_key, content) do
-    conn = authed(token) |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/#{type}/#{state_key}", content)
+    conn =
+      authed(token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/#{type}/#{state_key}", content)
+
     assert conn.status == 200
     decode(conn)["event_id"]
   end
@@ -36,8 +39,11 @@ defmodule AxonWeb.E2E.SpacesThreadsPollsFlowTest do
         "creation_content" => %{"type" => "m.space"},
         "name" => "Community"
       })
+
     public_child = create_room(alice.token, %{"preset" => "public_chat", "name" => "General"})
-    private_child = create_room(alice.token, %{"preset" => "private_chat", "name" => "Secret Council"})
+
+    private_child =
+      create_room(alice.token, %{"preset" => "private_chat", "name" => "Secret Council"})
 
     send_state(alice.token, space_id, "m.space.child", public_child, %{"via" => ["localhost"]})
     send_state(alice.token, space_id, "m.space.child", private_child, %{"via" => ["localhost"]})
@@ -62,7 +68,11 @@ defmodule AxonWeb.E2E.SpacesThreadsPollsFlowTest do
       "m.selections" => ["owl"]
     })
 
-    thread_root_id = send_event(alice.token, public_child, "m.room.message", %{"msgtype" => "m.text", "body" => "unrelated discussion root"})
+    thread_root_id =
+      send_event(alice.token, public_child, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "unrelated discussion root"
+      })
 
     reply_id =
       send_event(alice.token, public_child, "m.room.message", %{
@@ -80,7 +90,9 @@ defmodule AxonWeb.E2E.SpacesThreadsPollsFlowTest do
     assert thread["latest_event"]["event_id"] == reply_id
 
     # --- a stranger who is a member of NEITHER the space NOR any child sees nothing in the hierarchy ---
-    stranger_hierarchy_conn = authed(stranger.token) |> get("/_matrix/client/v1/rooms/#{space_id}/hierarchy")
+    stranger_hierarchy_conn =
+      authed(stranger.token) |> get("/_matrix/client/v1/rooms/#{space_id}/hierarchy")
+
     assert stranger_hierarchy_conn.status == 200
     stranger_room_ids = decode(stranger_hierarchy_conn)["rooms"] |> Enum.map(& &1["room_id"])
     assert space_id in stranger_room_ids
@@ -92,22 +104,29 @@ defmodule AxonWeb.E2E.SpacesThreadsPollsFlowTest do
     assert join_conn.status == 200
 
     # Joining the child grants no membership in the space room itself.
-    space_members_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{space_id}/joined_members")
+    space_members_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/rooms/#{space_id}/joined_members")
+
     refute Map.has_key?(decode(space_members_conn)["joined"], stranger.user_id)
 
     # Now the stranger can see the poll/thread content directly (real room membership).
     poll_event_for_stranger = get_event(stranger.token, public_child, poll_id)
-    assert get_in(poll_event_for_stranger, ["unsigned", "m.relations", "m.reference", "count"]) == 1
+
+    assert get_in(poll_event_for_stranger, ["unsigned", "m.relations", "m.reference", "count"]) ==
+             1
 
     relations_conn =
-      authed(stranger.token) |> get("/_matrix/client/v1/rooms/#{public_child}/relations/#{thread_root_id}/m.thread")
+      authed(stranger.token)
+      |> get("/_matrix/client/v1/rooms/#{public_child}/relations/#{thread_root_id}/m.thread")
 
     assert relations_conn.status == 200
     thread_event_ids = decode(relations_conn)["chunk"] |> Enum.map(& &1["event_id"])
     assert reply_id in thread_event_ids
 
     # But the private child remains inaccessible.
-    private_event_conn = authed(stranger.token) |> get("/_matrix/client/v3/rooms/#{private_child}/messages")
+    private_event_conn =
+      authed(stranger.token) |> get("/_matrix/client/v3/rooms/#{private_child}/messages")
+
     assert private_event_conn.status == 403
   end
 end

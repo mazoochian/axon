@@ -19,7 +19,10 @@ defmodule AxonWeb.Plug.FederationAuth do
     case parse_auth_header(conn) do
       {:ok, origin, destination, key_id, sig_b64} ->
         if destination != local_server do
-          Logger.warning("FederationAuth: wrong destination #{destination} (expected #{local_server})")
+          Logger.warning(
+            "FederationAuth: wrong destination #{destination} (expected #{local_server})"
+          )
+
           error(conn, "Wrong destination")
         else
           case verify_signature(conn, origin, destination, key_id, sig_b64) do
@@ -27,7 +30,10 @@ defmodule AxonWeb.Plug.FederationAuth do
               assign(conn, :origin_server, origin)
 
             {:error, reason} ->
-              Logger.warning("FederationAuth: signature invalid from #{origin}: #{inspect(reason)}")
+              Logger.warning(
+                "FederationAuth: signature invalid from #{origin}: #{inspect(reason)}"
+              )
+
               error(conn, "Signature verification failed")
           end
         end

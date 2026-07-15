@@ -9,8 +9,7 @@ config :axon_core, AxonCore.Repo,
 
 config :axon_web, AxonWeb.Endpoint,
   server: true,
-  secret_key_base:
-    System.get_env("SECRET_KEY_BASE") || String.duplicate("a", 64)
+  secret_key_base: System.get_env("SECRET_KEY_BASE") || String.duplicate("a", 64)
 
 config :axon_web,
   server_name: System.get_env("AXON_SERVER_NAME", System.get_env("SERVER_NAME", "localhost"))
