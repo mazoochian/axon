@@ -53,6 +53,9 @@ services:
       postgres:
         condition: service_healthy
     environment: *axon_env
+    ports:
+      - "8008:8008"
+      - "8448:8448"
     profiles: ["ci"]
 
   element-web-ci:
