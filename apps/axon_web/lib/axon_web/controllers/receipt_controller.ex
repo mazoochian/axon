@@ -54,7 +54,9 @@ defmodule AxonWeb.ReceiptController do
   # in the same room sat unseen until the recipient's timeout elapsed, or
   # some unrelated event happened to touch the room) and relays m.read
   # receipts (not m.read.private, which per spec never leaves the user's own
-  # devices) to remote servers sharing the room.
+  # devices/services — federation *or* AS push) to remote servers sharing
+  # the room, and to any AS that opted into ephemeral push and is in this
+  # event's audience (see AxonWeb.AppService.Manager.dispatch_ephemeral/5).
   defp store_receipt(room_id, user_id, receipt_type, event_id, ts) do
     Repo.insert_all(
       "receipts",
@@ -73,7 +75,27 @@ defmodule AxonWeb.ReceiptController do
 
     EventStore.record_ephemeral_update(room_id)
     if receipt_type == "m.read", do: federate_receipt(room_id, user_id, event_id, ts)
+    dispatch_appservice_receipt(room_id, user_id, receipt_type, event_id, ts)
   end
+
+  # Per spec, "private receipts only for matching namespaces" — an
+  # m.read.private receipt only reaches an AS that owns the receipt's own
+  # user (dispatch_ephemeral/5's `private?: true`), never broadcast the way
+  # a public m.read receipt is to every AS bridging the room.
+  defp dispatch_appservice_receipt(room_id, user_id, receipt_type, event_id, ts)
+       when receipt_type in ["m.read", "m.read.private"] do
+    content = %{event_id => %{receipt_type => %{user_id => %{"ts" => ts}}}}
+
+    AxonWeb.AppService.Manager.dispatch_ephemeral(
+      "m.receipt",
+      room_id,
+      user_id,
+      content,
+      private?: receipt_type == "m.read.private"
+    )
+  end
+
+  defp dispatch_appservice_receipt(_room_id, _user_id, _receipt_type, _event_id, _ts), do: :ok
 
   defp federate_receipt(room_id, user_id, event_id, ts) do
     case EventStore.remote_servers_for_room(room_id) do

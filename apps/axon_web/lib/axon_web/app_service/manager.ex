@@ -33,6 +33,7 @@ defmodule AxonWeb.AppService.Manager do
         "hs_token": "...",
         "sender_localpart": "_bridge_bot",
         "rate_limited": false,
+        "receive_ephemeral": false,
         "namespaces": {
           "users": [{"exclusive": true, "regex": "@_bridge_.*"}],
           "aliases": [{"exclusive": true, "regex": "#_bridge_.*"}],
@@ -171,6 +172,82 @@ defmodule AxonWeb.AppService.Manager do
   defp query_result({:ok, :found}), do: :ok
   defp query_result(_), do: :not_found
 
+  @doc """
+  Pushes an ephemeral (`m.typing`/`m.receipt`/`m.presence`) event to every
+  registration that opted in via `receive_ephemeral: true` (default false —
+  most bridges don't want this traffic) and whose audience this event
+  falls in, per spec's "Pushing ephemeral data" section.
+
+  `room_id` is `nil` for `m.presence` (not room-scoped in the transaction
+  body itself); room-scoped kinds (`m.typing`, `m.receipt`) match a
+  registration whose `users` namespace covers `subject_user_id` (the typer,
+  or the receipt's user) *or* whose `rooms` namespace covers `room_id`.
+  `private?: true` (for `m.read.private` receipts only) narrows that to
+  *just* the user-namespace match — per spec, "private receipts only for
+  matching namespaces" — since a private receipt is meant to stay on the
+  owning user's own devices/services, not be broadcast to every AS bridging
+  the room the way a public `m.read` receipt is.
+
+  `content` is the event's `content` in Client-Server API shape (e.g. for
+  `m.typing`, `%{"user_ids" => [...]}`, matching what `/sync`'s ephemeral
+  section would carry — reusing that representation rather than the
+  federation EDU's per-change-delta shape, since this is a Client-Server
+  API-shaped push, not a federation one. `opts[:sender]`, when given, is
+  stamped onto the emitted event as `"sender"` (client-event convention) —
+  used for `m.presence`, where `subject_user_id` identifies the audience
+  but isn't otherwise present in `content`; `m.typing`/`m.receipt` already
+  carry every relevant user_id inside `content` and don't need it.
+  """
+  def dispatch_ephemeral(edu_type, room_id, subject_user_id, content, opts \\ []) do
+    private? = Keyword.get(opts, :private?, false)
+
+    registrations =
+      list_registrations()
+      |> Enum.filter(&(&1["receive_ephemeral"] == true))
+      |> Enum.filter(&ephemeral_audience_match?(&1, room_id, subject_user_id, private?))
+
+    ephemeral_event =
+      %{"type" => edu_type, "content" => content}
+      |> then(fn e -> if room_id, do: Map.put(e, "room_id", room_id), else: e end)
+      |> then(fn e ->
+        if sender = opts[:sender], do: Map.put(e, "sender", sender), else: e
+      end)
+
+    Enum.each(registrations, fn reg ->
+      AxonWeb.AppService.OutboundQueue.enqueue(reg["id"], %{
+        "events" => [],
+        "ephemeral" => [ephemeral_event]
+      })
+    end)
+  end
+
+  defp ephemeral_audience_match?(reg, _room_id, subject_user_id, true) do
+    namespace_match?(reg, :users, subject_user_id)
+  end
+
+  defp ephemeral_audience_match?(reg, nil, subject_user_id, false) do
+    # m.presence: no room in the payload itself — an AS is interested if
+    # the presence-having user is one of its own, or it bridges some room
+    # that user is currently joined to.
+    namespace_match?(reg, :users, subject_user_id) or shares_claimed_room?(reg, subject_user_id)
+  end
+
+  defp ephemeral_audience_match?(reg, room_id, subject_user_id, false) do
+    namespace_match?(reg, :users, subject_user_id) or namespace_match?(reg, :rooms, room_id)
+  end
+
+  defp shares_claimed_room?(reg, user_id) do
+    case Map.get(reg["namespaces"] || %{}, "rooms", []) do
+      [] ->
+        false
+
+      _room_ns ->
+        user_id
+        |> AxonCore.EventStore.get_joined_rooms()
+        |> Enum.any?(&namespace_match?(reg, :rooms, &1))
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -180,6 +257,12 @@ defmodule AxonWeb.AppService.Manager do
     :ets.new(@table, [:named_table, :set, :public, read_concurrency: true])
     do_reload()
     Phoenix.PubSub.subscribe(Axon.PubSub, "all_events")
+    # AxonSync.Presence broadcasts state-transition changes here (consumed
+    # for real federation by AxonWeb.FederationFanout) — subscribing here
+    # too, rather than adding an axon_web dependency to axon_sync, is how
+    # m.presence ephemeral AS push (below) learns about a change without a
+    # new cross-app coupling; PubSub happily delivers to every subscriber.
+    Phoenix.PubSub.subscribe(Axon.PubSub, "federation:fanout")
     {:ok, %{}}
   end
 
@@ -202,6 +285,12 @@ defmodule AxonWeb.AppService.Manager do
         Enum.each(regs, &AxonWeb.AppService.OutboundQueue.enqueue(&1["id"], payload))
     end
 
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:presence_changed, user_id, presence_map}, state) do
+    dispatch_ephemeral("m.presence", nil, user_id, presence_map, sender: user_id)
     {:noreply, state}
   end
 

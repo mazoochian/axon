@@ -246,14 +246,28 @@ defmodule AxonWeb.RoomController do
         Typing.start(room_id, user_id, timeout_ms)
         EventStore.record_ephemeral_update(room_id)
         federate_typing(room_id, user_id, true, timeout_ms)
+        dispatch_appservice_typing(room_id, user_id)
         json(conn, %{})
 
       true ->
         Typing.stop(room_id, user_id)
         EventStore.record_ephemeral_update(room_id)
         federate_typing(room_id, user_id, false, 0)
+        dispatch_appservice_typing(room_id, user_id)
         json(conn, %{})
     end
+  end
+
+  # AS ephemeral push (spec: "Pushing ephemeral data"), same
+  # Client-Server-API-shaped `user_ids` snapshot /sync's own m.typing
+  # ephemeral event carries — see AxonWeb.AppService.Manager.dispatch_ephemeral/5.
+  defp dispatch_appservice_typing(room_id, user_id) do
+    AppService.Manager.dispatch_ephemeral(
+      "m.typing",
+      room_id,
+      user_id,
+      %{"user_ids" => Typing.typing_user_ids(room_id)}
+    )
   end
 
   defp joined?(room_id, user_id) do
