@@ -13,9 +13,10 @@ export default defineConfig({
   use: {
     // Element Web is always published on :8080 by docker-compose.yml,
     // regardless of whether the "local" or "ci" profile started it.
-    baseURL: "http://localhost:8080",
+    baseURL: process.env.E2E_BASE_URL || "http://localhost:8080",
     trace: "retain-on-failure",
     video: "retain-on-failure",
+    screenshot: "only-on-failure",
   },
   projects: [
     {

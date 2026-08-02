@@ -4,9 +4,16 @@ set -e
 # Complement passes SERVER_NAME env var
 SERVER_NAME="${SERVER_NAME:-localhost}"
 
-# PostgreSQL 17 binary path on Debian
-PG_BIN="/usr/lib/postgresql/17/bin"
-export PGDATA=/var/lib/postgresql/17/data
+# Resolve whatever PostgreSQL major version Debian's "postgresql" apt
+# package actually pulled in at image-build time, rather than hardcoding
+# one — bookworm's default has drifted between major versions across
+# rebuilds of this image (observed both 15 and 17), and a hardcoded path
+# that no longer matches makes every container immediately exit on a
+# bare "pg_ctl: No such file or directory", which is a confusing failure
+# mode with no obvious connection to a package-version bump.
+PG_VERSION="$(ls /usr/lib/postgresql/ | sort -V | tail -1)"
+PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
+export PGDATA="/var/lib/postgresql/${PG_VERSION}/data"
 PG_LOG=/var/log/postgresql/complement.log
 
 mkdir -p "$PGDATA" /var/log/postgresql /run/postgresql

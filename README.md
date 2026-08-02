@@ -14,9 +14,10 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 ### Known gaps
 
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
-- URL preview SSRF protection blocks literal/resolved private IP ranges but doesn't pin the HTTP connection to the address it validated, so it isn't immune to DNS rebinding — see `AxonMedia.UrlPreview`'s moduledoc.
+- Third-party (3pid) invites have no actual email/SMS delivery — no identity-server integration exists, so the token has to reach the invitee out-of-band.
+- Sliding sync re-sends a full `SYNC` op per range on every request rather than diffing against a remembered session — spec-valid, just not bandwidth-optimal.
 
-See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 14 — the full roadmap as originally scoped is now complete).
+See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 15 — the roadmap as originally scoped is complete, plus a production-readiness pass).
 
 ## Why BEAM?
 

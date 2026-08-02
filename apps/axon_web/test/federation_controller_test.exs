@@ -502,6 +502,126 @@ defmodule AxonWeb.FederationControllerTest do
   end
 
   # ---------------------------------------------------------------------------
+  # send_transaction — ancestry-gap catch-up (AxonFederation.Backfill)
+  # ---------------------------------------------------------------------------
+
+  describe "PUT send_transaction/2 with an ancestry gap" do
+    test "fetches a missing single-hop ancestor via get_missing_events before applying the PDU" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      # E1 never gets sent to axon directly — it only exists on "the
+      # remote", reachable via get_missing_events — so axon starts out with
+      # a genuine gap: E2 (below) references E1, which we've never seen.
+      missing_event =
+        signed_remote_event(%{
+          "event_id" => "$gapmissing_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "the missing one"},
+          "depth" => depth + 1,
+          "prev_events" => [last_event_id],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"POST", ~r{^/_matrix/federation/v1/get_missing_events/}},
+        200,
+        %{"events" => [missing_event]}
+      )
+
+      pdu =
+        signed_remote_event(%{
+          "event_id" => "$gaphead_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "the one that arrived"},
+          "depth" => depth + 2,
+          "prev_events" => [missing_event["event_id"]],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      conn = signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [pdu], "edus" => []})
+
+      assert conn.status == 200
+
+      assert {:ok, _} = EventStore.get_event(missing_event["event_id"])
+      assert {:ok, _} = EventStore.get_event(pdu["event_id"])
+
+      {new_last_event_id, _} = RoomProcess.get_position(room_id)
+      assert new_last_event_id == pdu["event_id"]
+
+      requests = FakeRemoteMatrixServer.requests(@port)
+      assert Enum.any?(requests, &(&1.path =~ "/get_missing_events/"))
+    end
+
+    test "falls back to backfill when get_missing_events comes back empty" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      missing_event =
+        signed_remote_event(%{
+          "event_id" => "$gapbf_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "found via backfill"},
+          "depth" => depth + 1,
+          "prev_events" => [last_event_id],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"POST", ~r{^/_matrix/federation/v1/get_missing_events/}},
+        200,
+        %{"events" => []}
+      )
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/backfill/}},
+        200,
+        %{"pdus" => [missing_event]}
+      )
+
+      pdu =
+        signed_remote_event(%{
+          "event_id" => "$gapbfhead_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "head after backfill"},
+          "depth" => depth + 2,
+          "prev_events" => [missing_event["event_id"]],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      conn = signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [pdu], "edus" => []})
+
+      assert conn.status == 200
+      assert {:ok, _} = EventStore.get_event(missing_event["event_id"])
+      assert {:ok, _} = EventStore.get_event(pdu["event_id"])
+
+      requests = FakeRemoteMatrixServer.requests(@port)
+      assert Enum.any?(requests, &(&1.path =~ "/backfill/"))
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # get_event / get_state / get_state_ids / backfill / get_missing_events
   # ---------------------------------------------------------------------------
 

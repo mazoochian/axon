@@ -3,7 +3,8 @@ import Config
 config :axon_core, AxonCore.Repo,
   username: "axon",
   password: "axon",
-  hostname: "localhost",
+  hostname: System.get_env("DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("DB_PORT", "5432")),
   database: "axon_dev",
   show_sensitive_data_on_connection_error: true,
   pool_size: 10

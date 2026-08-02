@@ -50,7 +50,7 @@ defmodule AxonWeb.MixProject do
       {:jason, "~> 1.4"},
       {:horde, "~> 0.9"},
       {:libcluster, "~> 3.4"},
-      {:finch, "~> 0.19"},
+      {:finch, "~> 0.21"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.1"},
       {:telemetry, "~> 1.2"},
@@ -59,8 +59,7 @@ defmodule AxonWeb.MixProject do
       {:opentelemetry_exporter, "~> 1.8"},
       {:phoenix_live_view, "~> 1.0"},
       {:phoenix_live_dashboard, "~> 0.8"},
-      {:sentry, "~> 10.8"},
-      {:hackney, "~> 1.20"},
+      {:sentry, "~> 13.3"},
       {:mox, "~> 1.1", only: :test}
     ]
   end

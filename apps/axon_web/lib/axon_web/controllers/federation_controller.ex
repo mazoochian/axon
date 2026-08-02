@@ -12,7 +12,7 @@ defmodule AxonWeb.FederationController do
   alias AxonCore.Schema.Event
   alias AxonCrypto.{EventHash, KeyServer}
   alias AxonRoom.{RestrictedJoin, RoomProcess}
-  alias AxonFederation.KeyCache
+  alias AxonFederation.{Backfill, EventVerification}
   require Logger
 
   # ---------------------------------------------------------------------------
@@ -800,38 +800,7 @@ defmodule AxonWeb.FederationController do
     end
   end
 
-  defp verify_event_signature(event) do
-    sender_server = event["sender"] |> String.split(":") |> List.last()
-    origin = event["origin"] || sender_server
-
-    # Try to find a key_id from the event's signatures
-    key_id = get_in(event, ["signatures", origin]) |> maybe_first_key()
-
-    if is_nil(key_id) do
-      {:error, :missing_signature}
-    else
-      pub_key = KeyCache.get_key(origin, key_id)
-
-      if is_nil(pub_key) do
-        {:error, :key_not_found}
-      else
-        AxonCrypto.EventHash.verify_signature(event, origin, key_id, pub_key)
-        |> case do
-          :ok -> :ok
-          {:error, _} -> {:error, :bad_signature}
-        end
-      end
-    end
-  end
-
-  defp maybe_first_key(nil), do: nil
-
-  defp maybe_first_key(map) when is_map(map) do
-    case Map.keys(map) do
-      [] -> nil
-      [key | _] -> key
-    end
-  end
+  defp verify_event_signature(event), do: EventVerification.verify_signature(event)
 
   # See apply_knock_event/2 — must go through RoomProcess.apply_remote_event/2,
   # not a direct EventStore.insert_event, or the room's live GenServer never
@@ -856,23 +825,31 @@ defmodule AxonWeb.FederationController do
   defp process_inbound_pdu(pdu, origin) do
     room_id = pdu["room_id"]
 
-    # Basic checks
-    unless room_exists?(room_id) do
+    if room_exists?(room_id) do
+      case verify_event_signature(pdu) do
+        :ok ->
+          apply_remote_event(pdu, room_id, origin)
+
+        {:error, reason} ->
+          Logger.warning("Inbound PDU signature failed from #{origin}: #{inspect(reason)}")
+          {:error, :bad_signature}
+      end
+    else
       # Soft-fail: we don't know this room
       {:error, :unknown_room}
     end
-
-    case verify_event_signature(pdu) do
-      :ok ->
-        apply_remote_event(pdu, room_id)
-
-      {:error, reason} ->
-        Logger.warning("Inbound PDU signature failed from #{origin}: #{inspect(reason)}")
-        {:error, :bad_signature}
-    end
   end
 
-  defp apply_remote_event(pdu, room_id) do
+  # If this PDU's prev_events reference events we don't have locally (we
+  # missed a transaction, or are catching up after downtime), close that
+  # gap via AxonFederation.Backfill *before* auth-checking pdu itself —
+  # otherwise AxonRoom.StateResolver silently drops the unknown ancestor
+  # branch and auth-checks against incomplete state, which either lets a
+  # gap through with wrong resolved state or (more commonly) soft-fails
+  # the PDU for good, with no other code path ever retrying it.
+  defp apply_remote_event(pdu, room_id, origin) do
+    Backfill.catch_up(room_id, origin, pdu)
+
     case RoomProcess.apply_remote_event(room_id, pdu) do
       {:ok, _event_id} ->
         :ok
