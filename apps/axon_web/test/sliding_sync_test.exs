@@ -482,4 +482,92 @@ defmodule AxonWeb.SlidingSyncTest do
       assert typing_event["content"]["user_ids"] == [bob.user_id]
     end
   end
+
+  describe "conn_id bandwidth diffing" do
+    test "without conn_id, a repeated identical request still returns a full op and room entry" do
+      alice = register("ss_diff_nokey_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"name" => "NoKey"})
+
+      list_body = %{"lists" => %{"main" => basic_list()}}
+      pos = sliding_sync(alice.token, list_body)["pos"]
+
+      body2 = sliding_sync(alice.token, list_body, pos: pos)
+
+      assert %{"ops" => [%{"op" => "SYNC", "room_ids" => [^room_id]}]} = body2["lists"]["main"]
+      assert Map.has_key?(body2["rooms"], room_id)
+    end
+
+    test "with a conn_id, an unchanged range and room are omitted from the second response" do
+      alice = register("ss_diff_alice_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"name" => "Diff"})
+
+      list_body = %{"lists" => %{"main" => basic_list()}, "conn_id" => "conn-1"}
+      body1 = sliding_sync(alice.token, list_body)
+      pos = body1["pos"]
+
+      assert %{"ops" => [%{"op" => "SYNC", "room_ids" => [^room_id]}]} = body1["lists"]["main"]
+      assert Map.has_key?(body1["rooms"], room_id)
+
+      body2 = sliding_sync(alice.token, list_body, pos: pos)
+
+      assert %{"ops" => []} = body2["lists"]["main"]
+      refute Map.has_key?(body2["rooms"], room_id)
+    end
+
+    test "with a conn_id, a room whose content changed is still resent even though its range didn't move" do
+      alice = register("ss_diff_room_alice_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"name" => "DiffRoom"})
+
+      list_body = %{"lists" => %{"main" => basic_list()}, "conn_id" => "conn-2"}
+      pos = sliding_sync(alice.token, list_body)["pos"]
+
+      send_event(alice.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "hi"})
+
+      body2 = sliding_sync(alice.token, list_body, pos: pos)
+
+      # Only one room in range, in the same position — the range itself
+      # didn't change, so its SYNC op is skipped...
+      assert %{"ops" => []} = body2["lists"]["main"]
+      # ...but the room's own content did, so it's still resent.
+      assert Map.has_key?(body2["rooms"], room_id)
+      assert Enum.any?(body2["rooms"][room_id]["timeline"], &(&1["content"]["body"] == "hi"))
+    end
+
+    test "with a conn_id, a reordering across rooms still emits a SYNC op for the moved range" do
+      alice = register("ss_diff_reorder_#{System.unique_integer([:positive])}")
+      room_a = create_room(alice.token, %{"name" => "A"})
+      room_b = create_room(alice.token, %{"name" => "B"})
+
+      list_body = %{"lists" => %{"main" => basic_list()}, "conn_id" => "conn-3"}
+      body1 = sliding_sync(alice.token, list_body)
+      pos = body1["pos"]
+      assert %{"ops" => [%{"room_ids" => [^room_b, ^room_a]}]} = body1["lists"]["main"]
+
+      # Bump A's recency above B.
+      send_event(alice.token, room_a, "m.room.message", %{"msgtype" => "m.text", "body" => "bump"})
+
+      body2 = sliding_sync(alice.token, list_body, pos: pos)
+      assert %{"ops" => [%{"room_ids" => [^room_a, ^room_b]}]} = body2["lists"]["main"]
+    end
+
+    test "different conn_ids on the same device get independent diffing state" do
+      alice = register("ss_diff_multi_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"name" => "Multi"})
+
+      list_body_a = %{"lists" => %{"main" => basic_list()}, "conn_id" => "tab-a"}
+      pos = sliding_sync(alice.token, list_body_a)["pos"]
+
+      # Second request on tab-a: nothing changed, diffed away.
+      body_a2 = sliding_sync(alice.token, list_body_a, pos: pos)
+      assert %{"ops" => []} = body_a2["lists"]["main"]
+      refute Map.has_key?(body_a2["rooms"], room_id)
+
+      # tab-b has never been seen on this connection, even reusing the same
+      # pos token (which is connection-agnostic) — it still gets a full send.
+      list_body_b = %{"lists" => %{"main" => basic_list()}, "conn_id" => "tab-b"}
+      body_b = sliding_sync(alice.token, list_body_b, pos: pos)
+      assert %{"ops" => [%{"op" => "SYNC"}]} = body_b["lists"]["main"]
+      assert Map.has_key?(body_b["rooms"], room_id)
+    end
+  end
 end

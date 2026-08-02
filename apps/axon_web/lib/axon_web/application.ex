@@ -24,6 +24,8 @@ defmodule AxonWeb.Application do
       AxonWeb.AppService.Manager,
       # In-memory rate limiter (login/register/message-send)
       AxonWeb.RateLimiter,
+      # Per-conn_id sliding sync (MSC4186) bandwidth-diffing session cache
+      AxonWeb.SlidingSync.ConnState,
       # Cluster auto-discovery
       {Cluster.Supervisor, [topologies, [name: Axon.ClusterSupervisor]]},
       # CS API endpoint (port 8008)

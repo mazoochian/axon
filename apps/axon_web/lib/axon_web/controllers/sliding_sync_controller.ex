@@ -20,10 +20,18 @@ defmodule AxonWeb.SlidingSyncController do
       architecture already gives for free.
     * `sort` only ever behaves as `by_recency` (by each room's newest event),
       regardless of what the client requests.
-    * Every response re-sends a full `SYNC` op per range rather than diffing
-      against a remembered previous window (no `conn_id` session state is
-      kept) — correct per spec (a full re-sync is always a valid response),
-      just less bandwidth-efficient than real add/remove diffing.
+    * Bandwidth diffing against a remembered `conn_id` session
+      (`AxonWeb.SlidingSync.ConnState`): a request with no `conn_id` (or an
+      empty one) gets a full `SYNC` op per range and a full entry for every
+      visible room, every response — always spec-valid, and unchanged from
+      before this existed. A client that sends the *same* `conn_id` on
+      every request opts into diffing: a list range whose room_ids are
+      identical to what was last sent on that connection has its `SYNC` op
+      omitted entirely (the count is still reported), and a room whose full
+      entry is byte-for-byte identical to what was last sent on that
+      connection is omitted from `rooms` outright — the client already has
+      it. Session state lives in ETS, TTL-swept, so losing it just falls
+      back to a full resync on the next request.
     * Extension params aren't sticky across requests — a client must resend
       `"enabled": true` (and any config) on every request, not just the first
       time it turns an extension on.
@@ -51,6 +59,7 @@ defmodule AxonWeb.SlidingSyncController do
   alias AxonCore.{EventStore, Repo}
   alias AxonPush.{RuleEvaluator, UserRules}
   alias AxonSync.Manager, as: SyncManager
+  alias AxonWeb.SlidingSync.ConnState
   alias AxonWeb.SyncHelpers
 
   @notification_scan_cap 500
@@ -70,6 +79,19 @@ defmodule AxonWeb.SlidingSyncController do
     lists_req = params["lists"] || %{}
     room_subscriptions_req = params["room_subscriptions"] || %{}
     extensions_req = params["extensions"] || %{}
+
+    # Only a client that opts in by sending the same conn_id on every
+    # request gets diffed against remembered session state — see
+    # AxonWeb.SlidingSync.ConnState's moduledoc. Absent/empty conn_id keeps
+    # today's always-full-resync behavior unchanged.
+    conn_id =
+      case params["conn_id"] do
+        id when is_binary(id) and id != "" -> id
+        _ -> nil
+      end
+
+    prior =
+      if conn_id, do: ConnState.get(user_id, device_id, conn_id), else: %{lists: %{}, rooms: %{}}
 
     # Block for new activity the same way classic /sync does — a message,
     # to-device send, device-list touch, or ephemeral change all wake this.
@@ -92,8 +114,8 @@ defmodule AxonWeb.SlidingSyncController do
     dm_ids = dm_room_ids(user_id)
     recency = EventStore.room_recency_map(all_room_ids)
 
-    {lists_resp, room_configs_from_lists} =
-      build_lists(all_room_ids, recency, dm_ids, lists_req)
+    {lists_resp, room_configs_from_lists, new_lists_state} =
+      build_lists(all_room_ids, recency, dm_ids, lists_req, prior.lists)
 
     subscribed_configs =
       room_subscriptions_req
@@ -102,11 +124,26 @@ defmodule AxonWeb.SlidingSyncController do
 
     room_configs = merge_room_configs(room_configs_from_lists, subscribed_configs)
 
-    rooms_resp =
-      Enum.into(room_configs, %{}, fn {room_id, cfg} ->
+    {rooms_resp, new_rooms_state} =
+      Enum.reduce(room_configs, {%{}, %{}}, fn {room_id, cfg}, {resp_acc, state_acc} ->
         membership = Map.fetch!(membership_by_room, room_id)
-        {room_id, build_room_entry(room_id, user_id, cfg, is_initial, dm_ids, membership)}
+        entry = build_room_entry(room_id, user_id, cfg, is_initial, dm_ids, membership)
+        fingerprint = room_fingerprint(entry)
+        state_acc = Map.put(state_acc, room_id, fingerprint)
+
+        resp_acc =
+          if Map.get(prior.rooms, room_id) == fingerprint do
+            resp_acc
+          else
+            Map.put(resp_acc, room_id, entry)
+          end
+
+        {resp_acc, state_acc}
       end)
+
+    if conn_id do
+      ConnState.put(user_id, device_id, conn_id, %{lists: new_lists_state, rooms: new_rooms_state})
+    end
 
     visible_room_ids = Map.keys(room_configs)
 
@@ -145,10 +182,21 @@ defmodule AxonWeb.SlidingSyncController do
   # Lists
   # ---------------------------------------------------------------------------
 
-  # Returns {lists_response_map, %{room_id => merged_room_config}} — the
-  # latter feeds build_room_entry/5 for every room that appears in any list.
-  defp build_lists(joined_rooms, recency, dm_ids, lists_req) do
-    Enum.reduce(lists_req, {%{}, %{}}, fn {list_key, list_cfg}, {lists_acc, configs_acc} ->
+  # Returns {lists_response_map, %{room_id => merged_room_config}, new_lists_state}
+  # — the config map feeds build_room_entry/5 for every room in any range
+  # regardless of whether its range's op got diffed away below (its content
+  # may still have changed even if the range's room_ids/ordering didn't);
+  # new_lists_state is what AxonWeb.SlidingSync.ConnState should remember
+  # for next time (only ranges present in *this* request, so a range the
+  # client stops asking for is naturally dropped rather than kept forever).
+  #
+  # prior_lists is `prior.lists` from the caller's conn_id lookup — always
+  # `%{}` when the request has no conn_id, which makes every range compare
+  # as changed (nil != a list) and therefore always emit its SYNC op,
+  # exactly matching pre-diffing behavior with no extra branching needed.
+  defp build_lists(joined_rooms, recency, dm_ids, lists_req, prior_lists) do
+    Enum.reduce(lists_req, {%{}, %{}, %{}}, fn {list_key, list_cfg},
+                                               {lists_acc, configs_acc, lists_state_acc} ->
       filters = list_cfg["filters"] || %{}
 
       sorted_ids =
@@ -159,10 +207,21 @@ defmodule AxonWeb.SlidingSyncController do
       count = length(sorted_ids)
       ranges = normalize_ranges(list_cfg["ranges"], count)
 
-      {ops, in_range_ids} =
-        Enum.map_reduce(ranges, [], fn [start_idx, end_idx], acc ->
+      {ops, in_range_ids, lists_state_acc} =
+        Enum.reduce(ranges, {[], [], lists_state_acc}, fn [start_idx, end_idx],
+                                                          {ops_acc, ids_acc, state_acc} ->
           slice = Enum.slice(sorted_ids, start_idx, max(end_idx - start_idx + 1, 0))
-          {%{"op" => "SYNC", "range" => [start_idx, end_idx], "room_ids" => slice}, acc ++ slice}
+          range_key = {list_key, start_idx, end_idx}
+          state_acc = Map.put(state_acc, range_key, slice)
+
+          ops_acc =
+            if Map.get(prior_lists, range_key) == slice do
+              ops_acc
+            else
+              [%{"op" => "SYNC", "range" => [start_idx, end_idx], "room_ids" => slice} | ops_acc]
+            end
+
+          {ops_acc, ids_acc ++ slice, state_acc}
         end)
 
       configs_acc =
@@ -170,7 +229,8 @@ defmodule AxonWeb.SlidingSyncController do
           Map.update(acc, room_id, list_cfg, &merge_config(&1, list_cfg))
         end)
 
-      {Map.put(lists_acc, list_key, %{"count" => count, "ops" => ops}), configs_acc}
+      lists_acc = Map.put(lists_acc, list_key, %{"count" => count, "ops" => Enum.reverse(ops)})
+      {lists_acc, configs_acc, lists_state_acc}
     end)
   end
 
@@ -292,6 +352,15 @@ defmodule AxonWeb.SlidingSyncController do
       "is_dm" => MapSet.member?(dm_ids, room_id)
     }
   end
+
+  # A room's entry with "initial" dropped — that flag flips true -> false
+  # between a room's first appearance on a connection and every later
+  # response, so leaving it in would make every room look "changed" on
+  # exactly its second response even when nothing else about it moved.
+  # Everything else in the built entry (timeline, required_state, counts,
+  # invite/knock state, name/avatar, is_dm) is real content, so plain map
+  # equality is the whole comparison — no separate hashing needed.
+  defp room_fingerprint(entry), do: Map.delete(entry, "initial")
 
   # ---------------------------------------------------------------------------
   # Notification/highlight counts
