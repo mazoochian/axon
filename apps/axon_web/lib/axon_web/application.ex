@@ -13,7 +13,7 @@ defmodule AxonWeb.Application do
       # Telemetry poller + metrics (Phoenix/Ecto/VM/mailbox-depth), feeds LiveDashboard
       AxonWeb.Telemetry,
       # HTTP client for outbound federation requests
-      {Finch, name: Axon.Finch},
+      {Finch, name: Axon.Finch, pools: finch_pools()},
       # Caches the delegated OIDC Authorization Server's discovery document
       AxonWeb.Oidc.Discovery,
       # Task supervisor for async federation work
@@ -40,6 +40,29 @@ defmodule AxonWeb.Application do
     AxonWeb.Endpoint.config_change(changed, removed)
     AxonWeb.FederationEndpoint.config_change(changed, removed)
     :ok
+  end
+
+  # Only set (config/runtime.exs, prod only) when Complement's start.sh
+  # provides FEDERATION_TLS_CA_FILE — a no-op default elsewhere, so
+  # outbound federation still validates against the normal OTP root store.
+  defp finch_pools do
+    case Application.get_env(:axon_web, :federation_extra_cacertfile) do
+      nil ->
+        %{}
+
+      cacertfile ->
+        extra_cacerts =
+          cacertfile
+          |> File.read!()
+          |> :public_key.pem_decode()
+          |> Enum.map(fn {_type, der, _cipher_info} -> der end)
+
+        %{
+          default: [
+            conn_opts: [transport_opts: [cacerts: :public_key.cacerts_get() ++ extra_cacerts]]
+          ]
+        }
+    end
   end
 
   # Only attaches when SENTRY_DSN is actually set (config/runtime.exs, prod

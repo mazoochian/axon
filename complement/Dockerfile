@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y \
     libncurses6 \
     locales \
     imagemagick \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN sed -i 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen
@@ -40,6 +41,6 @@ COPY --from=builder /app/_build/prod/rel/axon /axon
 COPY complement/start.sh /start.sh
 RUN chmod +x /start.sh
 
-EXPOSE 8008
+EXPOSE 8008 8448
 
 CMD ["/start.sh"]

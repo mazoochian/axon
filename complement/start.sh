@@ -41,6 +41,34 @@ export DB_PASS=axon
 export DB_HOST=127.0.0.1
 export DB_NAME=axon_prod
 export SECRET_KEY_BASE=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 64 | head -n 1)
+# Complement's own test traffic (many rapid registrations/sends from one
+# client against one homeserver) trips the production anti-abuse rate
+# limits by design — see config/runtime.exs.
+export RELAXED_RATE_LIMITS=true
+
+# Complement talks to the federation port over real TLS (accepting any
+# self-signed cert, so this alone would be enough for Complement's own
+# federation.Server client — see config/runtime.exs). But server-to-server
+# federation *between two Complement-spawned homeservers* (e.g. hs1 calling
+# out to hs2) goes through axon's own outbound Finch client, which validates
+# certs against a normal trust store and would reject a bare self-signed
+# cert. Complement mounts a shared CA at /complement/ca/{ca.crt,ca.key} into
+# every homeserver container for exactly this: sign this server's cert with
+# it, and (via FEDERATION_TLS_CA_FILE below) tell axon's outbound client to
+# trust that same CA, so any two Complement homeservers — both signed by it
+# — validate each other normally instead of needing to skip verification.
+mkdir -p /tmp/federation-tls
+openssl req -newkey rsa:2048 -nodes \
+  -keyout /tmp/federation-tls/key.pem -out /tmp/federation-tls/csr.pem \
+  -subj "/CN=${SERVER_NAME}" \
+  -addext "subjectAltName=DNS:${SERVER_NAME}" 2>/dev/null
+openssl x509 -req -in /tmp/federation-tls/csr.pem -days 1 \
+  -CA /complement/ca/ca.crt -CAkey /complement/ca/ca.key -CAcreateserial \
+  -out /tmp/federation-tls/cert.pem \
+  -copy_extensions copy 2>/dev/null
+export FEDERATION_TLS_CERT_FILE=/tmp/federation-tls/cert.pem
+export FEDERATION_TLS_KEY_FILE=/tmp/federation-tls/key.pem
+export FEDERATION_TLS_CA_FILE=/complement/ca/ca.crt
 
 # Run DB migrations
 /axon/bin/axon eval "AxonCore.Release.migrate()"
