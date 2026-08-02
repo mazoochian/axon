@@ -312,6 +312,11 @@ defmodule AxonCore.UserStore do
     end
   end
 
+  @doc "Whether `device_id` exists and belongs to `user_id`."
+  def device_exists?(user_id, device_id) do
+    Repo.exists?(from(d in Device, where: d.user_id == ^user_id and d.device_id == ^device_id))
+  end
+
   @doc "Registers `device_id` for `user_id` if it doesn't already exist. Returns `{:ok, device}`."
   def ensure_device(user_id, device_id, display_name) do
     case Repo.get_by(Device, user_id: user_id, device_id: device_id) do

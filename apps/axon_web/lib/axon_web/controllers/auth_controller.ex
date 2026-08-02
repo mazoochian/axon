@@ -8,6 +8,7 @@ defmodule AxonWeb.AuthController do
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{UserStore, Repo}
+  alias AxonWeb.AppService
 
   # POST /_matrix/client/v3/register
   def register(conn, params) do
@@ -22,6 +23,81 @@ defmodule AxonWeb.AuthController do
   end
 
   defp do_register(conn, params) do
+    if params["type"] == "m.login.application_service" do
+      register_via_appservice(conn, params)
+    else
+      do_register_normal(conn, params)
+    end
+  end
+
+  # POST /_matrix/client/v3/register with type=m.login.application_service:
+  # a bridge registering one of its own "ghost" users. No password, no
+  # User-Interactive Auth (the as_token — the AS's own long-lived secret,
+  # sent the same way any access_token would be — is proof enough), but
+  # the requested username must actually fall within one of the AS's
+  # `users` namespaces or it's masquerading outside what it's allowed.
+  defp register_via_appservice(conn, params) do
+    as_token = extract_as_token(conn, params)
+    username = params["username"]
+
+    with {:as_token, {:ok, registration}} <-
+           {:as_token, AppService.Manager.verify_as_token(as_token)},
+         {:username, true} <- {:username, is_binary(username) and valid_localpart?(username)} do
+      user_id = "@#{String.downcase(username)}:#{server_name()}"
+
+      if AppService.Manager.owns_user?(registration, user_id) do
+        opts = [server_name: server_name(), device_id: params["device_id"]]
+
+        case UserStore.register(String.downcase(username), nil, opts) do
+          {:ok, result} ->
+            conn
+            |> put_status(200)
+            |> json(%{
+              "user_id" => result.user_id,
+              "access_token" => result.access_token,
+              "device_id" => result.device_id
+            })
+
+          {:error, :user_in_use} ->
+            conn
+            |> put_status(400)
+            |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
+
+          {:error, _} ->
+            conn
+            |> put_status(500)
+            |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
+        end
+      else
+        conn
+        |> put_status(403)
+        |> json(%{
+          "errcode" => "M_EXCLUSIVE",
+          "error" => "#{user_id} is outside this application service's namespace"
+        })
+      end
+    else
+      {:as_token, :error} ->
+        conn
+        |> put_status(401)
+        |> json(%{"errcode" => "M_MISSING_TOKEN", "error" => "Missing or invalid as_token"})
+
+      {:username, false} ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid or missing username"})
+    end
+  end
+
+  defp extract_as_token(conn, params) do
+    params["access_token"] ||
+      case Plug.Conn.get_req_header(conn, "authorization") do
+        ["Bearer " <> token | _] -> token
+        _ -> nil
+      end
+  end
+
+  defp do_register_normal(conn, params) do
     kind = params["kind"] || "user"
 
     if kind == "guest" do
@@ -48,44 +124,59 @@ defmodule AxonWeb.AuthController do
       else
         user_id = username && "@#{String.downcase(username)}:#{server_name()}"
 
-        if user_id && user_exists?(user_id) do
-          conn
-          |> put_status(400)
-          |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
-        else
-          auth = params["auth"]
-
-          if is_nil(auth) do
+        cond do
+          user_id && user_exists?(user_id) ->
             conn
-            |> put_status(401)
-            |> json(%{
-              "flows" => [%{"stages" => ["m.login.dummy"]}],
-              "session" => gen_session(),
-              "params" => %{}
-            })
-          else
-            unless username do
-              conn
-              |> put_status(400)
-              |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
-            else
-              opts = [
-                server_name: server_name(),
-                device_id: params["device_id"],
-                display_name: username
-              ]
+            |> put_status(400)
+            |> json(%{"errcode" => "M_USER_IN_USE", "error" => "Username already taken"})
 
-              with {:ok, result} <- UserStore.register(String.downcase(username), password, opts) do
+          # Ordinary (non-AS) registration into a namespace an AS has
+          # claimed exclusively is rejected — only that AS (via
+          # type=m.login.application_service, register_via_appservice/2
+          # above) may create users there.
+          user_id && AppService.Manager.exclusive_user_owner(user_id) ->
+            conn
+            |> put_status(400)
+            |> json(%{
+              "errcode" => "M_EXCLUSIVE",
+              "error" => "#{user_id} is reserved by an application service"
+            })
+
+          true ->
+            auth = params["auth"]
+
+            if is_nil(auth) do
+              conn
+              |> put_status(401)
+              |> json(%{
+                "flows" => [%{"stages" => ["m.login.dummy"]}],
+                "session" => gen_session(),
+                "params" => %{}
+              })
+            else
+              unless username do
                 conn
-                |> put_status(200)
-                |> json(%{
-                  "user_id" => result.user_id,
-                  "access_token" => result.access_token,
-                  "device_id" => result.device_id
-                })
+                |> put_status(400)
+                |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
+              else
+                opts = [
+                  server_name: server_name(),
+                  device_id: params["device_id"],
+                  display_name: username
+                ]
+
+                with {:ok, result} <-
+                       UserStore.register(String.downcase(username), password, opts) do
+                  conn
+                  |> put_status(200)
+                  |> json(%{
+                    "user_id" => result.user_id,
+                    "access_token" => result.access_token,
+                    "device_id" => result.device_id
+                  })
+                end
               end
             end
-          end
         end
       end
     end

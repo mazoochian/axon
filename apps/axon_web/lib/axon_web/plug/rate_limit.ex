@@ -17,9 +17,19 @@ defmodule AxonWeb.Plug.RateLimit do
     - `:key_by` — `:ip` (default) or `:user` (keys by
       `conn.assigns.current_user_id`, falling back to IP if unset — for
       routes mounted after `AuthenticateToken`).
+
+  ## Application Service exemption
+
+  Per spec, an AS's own `sender_localpart` traffic is *always* exempt
+  ("the sender is excluded"), and its masqueraded-user traffic is exempt
+  too unless the registration sets `rate_limited: true` explicitly (the
+  registration field's default, when absent, is spec'd as rate-limited —
+  see `exempt?/1`). Only applies when `key_by == :user`: login/register
+  happen before any token exists, so there's no AS identity to check yet.
   """
 
   import Plug.Conn
+  alias AxonWeb.AppService.Manager
 
   def init(opts) do
     bucket = Keyword.fetch!(opts, :bucket)
@@ -28,22 +38,37 @@ defmodule AxonWeb.Plug.RateLimit do
   end
 
   def call(conn, {bucket, key_by}) do
-    [max: max, window_ms: window_ms] = Application.get_env(:axon_web, :rate_limits)[bucket]
-    bucket_key = {bucket, key(conn, key_by)}
+    if key_by == :user and exempt?(conn) do
+      conn
+    else
+      [max: max, window_ms: window_ms] = Application.get_env(:axon_web, :rate_limits)[bucket]
+      bucket_key = {bucket, key(conn, key_by)}
 
-    case AxonWeb.RateLimiter.check(bucket_key, max, window_ms) do
-      :ok ->
-        conn
+      case AxonWeb.RateLimiter.check(bucket_key, max, window_ms) do
+        :ok ->
+          conn
 
-      {:error, retry_after_ms} ->
-        conn
-        |> put_status(429)
-        |> Phoenix.Controller.json(%{
-          "errcode" => "M_LIMIT_EXCEEDED",
-          "error" => "Too many requests",
-          "retry_after_ms" => retry_after_ms
-        })
-        |> halt()
+        {:error, retry_after_ms} ->
+          conn
+          |> put_status(429)
+          |> Phoenix.Controller.json(%{
+            "errcode" => "M_LIMIT_EXCEEDED",
+            "error" => "Too many requests",
+            "retry_after_ms" => retry_after_ms
+          })
+          |> halt()
+      end
+    end
+  end
+
+  defp exempt?(conn) do
+    case conn.assigns[:appservice] do
+      nil ->
+        false
+
+      registration ->
+        conn.assigns[:current_user_id] == Manager.sender_user_id(registration) or
+          registration["rate_limited"] == false
     end
   end
 
