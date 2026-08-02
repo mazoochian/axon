@@ -151,8 +151,20 @@ defmodule AxonWeb.AppService.OutboundQueueTest do
       end
     end)
 
-    [request] = FakeAppService.requests(port)
-    assert {"authorization", "Bearer hs-bridge_rotate"} in request.headers
+    # Almost always exactly one request — enqueue's own immediate delivery
+    # attempt succeeds and deletes the row well within the 5s sweep
+    # interval. Under heavy scheduler contention that attempt can rarely
+    # still be in flight when a sweep tick independently rediscovers the
+    # same not-yet-deleted row and fires a second one; both carry the same
+    # idempotent txn_id (the row's own id), which is exactly the case the
+    # spec's txn_id de-duplication contract exists for on the AS's side —
+    # so assert on "at least one, all consistent" rather than "exactly one".
+    requests = FakeAppService.requests(port)
+    assert requests != []
+
+    Enum.each(requests, fn request ->
+      assert {"authorization", "Bearer hs-bridge_rotate"} in request.headers
+    end)
   end
 
   test "a transaction for a since-removed registration is dropped rather than retried forever" do

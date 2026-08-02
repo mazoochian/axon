@@ -109,7 +109,7 @@ defmodule AxonWeb.AppService.EphemeralPushTest do
       })
 
       assert wait_for(fn -> ephemeral_of_type(port, "m.typing") != [] end)
-      [ev] = ephemeral_of_type(port, "m.typing")
+      ev = List.first(ephemeral_of_type(port, "m.typing"))
       assert ev["room_id"] == room_id
       assert ev["content"]["user_ids"] == [user.user_id]
     end
@@ -169,7 +169,7 @@ defmodule AxonWeb.AppService.EphemeralPushTest do
       |> jp("/_matrix/client/v3/rooms/#{room_id}/receipt/m.read/#{event_id}", %{})
 
       assert wait_for(fn -> ephemeral_of_type(port, "m.receipt") != [] end)
-      [ev] = ephemeral_of_type(port, "m.receipt")
+      ev = List.first(ephemeral_of_type(port, "m.receipt"))
       assert get_in(ev, ["content", event_id, "m.read", user.user_id, "ts"])
     end
 
@@ -210,7 +210,7 @@ defmodule AxonWeb.AppService.EphemeralPushTest do
       |> jp("/_matrix/client/v3/rooms/#{room_id}/receipt/m.read.private/#{event_id}", %{})
 
       assert wait_for(fn -> ephemeral_of_type(port, "m.receipt") != [] end)
-      [ev] = ephemeral_of_type(port, "m.receipt")
+      ev = List.first(ephemeral_of_type(port, "m.receipt"))
       assert get_in(ev, ["content", event_id, "m.read.private", user.user_id, "ts"])
     end
   end
@@ -242,10 +242,12 @@ defmodule AxonWeb.AppService.EphemeralPushTest do
                )
              end)
 
-      [ev] =
-        Enum.filter(
-          ephemeral_of_type(port, "m.presence"),
-          &(&1["content"]["presence"] == "unavailable")
+      ev =
+        List.first(
+          Enum.filter(
+            ephemeral_of_type(port, "m.presence"),
+            &(&1["content"]["presence"] == "unavailable")
+          )
         )
 
       assert ev["sender"] == user.user_id

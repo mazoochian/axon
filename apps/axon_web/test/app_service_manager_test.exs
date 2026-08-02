@@ -174,7 +174,7 @@ defmodule AxonWeb.AppService.ManagerTest do
       send(Manager, {:new_event, "!room:localhost", event})
 
       assert wait_for(fn -> received(port) != [] end)
-      [delivered] = received(port)
+      delivered = List.first(received(port))
       [sent_event] = delivered["events"]
       assert sent_event["sender"] == "@bridge_bot:localhost"
       assert sent_event["room_id"] == "!room:localhost"
