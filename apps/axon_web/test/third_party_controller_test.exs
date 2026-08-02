@@ -24,7 +24,7 @@ defmodule AxonWeb.ThirdPartyControllerTest do
 
   defp put_registrations(regs), do: :ets.insert(@table, {:registrations, regs})
 
-  defp registration(id, port, opts \\ []) do
+  defp registration(id, port, opts) do
     %{
       "id" => id,
       "url" => "http://127.0.0.1:#{port}",
