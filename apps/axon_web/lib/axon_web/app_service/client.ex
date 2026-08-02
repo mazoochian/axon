@@ -8,10 +8,15 @@ defmodule AxonWeb.AppService.Client do
   like the shared-secret admin registration bootstrap already uses HMAC
   rather than a signature).
 
-  Three calls, all spec-defined:
+  Spec-defined calls:
     - `push_transaction/3` — `PUT :url/_matrix/app/v1/transactions/:txnId`
     - `query_user/2` — `GET :url/_matrix/app/v1/users/:userId`
     - `query_room_alias/2` — `GET :url/_matrix/app/v1/rooms/:roomAlias`
+    - `query_thirdparty_protocol/2`, `query_thirdparty_user/3`,
+      `query_thirdparty_location/3` — the "Third party networks" family
+      (`GET :url/_matrix/app/v1/thirdparty/{protocol,user,location}...`),
+      proxied from `AxonWeb.ThirdPartyController`'s Client-Server API
+      surface.
   """
 
   require Logger
@@ -48,6 +53,59 @@ defmodule AxonWeb.AppService.Client do
   def query_room_alias(registration, room_alias) do
     url = "#{registration["url"]}/_matrix/app/v1/rooms/#{encode_path_segment(room_alias)}"
     query(registration, url)
+  end
+
+  @doc """
+  `GET /_matrix/app/v1/thirdparty/protocol/:protocol` — protocol metadata
+  (field types, presets/`instances`, `user_fields`/`location_fields`).
+  Returns `{:ok, decoded_body}` or `{:error, reason}` (including
+  `{:error, :not_found}` on a 404).
+  """
+  def query_thirdparty_protocol(registration, protocol) do
+    url =
+      "#{registration["url"]}/_matrix/app/v1/thirdparty/protocol/#{encode_path_segment(protocol)}"
+
+    query_json(registration, url)
+  end
+
+  @doc """
+  Third-party user lookup. With `protocol`, hits
+  `GET .../thirdparty/user/:protocol?field=value...` (find Matrix user ids
+  matching third-party search fields); without, hits
+  `GET .../thirdparty/user?userid=...` (the reverse direction — what
+  third-party identity does this Matrix user id have). `params` is a map
+  of query string fields either way.
+  """
+  def query_thirdparty_user(registration, protocol, params) do
+    path = if protocol, do: "user/#{encode_path_segment(protocol)}", else: "user"
+    url = "#{registration["url"]}/_matrix/app/v1/thirdparty/#{path}?#{URI.encode_query(params)}"
+    query_json(registration, url)
+  end
+
+  @doc "Same as `query_thirdparty_user/3` but for `.../thirdparty/location[/:protocol]`."
+  def query_thirdparty_location(registration, protocol, params) do
+    path = if protocol, do: "location/#{encode_path_segment(protocol)}", else: "location"
+    url = "#{registration["url"]}/_matrix/app/v1/thirdparty/#{path}?#{URI.encode_query(params)}"
+    query_json(registration, url)
+  end
+
+  defp query_json(registration, url) do
+    case request(:get, url, registration["hs_token"], nil) do
+      {:ok, %Finch.Response{status: status, body: body}} when status in 200..299 ->
+        case Jason.decode(body) do
+          {:ok, decoded} -> {:ok, decoded}
+          {:error, _} -> {:error, :invalid_json}
+        end
+
+      {:ok, %Finch.Response{status: 404}} ->
+        {:error, :not_found}
+
+      {:ok, %Finch.Response{status: status, body: body}} ->
+        {:error, {:http_error, status, body}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   # `URI.encode/1`'s default predicate doesn't escape `#` (or `?`) — fine

@@ -109,6 +109,35 @@ defmodule AxonWeb.FakeAppService do
     put_response(port, {"PUT", ~r{^/_matrix/app/v1/transactions/}}, status, %{})
   end
 
+  @doc "Convenience: canned status/body for `GET /_matrix/app/v1/thirdparty/protocol/:protocol`."
+  def thirdparty_protocol_response(port, protocol, status, body) do
+    put_response(port, {"GET", "/_matrix/app/v1/thirdparty/protocol/#{protocol}"}, status, body)
+  end
+
+  @doc """
+  Convenience: canned status/body for `GET /_matrix/app/v1/thirdparty/user[/:protocol]`
+  (query string, if any, isn't matched — pass `protocol: nil` for the
+  reverse-lookup path with no protocol suffix).
+  """
+  def thirdparty_user_response(port, protocol, status, body) do
+    path =
+      if protocol,
+        do: "/_matrix/app/v1/thirdparty/user/#{protocol}",
+        else: "/_matrix/app/v1/thirdparty/user"
+
+    put_response(port, {"GET", path}, status, body)
+  end
+
+  @doc "Same as `thirdparty_user_response/4` but for `.../thirdparty/location[/:protocol]`."
+  def thirdparty_location_response(port, protocol, status, body) do
+    path =
+      if protocol,
+        do: "/_matrix/app/v1/thirdparty/location/#{protocol}",
+        else: "/_matrix/app/v1/thirdparty/location"
+
+    put_response(port, {"GET", path}, status, body)
+  end
+
   match _ do
     log_request(conn)
 

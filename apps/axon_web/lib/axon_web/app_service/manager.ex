@@ -173,6 +173,35 @@ defmodule AxonWeb.AppService.Manager do
   defp query_result(_), do: :not_found
 
   @doc """
+  The registration whose `users` namespace covers `user_id`, if any — used
+  for the reverse third-party user lookup (`GET /thirdparty/user?userid=`),
+  where the AS to ask is determined by who owns the Matrix side of the
+  identity rather than by `protocol`.
+  """
+  def registration_owning_user(user_id),
+    do: Enum.find(list_registrations(), &namespace_match?(&1, :users, user_id))
+
+  @doc "Same as `registration_owning_user/1` but for `GET /thirdparty/location?alias=`."
+  def registration_owning_alias(room_alias),
+    do: Enum.find(list_registrations(), &namespace_match?(&1, :aliases, room_alias))
+
+  @doc """
+  Every registration that declares `protocol` in its `protocols` field
+  (spec: "a list of external protocols which the application service
+  provides, e.g. IRC").
+  """
+  def registrations_for_protocol(protocol) do
+    Enum.filter(list_registrations(), &(protocol in (&1["protocols"] || [])))
+  end
+
+  @doc "Every distinct protocol name declared by any registration, for `GET /thirdparty/protocols`."
+  def all_protocols do
+    list_registrations()
+    |> Enum.flat_map(&(&1["protocols"] || []))
+    |> Enum.uniq()
+  end
+
+  @doc """
   Pushes an ephemeral (`m.typing`/`m.receipt`/`m.presence`) event to every
   registration that opted in via `receive_ephemeral: true` (default false —
   most bridges don't want this traffic) and whose audience this event
