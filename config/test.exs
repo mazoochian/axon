@@ -5,7 +5,7 @@ config :axon_core, AxonCore.Repo,
   password: "axon",
   hostname: System.get_env("DB_HOST", "localhost"),
   port: String.to_integer(System.get_env("DB_PORT", "5432")),
-  database: "axon_test",
+  database: System.get_env("DB_NAME", "axon_test"),
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: 10
 
