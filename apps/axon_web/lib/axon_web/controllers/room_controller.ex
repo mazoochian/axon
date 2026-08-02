@@ -51,7 +51,7 @@ defmodule AxonWeb.RoomController do
   def join(conn, %{"room_id" => room_id_or_alias} = params) do
     user_id = conn.assigns.current_user_id
     local_server = Application.get_env(:axon_web, :server_name, "localhost")
-    server_params = params["server_name"] || []
+    server_params = server_name_hints(conn)
 
     # Resolve alias to room_id (local lookup first, then federation)
     {room_id, hint_servers} = resolve_room(room_id_or_alias, local_server, server_params)
@@ -130,7 +130,7 @@ defmodule AxonWeb.RoomController do
   defp do_knock(conn, room_id_or_alias, params) do
     user_id = conn.assigns.current_user_id
     local_server = Application.get_env(:axon_web, :server_name, "localhost")
-    server_params = params["server_name"] || []
+    server_params = server_name_hints(conn)
 
     {room_id, hint_servers} = resolve_room(room_id_or_alias, local_server, server_params)
 
@@ -591,8 +591,17 @@ defmodule AxonWeb.RoomController do
     end
   end
 
+  # `server_name` hints can legally arrive from a caller as a list (already
+  # normalized), a bare string (a single `?server_name=x` — see
+  # server_name_hints/1), or nil/absent — List.wrap handles all three. Every
+  # branch below assumes a list from here on; this used to be the caller's
+  # job and wasn't done consistently (the "#" branch crashed — Enum over a
+  # raw string — on the single-hint case, the single most common one).
+  #
   # Returns {room_id, hint_servers} or {nil, []}
   defp resolve_room(room_id_or_alias, local_server, server_params) do
+    server_params = List.wrap(server_params)
+
     cond do
       String.starts_with?(room_id_or_alias, "#") ->
         # Alias — try local first
@@ -611,11 +620,23 @@ defmodule AxonWeb.RoomController do
         end
 
       String.starts_with?(room_id_or_alias, "!") ->
-        {room_id_or_alias, List.wrap(server_params)}
+        {room_id_or_alias, server_params}
 
       true ->
         {nil, []}
     end
+  end
+
+  # The `server_name` query param (join/knock via-hints) can legally repeat
+  # (`?server_name=a&server_name=b`) — Plug's default query parser collapses
+  # repeated bare (non-bracketed) keys to just the last occurrence, so
+  # `params["server_name"]` alone would silently drop every hint but one.
+  # Reading the raw query string directly preserves all of them.
+  defp server_name_hints(conn) do
+    conn.query_string
+    |> URI.query_decoder()
+    |> Enum.filter(fn {k, _v} -> k == "server_name" end)
+    |> Enum.map(fn {_k, v} -> v end)
   end
 
   defp resolve_remote_alias(room_alias, via_servers, _local_server) do

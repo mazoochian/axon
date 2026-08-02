@@ -238,4 +238,53 @@ defmodule AxonWeb.RoomControllerTest do
       assert conn.status == 200
     end
   end
+
+  describe "join/knock with a ?server_name= via-hint (regression)" do
+    # Found via Complement: Phoenix/Plug hands `params["server_name"]` back
+    # as a bare string for a single `?server_name=x`, not a list — the
+    # alias-resolution branch in RoomController.resolve_room/3 assumed a
+    # list unconditionally and crashed (Enumerable not implemented for
+    # BitString) instead of the clean 404 a nonexistent room should give.
+    # 127.0.0.1:1 is a real connect-refused (nothing listens there), not a
+    # DNS timeout, so this stays fast.
+
+    test "a single server_name query param no longer crashes an alias join to a nonexistent room" do
+      alice = register("alice_hint1_#{System.unique_integer([:positive])}")
+      room_alias = "%23nonexistent_#{System.unique_integer([:positive])}:remote.invalid"
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/join/#{room_alias}?server_name=127.0.0.1:1", %{})
+
+      assert conn.status == 404
+      assert decode(conn)["errcode"] == "M_NOT_FOUND"
+    end
+
+    test "a repeated server_name query param no longer crashes an alias join to a nonexistent room" do
+      alice = register("alice_hint2_#{System.unique_integer([:positive])}")
+      room_alias = "%23nonexistent_#{System.unique_integer([:positive])}:remote.invalid"
+
+      conn =
+        authed(alice.token)
+        |> jp(
+          "/_matrix/client/v3/join/#{room_alias}?server_name=127.0.0.1:1&server_name=127.0.0.1:2",
+          %{}
+        )
+
+      assert conn.status == 404
+      assert decode(conn)["errcode"] == "M_NOT_FOUND"
+    end
+
+    test "a single server_name query param no longer crashes a knock on a nonexistent alias" do
+      alice = register("alice_hint3_#{System.unique_integer([:positive])}")
+      room_alias = "%23nonexistent_#{System.unique_integer([:positive])}:remote.invalid"
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/knock/#{room_alias}?server_name=127.0.0.1:1", %{})
+
+      assert conn.status == 404
+      assert decode(conn)["errcode"] == "M_NOT_FOUND"
+    end
+  end
 end
