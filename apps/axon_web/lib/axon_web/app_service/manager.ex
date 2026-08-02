@@ -1,30 +1,58 @@
 defmodule AxonWeb.AppService.Manager do
   @moduledoc """
-  Application Service manager. Loads AS registrations from a JSON config file
-  and dispatches events to matching ASes.
+  Application Service registry + event dispatcher.
 
-  Config: `config :axon_web, :appservice_config_path, "appservices.json"`
-  If the file doesn't exist, no ASes are registered.
+  Loads AS registrations from a list of JSON files and holds them in a
+  public ETS table (readable lock-free from any process — auth plugs and
+  controllers consult namespace ownership on the hot request path). Also
+  subscribes to `"all_events"` (the same PubSub topic `RoomProcess` fans
+  federation out from) and, on every new event, hands matching registrations
+  to `AxonWeb.AppService.OutboundQueue` for durable, retried delivery.
 
-  Registration format (subset of Synapse's):
-    [{
-      "id": "bridge",
-      "url": "http://localhost:9000",
-      "as_token": "...",
-      "hs_token": "...",
-      "sender_localpart": "_bridge",
-      "namespaces": {
-        "users": [{"exclusive": false, "regex": "@bridge_.*"}],
-        "rooms": [],
-        "aliases": []
+  ## Registration files
+
+  `config :axon_web, :appservice_registration_files, [path, ...]` — each
+  path is a single JSON object (one registration), mirroring Synapse's
+  `app_service_config_files` *list* semantics (one file per bridge, so one
+  bridge's config edit can't clobber another's) rather than Phase 4's
+  original single-file-holding-a-JSON-array shape. JSON rather than YAML:
+  this codebase has no YAML dependency anywhere (config is env-var-driven
+  in `config/runtime.exs`, and the only other file-based registration
+  format in axon — the `_synapse/admin/v1/register` shared-secret bootstrap
+  — has no on-disk file at all), and the spec doesn't mandate a format, so
+  introducing a new dependency for this alone isn't worth it. A real
+  Synapse-style YAML registration a bridge ships by default needs a
+  mechanical reformat to JSON before use here — see ROADMAP.md.
+
+  Expected shape (subset of the spec's fields actually consumed):
+
+      {
+        "id": "my-bridge",
+        "url": "http://localhost:9000",
+        "as_token": "...",
+        "hs_token": "...",
+        "sender_localpart": "_bridge_bot",
+        "rate_limited": false,
+        "namespaces": {
+          "users": [{"exclusive": true, "regex": "@_bridge_.*"}],
+          "aliases": [{"exclusive": true, "regex": "#_bridge_.*"}],
+          "rooms": []
+        }
       }
-    }]
+
+  A file that's missing a required field, has a namespace entry with an
+  unparseable regex, or collides on `id`/`as_token`/`hs_token` with an
+  already-loaded registration is rejected (logged, skipped) rather than
+  crashing boot — one malformed bridge config shouldn't take the whole
+  homeserver down.
   """
 
   use GenServer
   require Logger
 
   @table :axon_appservices
+  @required_fields ~w(id url as_token hs_token sender_localpart namespaces)
+  @namespace_kinds ~w(users aliases rooms)
 
   # ---------------------------------------------------------------------------
   # Client API
@@ -34,17 +62,114 @@ defmodule AxonWeb.AppService.Manager do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
-  @doc "Verify an as_token. Returns {:ok, registration} or :error."
-  def verify_as_token(token) do
-    result = list_registrations() |> Enum.find(fn r -> r["as_token"] == token end)
-    if result, do: {:ok, result}, else: :error
+  @doc "All currently-loaded registrations."
+  def list_registrations do
+    case :ets.lookup(@table, :registrations) do
+      [{:registrations, list}] -> list
+      [] -> []
+    end
   end
 
-  @doc "Verify an hs_token. Returns {:ok, registration} or :error."
-  def verify_hs_token(token) do
-    result = list_registrations() |> Enum.find(fn r -> r["hs_token"] == token end)
-    if result, do: {:ok, result}, else: :error
+  @doc "Re-reads registration files from config. Synchronous; returns the new list."
+  def reload do
+    GenServer.call(__MODULE__, :reload)
   end
+
+  @doc "Verify an as_token (AS -> HS auth). Returns {:ok, registration} or :error."
+  def verify_as_token(token) when is_binary(token) do
+    find(&(&1["as_token"] == token))
+  end
+
+  def verify_as_token(_), do: :error
+
+  @doc "Verify an hs_token (HS -> AS auth, used by the AS to authenticate calls axon makes to it). Returns {:ok, registration} or :error."
+  def verify_hs_token(token) when is_binary(token) do
+    find(&(&1["hs_token"] == token))
+  end
+
+  def verify_hs_token(_), do: :error
+
+  @doc "Look up a registration by its `id`."
+  def find_by_id(id) do
+    find(&(&1["id"] == id))
+  end
+
+  @doc "The full mxid of a registration's own bot/sender user."
+  def sender_user_id(registration) do
+    "@#{registration["sender_localpart"]}:#{server_name()}"
+  end
+
+  @doc """
+  The registration that exclusively claims `user_id`, if any (checked
+  against its `users` namespace only).
+  """
+  def exclusive_user_owner(user_id), do: exclusive_owner(:users, user_id)
+
+  @doc """
+  The registration that exclusively claims `room_alias`, if any (checked
+  against its `aliases` namespace only).
+  """
+  def exclusive_alias_owner(room_alias), do: exclusive_owner(:aliases, room_alias)
+
+  @doc """
+  Whether creating `value` (a user_id or room_alias, per `kind`) should be
+  blocked: some registration exclusively claims it and `requesting_registration`
+  isn't that registration (`nil` — an ordinary, non-AS request — never is).
+  The owning AS itself is exempt from its own exclusive claim.
+  """
+  def exclusive_conflict?(kind, value, requesting_registration) do
+    case exclusive_owner(kind, value) do
+      nil ->
+        false
+
+      owner ->
+        is_nil(requesting_registration) or owner["id"] != requesting_registration["id"]
+    end
+  end
+
+  @doc "Whether `registration` claims `user_id` in its `users` namespace (exclusive or not)."
+  def owns_user?(registration, user_id), do: namespace_match?(registration, :users, user_id)
+
+  @doc "Whether `registration` claims `room_alias` in its `aliases` namespace (exclusive or not)."
+  def owns_alias?(registration, room_alias),
+    do: namespace_match?(registration, :aliases, room_alias)
+
+  @doc """
+  Every registration whose `users` or `rooms` namespace matches this event
+  (by sender or room_id) — the audience for event dispatch.
+  """
+  def matching_registrations(sender, room_id) do
+    Enum.filter(list_registrations(), fn reg ->
+      namespace_match?(reg, :users, sender) or namespace_match?(reg, :rooms, room_id)
+    end)
+  end
+
+  @doc """
+  Attempts on-demand provisioning of an unknown local user by asking the
+  owning AS (any registration whose `users` namespace matches, exclusive or
+  not) via `GET /_matrix/app/v1/users/:userId`. Best-effort: returns `:ok`
+  if some AS claimed it and answered 200 (caller should re-check for the
+  user afterwards — the AS is expected to have called back into `/register`
+  by the time it responds), `:not_found` if no AS claims this user or every
+  claiming AS declined/errored.
+  """
+  def maybe_provision_user(user_id) do
+    case Enum.find(list_registrations(), &namespace_match?(&1, :users, user_id)) do
+      nil -> :not_found
+      reg -> query_result(AxonWeb.AppService.Client.query_user(reg, user_id))
+    end
+  end
+
+  @doc "Same as `maybe_provision_user/1` but for a room alias, via `GET /_matrix/app/v1/rooms/:roomAlias`."
+  def maybe_provision_alias(room_alias) do
+    case Enum.find(list_registrations(), &namespace_match?(&1, :aliases, room_alias)) do
+      nil -> :not_found
+      reg -> query_result(AxonWeb.AppService.Client.query_room_alias(reg, room_alias))
+    end
+  end
+
+  defp query_result({:ok, :found}), do: :ok
+  defp query_result(_), do: :not_found
 
   # ---------------------------------------------------------------------------
   # GenServer callbacks
@@ -53,20 +178,28 @@ defmodule AxonWeb.AppService.Manager do
   @impl true
   def init(_) do
     :ets.new(@table, [:named_table, :set, :public, read_concurrency: true])
-    registrations = load_registrations()
-    :ets.insert(@table, {:registrations, registrations})
-    # Subscribe to all room events so we can fan-out to ASes without a circular dep
+    do_reload()
     Phoenix.PubSub.subscribe(Axon.PubSub, "all_events")
-    Logger.info("AppService.Manager started with #{length(registrations)} registration(s)")
     {:ok, %{}}
   end
 
   @impl true
-  def handle_info({:new_event, room_id, event_map}, state) do
-    registrations = list_registrations()
+  def handle_call(:reload, _from, state) do
+    {:reply, do_reload(), state}
+  end
 
-    if registrations != [] do
-      Task.start(fn -> do_dispatch(event_map, room_id, registrations) end)
+  @impl true
+  def handle_info({:new_event, room_id, event_map}, state) do
+    sender = event_map["sender"] || ""
+    event_room_id = event_map["room_id"] || room_id
+
+    case matching_registrations(sender, event_room_id) do
+      [] ->
+        :ok
+
+      regs ->
+        payload = %{"events" => [Map.put(event_map, "room_id", event_room_id)]}
+        Enum.each(regs, &AxonWeb.AppService.OutboundQueue.enqueue(&1["id"], payload))
     end
 
     {:noreply, state}
@@ -75,60 +208,137 @@ defmodule AxonWeb.AppService.Manager do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # ---------------------------------------------------------------------------
-  # Private
+  # Private: loading
   # ---------------------------------------------------------------------------
 
-  defp list_registrations do
-    case :ets.lookup(@table, :registrations) do
-      [{:registrations, list}] -> list
-      [] -> []
-    end
+  defp do_reload do
+    paths = Application.get_env(:axon_web, :appservice_registration_files, [])
+
+    registrations =
+      paths
+      |> Enum.map(&load_one/1)
+      |> Enum.reject(&is_nil/1)
+      |> dedupe()
+
+    :ets.insert(@table, {:registrations, registrations})
+    Logger.info("AppService.Manager loaded #{length(registrations)} registration(s)")
+    registrations
   end
 
-  defp load_registrations do
-    path = Application.get_env(:axon_web, :appservice_config_path, "appservices.json")
-
-    case File.read(path) do
-      {:ok, contents} ->
-        case Jason.decode(contents) do
-          {:ok, list} when is_list(list) ->
-            Logger.info("Loaded #{length(list)} app service registration(s) from #{path}")
-            list
-
-          {:error, reason} ->
-            Logger.warning("Failed to parse #{path}: #{inspect(reason)}")
-            []
-        end
-
+  defp load_one(path) do
+    with {:ok, contents} <- File.read(path),
+         {:ok, %{} = reg} <- Jason.decode(contents),
+         :ok <- validate(reg) do
+      reg
+    else
       {:error, :enoent} ->
-        []
+        Logger.warning("AppService registration file not found: #{path}")
+        nil
+
+      {:error, %Jason.DecodeError{} = err} ->
+        Logger.warning(
+          "AppService registration #{path} is not valid JSON: #{Exception.message(err)}"
+        )
+
+        nil
 
       {:error, reason} ->
-        Logger.warning("Failed to read #{path}: #{inspect(reason)}")
-        []
+        Logger.warning("AppService registration #{path} rejected: #{reason}")
+        nil
+
+      {:ok, other} ->
+        Logger.warning(
+          "AppService registration #{path} must be a JSON object, got: #{inspect(other)}"
+        )
+
+        nil
     end
   end
 
-  defp do_dispatch(event, room_id, registrations) do
-    sender = event["sender"] || ""
-    state_key = event["state_key"]
-    event_room_id = event["room_id"] || room_id
+  defp validate(reg) do
+    with :ok <- require_fields(reg),
+         :ok <- validate_namespaces(reg["namespaces"]) do
+      :ok
+    end
+  end
 
-    Enum.each(registrations, fn reg ->
-      if matches_namespace?(reg, sender, event_room_id, state_key) do
-        deliver(reg, event, room_id)
-      end
+  defp require_fields(reg) do
+    missing = Enum.filter(@required_fields, &(!Map.has_key?(reg, &1)))
+
+    if missing == [],
+      do: :ok,
+      else: {:error, "missing required field(s): #{Enum.join(missing, ", ")}"}
+  end
+
+  defp validate_namespaces(namespaces) when is_map(namespaces) do
+    errors =
+      for kind <- @namespace_kinds,
+          entry <- Map.get(namespaces, kind, []),
+          error = validate_namespace_entry(kind, entry),
+          not is_nil(error),
+          do: error
+
+    if errors == [], do: :ok, else: {:error, Enum.join(errors, "; ")}
+  end
+
+  defp validate_namespaces(_), do: {:error, "namespaces must be an object"}
+
+  defp validate_namespace_entry(kind, %{"regex" => regex}) when is_binary(regex) do
+    case Regex.compile(regex) do
+      {:ok, _} -> nil
+      {:error, reason} -> "#{kind} namespace regex #{inspect(regex)} invalid: #{inspect(reason)}"
+    end
+  end
+
+  defp validate_namespace_entry(kind, other),
+    do: "#{kind} namespace entry missing string \"regex\": #{inspect(other)}"
+
+  # Rejects a registration whose id/as_token/hs_token collides with one
+  # already accepted (first file wins, later ones are dropped with a
+  # warning) — the spec requires these to be unique per AS, and a
+  # collision would let one bridge's token double as another's.
+  defp dedupe(registrations) do
+    {kept, _seen} =
+      Enum.reduce(registrations, {[], MapSet.new()}, fn reg, {kept, seen} ->
+        keys = [{:id, reg["id"]}, {:as_token, reg["as_token"]}, {:hs_token, reg["hs_token"]}]
+
+        if Enum.any?(keys, &MapSet.member?(seen, &1)) do
+          Logger.warning(
+            "AppService registration #{reg["id"]} dropped: duplicate id/as_token/hs_token"
+          )
+
+          {kept, seen}
+        else
+          {[reg | kept], Enum.into(keys, seen)}
+        end
+      end)
+
+    Enum.reverse(kept)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: namespace matching
+  # ---------------------------------------------------------------------------
+
+  defp find(pred) do
+    case Enum.find(list_registrations(), pred) do
+      nil -> :error
+      reg -> {:ok, reg}
+    end
+  end
+
+  defp exclusive_owner(kind, value) do
+    Enum.find(list_registrations(), fn reg ->
+      Enum.any?(Map.get(reg["namespaces"] || %{}, to_string(kind), []), fn ns ->
+        ns["exclusive"] == true and regex_match?(ns["regex"], value)
+      end)
     end)
   end
 
-  defp matches_namespace?(reg, sender, room_id, _state_key) do
-    user_ns = get_in(reg, ["namespaces", "users"]) || []
-    room_ns = get_in(reg, ["namespaces", "rooms"]) || []
-
-    user_match = Enum.any?(user_ns, fn ns -> regex_match?(ns["regex"], sender) end)
-    room_match = Enum.any?(room_ns, fn ns -> regex_match?(ns["regex"], room_id) end)
-
-    user_match or room_match
+  defp namespace_match?(registration, kind, value) do
+    Enum.any?(Map.get(registration["namespaces"] || %{}, to_string(kind), []), fn ns ->
+      regex_match?(ns["regex"], value)
+    end)
   end
 
   defp regex_match?(nil, _), do: false
@@ -140,33 +350,5 @@ defmodule AxonWeb.AppService.Manager do
     end
   end
 
-  defp deliver(reg, event, room_id) do
-    url = reg["url"]
-    hs_token = reg["hs_token"]
-    txn_id = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
-
-    body =
-      Jason.encode!(%{
-        "events" => [Map.put(event, "room_id", event["room_id"] || room_id)]
-      })
-
-    req =
-      Finch.build(
-        :put,
-        "#{url}/_matrix/app/v1/transactions/#{txn_id}",
-        [{"content-type", "application/json"}, {"authorization", "Bearer #{hs_token}"}],
-        body
-      )
-
-    case Finch.request(req, Axon.Finch, receive_timeout: 10_000) do
-      {:ok, %Finch.Response{status: status}} when status in 200..299 ->
-        :ok
-
-      {:ok, %Finch.Response{status: status}} ->
-        Logger.warning("AppService #{reg["id"]} returned #{status} for txn #{txn_id}")
-
-      {:error, reason} ->
-        Logger.warning("AppService #{reg["id"]} delivery failed: #{inspect(reason)}")
-    end
-  end
+  defp server_name, do: Application.get_env(:axon_web, :server_name, "localhost")
 end

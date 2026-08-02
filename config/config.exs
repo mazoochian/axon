@@ -4,6 +4,12 @@ import Config
 config :axon_web,
   server_name: System.get_env("AXON_SERVER_NAME", "localhost")
 
+# Application Services (bridges/bots) — see AxonWeb.AppService.Manager.
+# Each path is a single-registration JSON file; empty by default (no ASes
+# registered). Populated from AS_REGISTRATION_FILES in config/runtime.exs
+# (prod) or set directly in config/dev.exs / test setup.
+config :axon_web, :appservice_registration_files, []
+
 # Delegated OAuth 2.0 / OIDC auth (MSC3861 / MSC2965) — off by default.
 # When enabled, this homeserver acts purely as an OAuth2 resource server:
 # it does not mint its own access tokens or accept m.login.password/register;

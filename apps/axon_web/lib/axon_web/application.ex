@@ -22,6 +22,8 @@ defmodule AxonWeb.Application do
       AxonWeb.FederationFanout,
       # Application service manager (loads AS registrations, dispatches events)
       AxonWeb.AppService.Manager,
+      # Durable outbound AS event push (PUT .../transactions/:txnId), retried with backoff
+      AxonWeb.AppService.OutboundQueue,
       # In-memory rate limiter (login/register/message-send)
       AxonWeb.RateLimiter,
       # Per-conn_id sliding sync (MSC4186) bandwidth-diffing session cache

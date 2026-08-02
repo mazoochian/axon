@@ -28,6 +28,15 @@ if config_env() == :prod do
   config :axon_web, server_name: server_name
   config :axon_federation, server_name: server_name
 
+  # Application Service registrations — comma-separated list of JSON
+  # registration file paths (one registration per file), e.g.
+  # AS_REGISTRATION_FILES="/etc/axon/appservices/irc.json,/etc/axon/appservices/telegram.json"
+  if as_files = System.get_env("AS_REGISTRATION_FILES") do
+    config :axon_web,
+           :appservice_registration_files,
+           as_files |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+  end
+
   config :axon_web, AxonWeb.FederationEndpoint,
     server: true,
     secret_key_base: secret_key_base
