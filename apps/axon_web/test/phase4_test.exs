@@ -383,31 +383,11 @@ defmodule AxonWeb.Phase4Test do
   end
 
   # -------------------------------------------------------------------------
-  # 4c. Application services
+  # 4c. Application services — see apps/axon_web/test/app_service_*_test.exs
+  # for the real (Phase 16) AS suite. The endpoint previously tested here,
+  # `PUT /_matrix/app/v1/transactions/:txn_id` on axon's own router, was
+  # removed: that path is the *Application Service's* own HTTP server, and
+  # axon is always the caller, never the callee, so a homeserver exposing
+  # it as an inbound route was unreachable by any real bridge.
   # -------------------------------------------------------------------------
-
-  describe "application service transaction endpoint" do
-    test "returns 403 for unknown AS token" do
-      conn =
-        build_conn()
-        |> put_req_header("content-type", "application/json")
-        |> put(
-          "/_matrix/app/v1/transactions/txn1?access_token=invalid_token",
-          Jason.encode!(%{"events" => []})
-        )
-
-      assert conn.status == 403
-      assert decode(conn)["errcode"] == "M_FORBIDDEN"
-    end
-
-    test "returns 403 via Authorization header with bad token" do
-      conn =
-        build_conn()
-        |> put_req_header("content-type", "application/json")
-        |> put_req_header("authorization", "Bearer badtoken")
-        |> put("/_matrix/app/v1/transactions/txn2", Jason.encode!(%{"events" => []}))
-
-      assert conn.status == 403
-    end
-  end
 end

@@ -223,12 +223,15 @@ defmodule AxonWeb.Router do
   end
 
   # -------------------------------------------------------------------------
-  # Application Service inbound transactions (AS auth via token)
+  # NOTE: there is intentionally no `/_matrix/app/v1/...` scope on this
+  # router. That path family is the Application Service's *own* HTTP
+  # server — axon is the caller there (AxonWeb.AppService.Client /
+  # OutboundQueue), never the callee. An earlier revision mistakenly
+  # exposed `PUT /_matrix/app/v1/transactions/:txn_id` on this homeserver's
+  # own router (misreading which side implements it) — removed, since
+  # nothing real would ever call a homeserver's own /app/v1 endpoint. See
+  # ROADMAP.md's Application Services phase.
   # -------------------------------------------------------------------------
-  scope "/_matrix/app/v1", AxonWeb do
-    pipe_through(:api)
-    put("/transactions/:txn_id", AppServiceController, :transaction)
-  end
 
   # -------------------------------------------------------------------------
   # Federation API — inbound from remote servers (X-Matrix auth)
