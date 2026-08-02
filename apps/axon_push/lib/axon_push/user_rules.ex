@@ -11,13 +11,16 @@ defmodule AxonPush.UserRules do
   rule id is a genuine custom rule the user created from scratch, which is
   evaluated before the (possibly-overridden) defaults for that kind.
 
-  Not implemented: the `before`/`after` positioning query params on
-  `PUT .../{kind}/{ruleId}` — custom rules are simply appended in creation
-  order within their kind. This is a real behavior gap (a client asking to
-  insert a rule at a specific position won't get that position honored)
-  but a contained one; exact positioning has no effect on whether
-  notifications fire, only on tie-break ordering among a user's own custom
-  rules, which is rare in practice.
+  Custom-rule order (and hence priority — earlier in a kind's list wins)
+  is `inserted_at` order, which `PUT .../{kind}/{ruleId}?before=<rule_id>`
+  or `?after=<rule_id>` can override: instead of always stamping "now"
+  (append to the end), a positioned insert stamps a synthetic timestamp
+  strictly between the target rule and its current neighbor, so it sorts
+  into that slot without renumbering any other row. `before`/`after` may
+  only reference another *custom* rule of the same kind (not a
+  server-default rule id — matches spec, "not possible to add a rule
+  relative to a predefined server rule": a default id simply won't be
+  found among this kind's custom rows).
   """
 
   import Ecto.Query
@@ -106,18 +109,27 @@ defmodule AxonPush.UserRules do
   writing to a server-default rule id — those can only have `enabled`/
   `actions` overridden via `put_enabled/4` / `put_actions/4`, matching
   spec (a default rule's own conditions/pattern are fixed).
+
+  `attrs["before"]`/`attrs["after"]` (mutually exclusive), if present,
+  must each name another custom rule of the same kind and position this
+  rule immediately more/less important than it; omitted, the rule is
+  appended as the least important custom rule (existing behavior).
   """
   def put_custom_rule(user_id, kind, rule_id, attrs) do
     if default_rule_id?(kind, rule_id) do
       {:error, :cannot_replace_default_rule}
     else
-      upsert(user_id, kind, rule_id, %{
-        is_default: false,
-        pattern: attrs["pattern"],
-        conditions: attrs["conditions"],
-        actions: attrs["actions"] || [],
-        enabled: true
-      })
+      with {:ok, inserted_at} <-
+             resolve_position(user_id, kind, rule_id, attrs["before"], attrs["after"]) do
+        upsert(user_id, kind, rule_id, %{
+          is_default: false,
+          pattern: attrs["pattern"],
+          conditions: attrs["conditions"],
+          actions: attrs["actions"] || [],
+          enabled: true,
+          inserted_at: inserted_at
+        })
+      end
     end
   end
 
@@ -156,20 +168,89 @@ defmodule AxonPush.UserRules do
   # Private
   # ---------------------------------------------------------------------------
 
+  # No positioning requested: fall through to the default "append" behavior
+  # (upsert/2 stamps `now` on insert, leaves it alone on conflict).
+  defp resolve_position(_user_id, _kind, _rule_id, before, after_)
+       when before in [nil, ""] and after_ in [nil, ""] do
+    {:ok, nil}
+  end
+
+  defp resolve_position(_user_id, _kind, _rule_id, before, after_)
+       when before not in [nil, ""] and after_ not in [nil, ""] do
+    {:error, :relative_rule_conflict}
+  end
+
+  defp resolve_position(user_id, kind, rule_id, before, after_) do
+    neighbors =
+      Repo.all(
+        from(r in "user_push_rules",
+          where:
+            r.user_id == ^user_id and r.kind == ^kind and r.is_default == false and
+              r.rule_id != ^rule_id,
+          order_by: [asc: r.inserted_at],
+          select: %{rule_id: r.rule_id, inserted_at: r.inserted_at}
+        )
+      )
+      # Schemaless select decodes the `timestamp` column as NaiveDateTime;
+      # normalize to DateTime so this matches the DateTime.utc_now/1 used
+      # elsewhere in this module for the same column.
+      |> Enum.map(
+        &Map.update!(&1, :inserted_at, fn ndt -> DateTime.from_naive!(ndt, "Etc/UTC") end)
+      )
+
+    target = before || after_
+
+    case Enum.find_index(neighbors, &(&1.rule_id == target)) do
+      nil ->
+        {:error, :relative_rule_not_found}
+
+      idx ->
+        {lower, upper} =
+          if before do
+            {at(neighbors, idx - 1), Enum.at(neighbors, idx).inserted_at}
+          else
+            {Enum.at(neighbors, idx).inserted_at, at(neighbors, idx + 1)}
+          end
+
+        {:ok, midpoint(lower, upper)}
+    end
+  end
+
+  defp at(list, idx) when idx >= 0 and idx < length(list), do: Enum.at(list, idx).inserted_at
+  defp at(_list, _idx), do: nil
+
+  defp midpoint(nil, upper), do: DateTime.add(upper, -1000, :microsecond)
+  defp midpoint(lower, nil), do: DateTime.add(lower, 1000, :microsecond)
+
+  defp midpoint(lower, upper) do
+    mid_us = div(DateTime.to_unix(lower, :microsecond) + DateTime.to_unix(upper, :microsecond), 2)
+    DateTime.from_unix!(mid_us, :microsecond)
+  end
+
+  # `inserted_at` in base_attrs (set only by a positioned put_custom_rule/4
+  # call) is both the value used on insert and, unusually, replaced on
+  # conflict too — repositioning an *existing* custom rule must actually
+  # move it, unlike every other conflict path here which leaves the
+  # original creation order alone.
   defp upsert(user_id, kind, rule_id, base_attrs) do
+    {explicit_inserted_at, base_attrs} = Map.pop(base_attrs, :inserted_at)
+
     row =
       Map.merge(
         %{
           user_id: user_id,
           kind: kind,
           rule_id: rule_id,
-          inserted_at: DateTime.utc_now(:microsecond)
+          inserted_at: explicit_inserted_at || DateTime.utc_now(:microsecond)
         },
         base_attrs
       )
 
+    replace_cols = [:is_default, :pattern, :conditions, :actions, :enabled]
+    replace_cols = if explicit_inserted_at, do: [:inserted_at | replace_cols], else: replace_cols
+
     Repo.insert_all("user_push_rules", [row],
-      on_conflict: {:replace, [:is_default, :pattern, :conditions, :actions, :enabled]},
+      on_conflict: {:replace, replace_cols},
       conflict_target: [:user_id, :kind, :rule_id]
     )
 

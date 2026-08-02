@@ -31,6 +31,7 @@ defmodule AxonMedia.MixProject do
     [
       {:axon_core, in_umbrella: true},
       {:finch, "~> 0.19"},
+      {:mint, "~> 1.9"},
       {:plug, "~> 1.16"}
     ]
   end

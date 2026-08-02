@@ -186,7 +186,7 @@ defmodule AxonWeb.SyncController do
       invited_rooms
       |> Enum.reject(fn room_id -> invite_from_ignored?(room_id, user_id, ignored_users) end)
       |> Enum.into(%{}, fn room_id ->
-        invite_state = build_invite_state(room_id, user_id)
+        invite_state = SyncHelpers.build_invite_state(room_id, user_id)
         {room_id, %{"invite_state" => %{"events" => invite_state}}}
       end)
 
@@ -393,28 +393,6 @@ defmodule AxonWeb.SyncController do
       end
 
     {state_events, Enum.map(tl_events, &EventStore.event_to_map/1), limited, prev}
-  end
-
-  # ---------------------------------------------------------------------------
-  # Invite state builder
-  # ---------------------------------------------------------------------------
-
-  defp build_invite_state(room_id, user_id) do
-    stripped = EventStore.stripped_state_events(room_id)
-
-    case EventStore.get_state_event(room_id, "m.room.member", user_id) do
-      {:ok, invite_event} -> stripped ++ [stripped_event(invite_event)]
-      _ -> stripped
-    end
-  end
-
-  defp stripped_event(event) do
-    %{
-      "type" => event.type,
-      "state_key" => event.state_key,
-      "sender" => event.sender,
-      "content" => event.content || %{}
-    }
   end
 
   # ---------------------------------------------------------------------------

@@ -254,4 +254,28 @@ defmodule AxonWeb.SyncHelpers do
   def room_encrypted?(room_id) do
     EventStore.get_state_event(room_id, "m.room.encryption", "") != {:error, :not_found}
   end
+
+  @doc """
+  Stripped preview state for an invited room, plus `user_id`'s own invite
+  `m.room.member` event — the shape both classic `/sync`'s `invite_state`
+  and sliding sync's `invite_state` use, so the two can't drift on what an
+  invitee is allowed to see before joining.
+  """
+  def build_invite_state(room_id, user_id) do
+    stripped = EventStore.stripped_state_events(room_id)
+
+    case EventStore.get_state_event(room_id, "m.room.member", user_id) do
+      {:ok, invite_event} -> stripped ++ [stripped_event(invite_event)]
+      _ -> stripped
+    end
+  end
+
+  defp stripped_event(event) do
+    %{
+      "type" => event.type,
+      "state_key" => event.state_key,
+      "sender" => event.sender,
+      "content" => event.content || %{}
+    }
+  end
 end

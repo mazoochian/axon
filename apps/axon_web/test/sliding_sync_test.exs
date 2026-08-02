@@ -191,6 +191,151 @@ defmodule AxonWeb.SlidingSyncTest do
     end
   end
 
+  describe "invited/knocked room visibility" do
+    test "an invited room appears with invite_state instead of a timeline" do
+      alice = register("ss_inv_alice_#{System.unique_integer([:positive])}")
+      bob = register("ss_inv_bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(bob.token, %{"name" => "Invited", "invite" => [alice.user_id]})
+
+      body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
+
+      assert %{"ops" => [%{"room_ids" => ids}]} = body["lists"]["main"]
+      assert room_id in ids
+
+      entry = body["rooms"][room_id]
+      assert %{"invite_state" => %{"events" => events}} = entry
+      refute Map.has_key?(entry, "timeline")
+      refute Map.has_key?(entry, "notification_count")
+
+      member_event =
+        Enum.find(events, &(&1["type"] == "m.room.member" and &1["state_key"] == alice.user_id))
+
+      assert member_event["content"]["membership"] == "invite"
+    end
+
+    test "a knocked room appears with knock_state instead of a timeline" do
+      alice = register("ss_knock_alice_#{System.unique_integer([:positive])}")
+      bob = register("ss_knock_bob_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(bob.token, %{
+          "name" => "Knockable",
+          "initial_state" => [
+            %{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}
+          ]
+        })
+
+      conn = authed(alice.token) |> jp("/_matrix/client/v3/knock/#{room_id}", %{})
+      assert conn.status == 200
+
+      body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
+
+      assert %{"ops" => [%{"room_ids" => ids}]} = body["lists"]["main"]
+      assert room_id in ids
+
+      entry = body["rooms"][room_id]
+      assert %{"knock_state" => %{"events" => events}} = entry
+      refute Map.has_key?(entry, "timeline")
+      assert Enum.any?(events, &(&1["type"] == "m.room.join_rules"))
+    end
+
+    test "an invited room can still be reached via room_subscriptions" do
+      alice = register("ss_inv_sub_alice_#{System.unique_integer([:positive])}")
+      bob = register("ss_inv_sub_bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(bob.token, %{"name" => "InvitedSub", "invite" => [alice.user_id]})
+
+      body =
+        sliding_sync(alice.token, %{
+          "lists" => %{},
+          "room_subscriptions" => %{room_id => %{"timeline_limit" => 5}}
+        })
+
+      assert %{"invite_state" => _} = body["rooms"][room_id]
+    end
+  end
+
+  describe "notification/highlight counts" do
+    defp read_receipt(token, room_id, event_id) do
+      conn =
+        authed(token) |> jp("/_matrix/client/v3/rooms/#{room_id}/receipt/m.read/#{event_id}", %{})
+
+      assert conn.status == 200
+    end
+
+    test "counts unread messages from another user since the last read receipt" do
+      alice = register("ss_notif_alice_#{System.unique_integer([:positive])}")
+      bob = register("ss_notif_bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(bob.token, %{"name" => "Notif", "invite" => [alice.user_id]})
+      join_room(alice.token, room_id)
+
+      send_event(bob.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "one"})
+      send_event(bob.token, room_id, "m.room.message", %{"msgtype" => "m.text", "body" => "two"})
+
+      body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
+      # +1 for the invite-for-me event itself — .m.rule.invite_for_me notifies
+      # (without highlighting) by default, same as any other unread notification.
+      assert body["rooms"][room_id]["notification_count"] == 3
+      assert body["rooms"][room_id]["highlight_count"] == 0
+    end
+
+    test "advancing the read receipt drops the count back to 0" do
+      alice = register("ss_notif_ack_alice_#{System.unique_integer([:positive])}")
+      bob = register("ss_notif_ack_bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(bob.token, %{"name" => "Ack", "invite" => [alice.user_id]})
+      join_room(alice.token, room_id)
+
+      event_id =
+        send_event(bob.token, room_id, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => "read me"
+        })
+
+      read_receipt(alice.token, room_id, event_id)
+
+      body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
+      assert body["rooms"][room_id]["notification_count"] == 0
+    end
+
+    test "a message containing the recipient's display name is a highlight" do
+      alice = register("ss_notif_hl_alice_#{System.unique_integer([:positive])}")
+      bob = register("ss_notif_hl_bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(bob.token, %{"name" => "Highlight", "invite" => [alice.user_id]})
+      join_room(alice.token, room_id)
+
+      conn =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/profile/#{alice.user_id}/displayname", %{
+          "displayname" => "Wonderland Alice"
+        })
+
+      assert conn.status == 200
+
+      send_event(bob.token, room_id, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "hey Wonderland Alice, check this out"
+      })
+
+      body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
+      # +1 for the invite-for-me event, same as above; only the display-name
+      # message itself contributes to highlight_count.
+      assert body["rooms"][room_id]["notification_count"] == 2
+      assert body["rooms"][room_id]["highlight_count"] == 1
+    end
+
+    test "the sender's own messages never count toward their own notification_count" do
+      alice = register("ss_notif_self_alice_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"name" => "Self"})
+
+      send_event(alice.token, room_id, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "talking to myself"
+      })
+
+      body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
+      assert body["rooms"][room_id]["notification_count"] == 0
+    end
+  end
+
   describe "long-poll wake-up" do
     test "a nonzero timeout returns as soon as a message arrives in a visible room" do
       alice = register("ss_poll_alice_#{System.unique_integer([:positive])}")

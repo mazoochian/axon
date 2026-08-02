@@ -147,6 +147,94 @@ defmodule AxonPush.UserRulesTest do
     end
   end
 
+  describe "put_custom_rule/4 positioning (before/after)" do
+    @pos_user "@rules_pos_user:localhost"
+
+    defp custom_rule_ids(user, kind) do
+      UserRules.effective_rules(user)[kind]
+      |> Enum.take_while(&(&1["default"] == false))
+      |> Enum.map(& &1["rule_id"])
+    end
+
+    test "with neither before nor after, a new rule is appended last among customs" do
+      :ok = UserRules.put_custom_rule(@pos_user, "room", "a", %{"actions" => []})
+      :ok = UserRules.put_custom_rule(@pos_user, "room", "b", %{"actions" => []})
+
+      assert custom_rule_ids(@pos_user, "room") == ["a", "b"]
+    end
+
+    test "before positions the new rule immediately ahead of the target" do
+      :ok = UserRules.put_custom_rule(@pos_user, "sender", "a", %{"actions" => []})
+      :ok = UserRules.put_custom_rule(@pos_user, "sender", "b", %{"actions" => []})
+      :ok = UserRules.put_custom_rule(@pos_user, "sender", "c", %{"actions" => []})
+
+      :ok =
+        UserRules.put_custom_rule(@pos_user, "sender", "d", %{"actions" => [], "before" => "b"})
+
+      assert custom_rule_ids(@pos_user, "sender") == ["a", "d", "b", "c"]
+    end
+
+    test "after positions the new rule immediately behind the target" do
+      :ok = UserRules.put_custom_rule(@pos_user, "content", "a", %{"actions" => []})
+      :ok = UserRules.put_custom_rule(@pos_user, "content", "b", %{"actions" => []})
+
+      :ok =
+        UserRules.put_custom_rule(@pos_user, "content", "c", %{"actions" => [], "after" => "a"})
+
+      assert custom_rule_ids(@pos_user, "content") == ["a", "c", "b"]
+    end
+
+    test "before on the first rule makes the new rule the new most-important" do
+      :ok = UserRules.put_custom_rule(@pos_user, "underride", "a", %{"actions" => []})
+
+      :ok =
+        UserRules.put_custom_rule(@pos_user, "underride", "z", %{
+          "actions" => [],
+          "before" => "a"
+        })
+
+      assert custom_rule_ids(@pos_user, "underride") == ["z", "a"]
+    end
+
+    test "repositioning an existing custom rule via before actually moves it" do
+      :ok = UserRules.put_custom_rule(@pos_user, "override", "a", %{"actions" => []})
+      :ok = UserRules.put_custom_rule(@pos_user, "override", "b", %{"actions" => []})
+      :ok = UserRules.put_custom_rule(@pos_user, "override", "c", %{"actions" => []})
+      assert custom_rule_ids(@pos_user, "override") == ["a", "b", "c"]
+
+      :ok =
+        UserRules.put_custom_rule(@pos_user, "override", "c", %{
+          "actions" => ["dont_notify"],
+          "before" => "a"
+        })
+
+      assert custom_rule_ids(@pos_user, "override") == ["c", "a", "b"]
+      assert UserRules.get_rule(@pos_user, "override", "c")["actions"] == ["dont_notify"]
+    end
+
+    test "before referencing an unknown or default rule id is rejected" do
+      assert UserRules.put_custom_rule(@pos_user, "room", "x", %{
+               "actions" => [],
+               "before" => "nope"
+             }) == {:error, :relative_rule_not_found}
+
+      assert UserRules.put_custom_rule(@pos_user, "override", "x", %{
+               "actions" => [],
+               "before" => ".m.rule.master"
+             }) == {:error, :relative_rule_not_found}
+    end
+
+    test "specifying both before and after is rejected" do
+      :ok = UserRules.put_custom_rule(@pos_user, "sender", "e1", %{"actions" => []})
+
+      assert UserRules.put_custom_rule(@pos_user, "sender", "e2", %{
+               "actions" => [],
+               "before" => "e1",
+               "after" => "e1"
+             }) == {:error, :relative_rule_conflict}
+    end
+  end
+
   describe "delete_rule/3" do
     test "deleting a custom rule removes it entirely" do
       :ok =

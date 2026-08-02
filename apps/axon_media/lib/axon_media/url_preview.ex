@@ -14,15 +14,24 @@ defmodule AxonMedia.UrlPreview do
       the same validation re-applied to every hop, rather than letting the
       HTTP client silently follow a redirect into a blocked address
     - response size and total time are capped
+    - the connection is pinned to the exact address that was validated
+      (see "DNS rebinding" below) — connects a raw `Mint.HTTP` socket to
+      that literal address rather than handing the hostname to an HTTP
+      client that would resolve it a second time
 
-  Known limitation: not immune to DNS rebinding (the DNS answer changing
-  between our resolve-and-validate check and the HTTP client's own
-  connection a moment later) — fully closing that needs pinning the
-  connection to the specific address that was validated, which isn't
-  implemented here. This still blocks the overwhelming majority of
-  real-world SSRF payloads: literal private/loopback addresses, cloud
-  metadata endpoints (169.254.169.254), and any hostname that simply
-  resolves to a private range.
+  ## DNS rebinding
+
+  A naive validate-then-fetch split has a TOCTOU gap: validate the
+  hostname's DNS answer, then hand the same hostname to an HTTP client,
+  which resolves it *again* to actually connect — a rebinding attacker
+  (short TTL, or a DNS server that alternates answers) can return a public
+  address for the validation lookup and a private one for the client's own
+  lookup a moment later. Closed here by resolving once, validating that
+  answer, and connecting directly to that literal address (`Mint.HTTP.connect/4`
+  with `address` set to the validated IP tuple and `hostname:` set
+  separately for the `Host` header, TLS SNI, and certificate hostname
+  verification) — there is no second resolution for an attacker to win a
+  race against.
   """
 
   require Logger
@@ -88,8 +97,8 @@ defmodule AxonMedia.UrlPreview do
   defp fetch_and_parse(_url, 0, _server_name), do: {:error, :too_many_redirects}
 
   defp fetch_and_parse(url, redirects_left, server_name) do
-    with :ok <- validate_url(url),
-         {:ok, status, headers, body} <- http_get(url) do
+    with {:ok, address} <- validate_url(url),
+         {:ok, status, headers, body} <- http_get(url, address) do
       cond do
         status in 300..399 ->
           case find_header(headers, "location") do
@@ -210,12 +219,19 @@ defmodule AxonMedia.UrlPreview do
   # SSRF validation
   # ---------------------------------------------------------------------------
 
+  # Returns {:ok, address} — the single literal address the actual
+  # connection must be pinned to (see moduledoc "DNS rebinding"), not just
+  # `:ok`. Still blocks if *any* resolved address is private, not only the
+  # one we'd pin to: an attacker-controlled resolver returning a mix of
+  # public/private answers for one hostname is itself a red flag worth
+  # rejecting outright, even though pinning alone would already prevent
+  # the private one from ever being dialed.
   defp validate_url(url) do
     with %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) <-
            URI.parse(url),
          {:ok, addresses} <- resolve(host),
          false <- Enum.any?(addresses, &private_address?/1) do
-      :ok
+      {:ok, hd(addresses)}
     else
       %URI{} -> {:error, :invalid_url}
       {:error, _} = err -> err
@@ -281,43 +297,94 @@ defmodule AxonMedia.UrlPreview do
   # HTTP fetch (size + time capped)
   # ---------------------------------------------------------------------------
 
-  defp http_get(url) do
-    request = Finch.build(:get, url, [{"user-agent", "axon-url-preview/1.0"}])
+  # Connects directly to `address` (the literal IP validate_url/1 already
+  # checked) rather than to `url`'s hostname — closes the DNS-rebinding gap
+  # documented in the moduledoc. `hostname:` still carries the original
+  # host for the Host header, TLS SNI, and certificate hostname
+  # verification, so a normal https:// preview of a virtual-hosted site
+  # still works correctly.
+  defp http_get(url, address) do
+    uri = URI.parse(url)
+    scheme = String.to_existing_atom(uri.scheme)
+    port = uri.port || default_port(scheme)
+    path = request_path(uri)
 
-    result =
-      Finch.stream(
-        request,
-        Axon.Finch,
-        {nil, [], <<>>},
-        fn
-          {:status, status}, {_s, h, b} ->
-            {:cont, {status, h, b}}
+    connect_opts = [hostname: uri.host, transport_opts: [timeout: @fetch_timeout]]
 
-          {:headers, headers}, {s, h, b} ->
-            {:cont, {s, h ++ headers, b}}
-
-          {:data, chunk}, {s, h, b} ->
-            new_body = b <> chunk
-
-            if byte_size(new_body) > @max_body_bytes,
-              do: {:halt, {s, h, new_body}},
-              else: {:cont, {s, h, new_body}}
-        end,
-        receive_timeout: @fetch_timeout
-      )
-
-    case result do
-      {:ok, {status, headers, body}} when byte_size(body) <= @max_body_bytes ->
-        {:ok, status, headers, body}
-
-      {:ok, {_status, _headers, _body}} ->
-        {:error, :response_too_large}
-
+    with {:ok, conn} <- Mint.HTTP.connect(scheme, address, port, connect_opts),
+         {:ok, conn, ref} <-
+           Mint.HTTP.request(conn, "GET", path, [{"user-agent", "axon-url-preview/1.0"}], nil) do
+      deadline = System.monotonic_time(:millisecond) + @fetch_timeout
+      acc = %{status: nil, headers: [], body: <<>>, done: false, error: nil}
+      result = receive_response(conn, ref, acc, deadline)
+      Mint.HTTP.close(conn)
+      result
+    else
       {:error, reason} ->
+        Logger.warning("URL preview fetch failed for #{url}: #{inspect(reason)}")
+        {:error, :fetch_failed}
+
+      {:error, conn, reason} ->
+        Mint.HTTP.close(conn)
         Logger.warning("URL preview fetch failed for #{url}: #{inspect(reason)}")
         {:error, :fetch_failed}
     end
   end
+
+  defp request_path(%URI{path: path, query: query}) do
+    base = path || "/"
+    if query, do: base <> "?" <> query, else: base
+  end
+
+  defp default_port(:https), do: 443
+  defp default_port(:http), do: 80
+
+  defp receive_response(conn, ref, acc, deadline_ms) do
+    cond do
+      byte_size(acc.body) > @max_body_bytes ->
+        {:error, :response_too_large}
+
+      acc.error ->
+        {:error, acc.error}
+
+      acc.done ->
+        {:ok, acc.status, acc.headers, acc.body}
+
+      true ->
+        timeout = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+        receive do
+          message ->
+            case Mint.HTTP.stream(conn, message) do
+              {:ok, conn, responses} ->
+                receive_response(
+                  conn,
+                  ref,
+                  Enum.reduce(responses, acc, &apply_response(&1, &2, ref)),
+                  deadline_ms
+                )
+
+              {:error, _conn, reason, _responses} ->
+                {:error, reason}
+
+              :unknown ->
+                receive_response(conn, ref, acc, deadline_ms)
+            end
+        after
+          timeout -> {:error, :timeout}
+        end
+    end
+  end
+
+  defp apply_response({:status, ref, status}, acc, ref), do: %{acc | status: status}
+
+  defp apply_response({:headers, ref, headers}, acc, ref),
+    do: %{acc | headers: acc.headers ++ headers}
+
+  defp apply_response({:data, ref, data}, acc, ref), do: %{acc | body: acc.body <> data}
+  defp apply_response({:done, ref}, acc, ref), do: %{acc | done: true}
+  defp apply_response({:error, ref, reason}, acc, ref), do: %{acc | error: reason}
+  defp apply_response(_other, acc, _ref), do: acc
 
   defp find_header(headers, name) do
     Enum.find_value(headers, fn {k, v} -> if String.downcase(k) == name, do: v end)

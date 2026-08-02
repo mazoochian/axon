@@ -100,6 +100,37 @@ defmodule AxonWeb.PushRulesControllerTest do
     assert "custom" in override_ids
   end
 
+  test "put_rule honors the before query param to position a custom rule" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    authed(alice.token)
+    |> jpu("/_matrix/client/v3/pushrules/global/room/a", %{"actions" => []})
+
+    authed(alice.token)
+    |> jpu("/_matrix/client/v3/pushrules/global/room/b", %{"actions" => []})
+
+    conn =
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/pushrules/global/room/c?before=b", %{"actions" => []})
+
+    assert conn.status == 200
+
+    index_conn = authed(alice.token) |> get("/_matrix/client/v3/pushrules/")
+    room_ids = decode(index_conn)["global"]["room"] |> Enum.map(& &1["rule_id"])
+    assert room_ids == ["a", "c", "b"]
+  end
+
+  test "put_rule rejects a before pointing at a nonexistent rule" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    conn =
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/pushrules/global/room/x?before=nope", %{"actions" => []})
+
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_NOT_FOUND"
+  end
+
   test "put_rule_enabled/put_rule_actions override a server-default rule without replacing its conditions" do
     alice = register("alice_#{System.unique_integer([:positive])}")
 

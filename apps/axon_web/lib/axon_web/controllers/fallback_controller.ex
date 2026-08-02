@@ -119,6 +119,24 @@ defmodule AxonWeb.FallbackController do
     })
   end
 
+  def call(conn, {:error, :relative_rule_conflict}) do
+    conn
+    |> put_status(400)
+    |> json(%{
+      "errcode" => "M_INVALID_PARAM",
+      "error" => "Cannot specify both before and after"
+    })
+  end
+
+  def call(conn, {:error, :relative_rule_not_found}) do
+    conn
+    |> put_status(400)
+    |> json(%{
+      "errcode" => "M_NOT_FOUND",
+      "error" => "before/after rule not found (must be another custom rule of the same kind)"
+    })
+  end
+
   def call(conn, {:error, :room_blocked}) do
     conn
     |> put_status(403)

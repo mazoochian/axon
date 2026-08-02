@@ -4,12 +4,20 @@ defmodule AxonWeb.SlidingSyncController do
 
   A pragmatic subset of the MSC, not full conformance:
 
-    * Only joined rooms participate in `lists`/`room_subscriptions` — invited/
-      knocked/left rooms aren't exposed here yet (classic `/sync`, kept
-      alongside this endpoint, still covers those). Exposing them safely
-      would mean re-deriving the same invite-state-only visibility rules
-      `SyncController.build_invite_state/2` already enforces for classic
-      sync; deferred rather than half-done.
+    * Invited and knocked rooms now participate in `lists`/`room_subscriptions`
+      alongside joined ones — each gets `invite_state`/`knock_state` (stripped
+      preview state, the same shape as classic `/sync`) instead of a
+      timeline/required_state/counts, via the same `SyncHelpers.build_invite_state/2`
+      classic sync uses so the two can't drift on what an invitee is allowed
+      to see before joining. Left rooms are deliberately *not* given an
+      equivalent bucket: unlike classic sync's incremental delta model
+      (where a `leave` entry is the only signal a client gets), every
+      sliding sync response here already re-sends a full `SYNC` op per
+      range with no diffing (see below) — a room the user left simply stops
+      appearing in the next response, which is itself the removal signal.
+      Adding a real "you left" event would mean building the same
+      incremental-delta plumbing classic sync has, for a signal this
+      architecture already gives for free.
     * `sort` only ever behaves as `by_recency` (by each room's newest event),
       regardless of what the client requests.
     * Every response re-sends a full `SYNC` op per range rather than diffing
@@ -19,10 +27,18 @@ defmodule AxonWeb.SlidingSyncController do
     * Extension params aren't sticky across requests — a client must resend
       `"enabled": true` (and any config) on every request, not just the first
       time it turns an extension on.
-    * `notification_count`/`highlight_count` are always 0 — this codebase
-      doesn't compute per-room unread/highlight counts anywhere yet (not
-      even in classic `/sync` or push dispatch), so this isn't a regression,
-      just a shared known gap.
+    * `notification_count`/`highlight_count` are computed per room by
+      re-evaluating this user's push rules (`AxonPush.RuleEvaluator`)
+      against every event since their `m.read` receipt (room start if
+      they've never sent one), capped at #{inspect(500)} scanned events —
+      a room with more unread events than that undercounts rather than
+      doing unbounded work on every sync poll. Real homeservers avoid the
+      cap by maintaining a push-actions table incrementally as events
+      arrive instead of recomputing on read; that's a bigger lift than
+      this pass covers. Classic `/sync` doesn't get this (still always 0
+      there) — kept local to sliding sync rather than promoted to the
+      shared `SyncHelpers`, deliberately, to avoid claiming classic sync
+      also changed.
 
   Long-poll wake-up reuses `AxonSync.Manager.wait_for_events/3` exactly as
   classic sync does, so the Phase 8 wake-up fixes (to-device, device-list,
@@ -33,8 +49,11 @@ defmodule AxonWeb.SlidingSyncController do
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
+  alias AxonPush.{RuleEvaluator, UserRules}
   alias AxonSync.Manager, as: SyncManager
   alias AxonWeb.SyncHelpers
+
+  @notification_scan_cap 500
 
   # POST /_matrix/client/unstable/org.matrix.msc4186/sync
   def sync(conn, params) do
@@ -65,22 +84,28 @@ defmodule AxonWeb.SlidingSyncController do
     next_ordering = max(next_ordering, since_ordering)
 
     joined_rooms = EventStore.get_joined_rooms(user_id)
+    invited_rooms = EventStore.get_invited_rooms(user_id)
+    knocked_rooms = EventStore.get_knocked_rooms(user_id)
+    membership_by_room = membership_map(joined_rooms, invited_rooms, knocked_rooms)
+    all_room_ids = joined_rooms ++ invited_rooms ++ knocked_rooms
+
     dm_ids = dm_room_ids(user_id)
-    recency = EventStore.room_recency_map(joined_rooms)
+    recency = EventStore.room_recency_map(all_room_ids)
 
     {lists_resp, room_configs_from_lists} =
-      build_lists(joined_rooms, recency, dm_ids, lists_req)
+      build_lists(all_room_ids, recency, dm_ids, lists_req)
 
     subscribed_configs =
       room_subscriptions_req
-      |> Enum.filter(fn {room_id, _cfg} -> room_id in joined_rooms end)
+      |> Enum.filter(fn {room_id, _cfg} -> room_id in all_room_ids end)
       |> Map.new()
 
     room_configs = merge_room_configs(room_configs_from_lists, subscribed_configs)
 
     rooms_resp =
       Enum.into(room_configs, %{}, fn {room_id, cfg} ->
-        {room_id, build_room_entry(room_id, user_id, cfg, is_initial, dm_ids)}
+        membership = Map.fetch!(membership_by_room, room_id)
+        {room_id, build_room_entry(room_id, user_id, cfg, is_initial, dm_ids, membership)}
       end)
 
     visible_room_ids = Map.keys(room_configs)
@@ -203,11 +228,33 @@ defmodule AxonWeb.SlidingSyncController do
     end)
   end
 
+  defp membership_map(joined_rooms, invited_rooms, knocked_rooms) do
+    Map.new(joined_rooms, &{&1, :join})
+    |> Map.merge(Map.new(invited_rooms, &{&1, :invite}))
+    |> Map.merge(Map.new(knocked_rooms, &{&1, :knock}))
+  end
+
   # ---------------------------------------------------------------------------
   # Per-room data
   # ---------------------------------------------------------------------------
 
-  defp build_room_entry(room_id, user_id, cfg, is_initial, dm_ids) do
+  defp build_room_entry(room_id, user_id, _cfg, is_initial, dm_ids, :invite) do
+    %{
+      "initial" => is_initial,
+      "invite_state" => %{"events" => SyncHelpers.build_invite_state(room_id, user_id)},
+      "is_dm" => MapSet.member?(dm_ids, room_id)
+    }
+  end
+
+  defp build_room_entry(room_id, user_id, _cfg, is_initial, dm_ids, :knock) do
+    %{
+      "initial" => is_initial,
+      "knock_state" => %{"events" => EventStore.get_knock_preview_state(room_id, user_id)},
+      "is_dm" => MapSet.member?(dm_ids, room_id)
+    }
+  end
+
+  defp build_room_entry(room_id, user_id, cfg, is_initial, dm_ids, :join) do
     timeline_limit = cfg["timeline_limit"] || 0
 
     raw_timeline =
@@ -223,6 +270,7 @@ defmodule AxonWeb.SlidingSyncController do
       resolve_required_state(room_id, user_id, cfg["required_state"] || [], raw_timeline)
 
     counts = EventStore.member_counts(room_id)
+    unread = unread_counts(room_id, user_id)
 
     prev_batch =
       case raw_timeline do
@@ -237,12 +285,60 @@ defmodule AxonWeb.SlidingSyncController do
       "required_state" => required_state,
       "timeline" => timeline_maps,
       "prev_batch" => prev_batch,
-      "notification_count" => 0,
-      "highlight_count" => 0,
+      "notification_count" => unread.notification_count,
+      "highlight_count" => unread.highlight_count,
       "joined_count" => counts.joined,
       "invited_count" => counts.invited,
       "is_dm" => MapSet.member?(dm_ids, room_id)
     }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Notification/highlight counts
+  # ---------------------------------------------------------------------------
+
+  defp unread_counts(room_id, user_id) do
+    since_ordering = read_receipt_ordering(room_id, user_id)
+    rules = UserRules.effective_rules(user_id)
+
+    room_id
+    |> EventStore.get_events_since(since_ordering, @notification_scan_cap)
+    |> Enum.reject(&(&1.sender == user_id))
+    |> Enum.reduce(%{notification_count: 0, highlight_count: 0}, fn event, acc ->
+      case RuleEvaluator.should_notify?(EventStore.event_to_map(event), room_id, user_id, rules) do
+        {:notify, actions} ->
+          acc = %{acc | notification_count: acc.notification_count + 1}
+          if highlight?(actions), do: %{acc | highlight_count: acc.highlight_count + 1}, else: acc
+
+        :dont_notify ->
+          acc
+      end
+    end)
+  end
+
+  defp read_receipt_ordering(room_id, user_id) do
+    receipt_event_id =
+      Repo.one(
+        from(r in "receipts",
+          where: r.room_id == ^room_id and r.user_id == ^user_id and r.receipt_type == "m.read",
+          select: r.event_id
+        )
+      )
+
+    with event_id when not is_nil(event_id) <- receipt_event_id,
+         {:ok, event} <- EventStore.get_event(event_id) do
+      event.stream_ordering
+    else
+      _ -> 0
+    end
+  end
+
+  defp highlight?(actions) do
+    Enum.any?(actions, fn
+      %{"set_tweak" => "highlight", "value" => value} -> value != false
+      %{"set_tweak" => "highlight"} -> true
+      _ -> false
+    end)
   end
 
   defp room_name(room_id) do
