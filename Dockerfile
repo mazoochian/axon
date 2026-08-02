@@ -40,6 +40,11 @@ RUN groupadd --system axon && useradd --system --create-home --gid axon --home-d
 
 COPY --from=builder --chown=axon:axon /app/_build/prod/rel/axon /axon
 
+# Default mount point for SIGNING_KEY_PATH (see config/runtime.exs,
+# AxonCrypto.KeyServer) — pre-created and owned by axon so a volume mounted
+# here on first run inherits the same ownership rather than root's.
+RUN mkdir -p /axon/data && chown axon:axon /axon/data
+
 USER axon
 WORKDIR /axon
 

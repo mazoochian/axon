@@ -32,6 +32,16 @@ if config_env() == :prod do
     server: true,
     secret_key_base: secret_key_base
 
+  # Optional — leave unset and the server's Ed25519 signing identity is
+  # regenerated fresh (in memory only) on every restart, which is fine for
+  # a one-off/throwaway deployment but invalidates every cached
+  # `/_matrix/key/v2/server` response and every signature another server
+  # already verified against the old key on a real, long-lived one. Point
+  # this at a path on a persistent volume to keep the same identity across
+  # restarts (generated and written there on first boot if it doesn't
+  # exist yet). See AxonCrypto.KeyServer.
+  config :axon_crypto, signing_key_path: System.get_env("SIGNING_KEY_PATH")
+
   if System.get_env("OIDC_ISSUER") do
     config :axon_web, :oidc,
       enabled: true,

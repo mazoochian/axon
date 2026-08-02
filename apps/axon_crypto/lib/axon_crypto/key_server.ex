@@ -2,15 +2,16 @@ defmodule AxonCrypto.KeyServer do
   @moduledoc """
   GenServer holding the local homeserver's Ed25519 signing keypair.
 
-  On start it generates (or loads from config) the server's signing key.
-  All event signing goes through this process.
-
-  TODO: `init/1` currently always generates a fresh keypair in memory and
-  never persists or reloads it — the server's signing identity changes on
-  every restart. This invalidates cached `/_matrix/key/v2/server` responses
-  and any signatures other servers verified against the old key. Fix by
-  persisting the keypair (DB or config-supplied) and loading it here if
-  present instead of unconditionally calling generate_keypair/0.
+  On start, loads the keypair from `:axon_crypto, :signing_key_path` if
+  configured (config/runtime.exs, prod only — generating and persisting
+  one there on first boot if the file doesn't exist yet), or generates a
+  fresh in-memory-only one otherwise. Fixes what used to be a hard TODO
+  here: with no path configured, every restart minted a brand new signing
+  identity, invalidating every cached `/_matrix/key/v2/server` response and
+  every signature another server had verified against the old key. An
+  unset path (the default in dev/test/CI, where identity persistence
+  across restarts doesn't matter) keeps that always-fresh behavior
+  unchanged. All event signing goes through this process.
   """
 
   use GenServer
@@ -51,7 +52,7 @@ defmodule AxonCrypto.KeyServer do
   @impl true
   def init(opts) do
     server_name = Keyword.fetch!(opts, :server_name)
-    {key_id, public_key, private_key} = generate_keypair()
+    {key_id, public_key, private_key} = load_or_generate_keypair()
     valid_until_ts = System.os_time(:millisecond) + @key_expiry_ms
 
     Logger.info("KeyServer started for #{server_name} with key_id #{key_id}")
@@ -131,5 +132,49 @@ defmodule AxonCrypto.KeyServer do
     {public_key, private_key} = :crypto.generate_key(:eddsa, :ed25519)
     key_id = "ed25519:" <> (Base.url_encode64(public_key, padding: false) |> binary_part(0, 6))
     {key_id, public_key, private_key}
+  end
+
+  # No path configured (dev/test/CI default): always-fresh, in-memory only —
+  # unchanged from before persistence existed.
+  defp load_or_generate_keypair do
+    case Application.get_env(:axon_crypto, :signing_key_path) do
+      nil -> generate_keypair()
+      path -> load_or_generate_keypair(path)
+    end
+  end
+
+  defp load_or_generate_keypair(path) do
+    case File.read(path) do
+      {:ok, contents} ->
+        decode_keypair!(contents)
+
+      {:error, :enoent} ->
+        keypair = generate_keypair()
+        persist_keypair!(path, keypair)
+        keypair
+    end
+  end
+
+  defp decode_keypair!(contents) do
+    %{"key_id" => key_id, "public_key" => pub_b64, "private_key" => priv_b64} =
+      Jason.decode!(contents)
+
+    {:ok, public_key} = Base.decode64(pub_b64, padding: false)
+    {:ok, private_key} = Base.decode64(priv_b64, padding: false)
+    {key_id, public_key, private_key}
+  end
+
+  defp persist_keypair!(path, {key_id, public_key, private_key}) do
+    doc =
+      Jason.encode!(%{
+        "key_id" => key_id,
+        "public_key" => Base.encode64(public_key, padding: false),
+        "private_key" => Base.encode64(private_key, padding: false)
+      })
+
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, doc)
+    # Contains the private signing key — readable only by the process owner.
+    File.chmod!(path, 0o600)
   end
 end

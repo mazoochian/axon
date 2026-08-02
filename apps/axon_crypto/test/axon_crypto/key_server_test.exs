@@ -128,4 +128,91 @@ defmodule AxonCrypto.KeyServerTest do
       assert Map.has_key?(signed, "signatures")
     end
   end
+
+  describe "signing key persistence (:axon_crypto, :signing_key_path)" do
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "axon_test_signing_key_#{System.unique_integer([:positive])}.json"
+        )
+
+      Application.put_env(:axon_crypto, :signing_key_path, path)
+
+      on_exit(fn ->
+        Application.delete_env(:axon_crypto, :signing_key_path)
+        File.rm(path)
+      end)
+
+      %{path: path}
+    end
+
+    test "with no path configured, two servers still get distinct in-memory keys" do
+      Application.delete_env(:axon_crypto, :signing_key_path)
+
+      name1 = :"key_server_ephemeral_#{System.unique_integer([:positive])}"
+      name2 = :"key_server_ephemeral_#{System.unique_integer([:positive])}"
+
+      {:ok, _} =
+        GenServer.start_link(KeyServer, [server_name: "ephemeral.example.org"], name: name1)
+
+      {:ok, _} =
+        GenServer.start_link(KeyServer, [server_name: "ephemeral.example.org"], name: name2)
+
+      refute GenServer.call(name1, :server_key_info).key_id ==
+               GenServer.call(name2, :server_key_info).key_id
+    end
+
+    test "generates and persists a keypair on first boot, then reloads the same one on the next",
+         %{path: path} do
+      name1 = :"key_server_persist_#{System.unique_integer([:positive])}"
+
+      {:ok, _pid1} =
+        GenServer.start_link(KeyServer, [server_name: "persist.example.org"], name: name1)
+
+      info1 = GenServer.call(name1, :server_key_info)
+
+      assert File.exists?(path)
+
+      name2 = :"key_server_persist_#{System.unique_integer([:positive])}"
+
+      {:ok, _pid2} =
+        GenServer.start_link(KeyServer, [server_name: "persist.example.org"], name: name2)
+
+      info2 = GenServer.call(name2, :server_key_info)
+
+      assert info1.key_id == info2.key_id
+      assert info1.public_key_b64 == info2.public_key_b64
+    end
+
+    test "the reloaded key still produces signatures verifiable against its own public key", %{
+      path: path
+    } do
+      name1 = :"key_server_persist_sig_#{System.unique_integer([:positive])}"
+      {:ok, _} = GenServer.start_link(KeyServer, [server_name: "sig.example.org"], name: name1)
+      assert File.exists?(path)
+
+      name2 = :"key_server_persist_sig_#{System.unique_integer([:positive])}"
+      {:ok, _} = GenServer.start_link(KeyServer, [server_name: "sig.example.org"], name: name2)
+
+      {_key_id, sig_b64} = GenServer.call(name2, {:sign, "reloaded key payload"})
+      info = GenServer.call(name2, :server_key_info)
+
+      {:ok, pub_key} = Base.decode64(info.public_key_b64, padding: false)
+      {:ok, sig_bytes} = Base.decode64(sig_b64, padding: false)
+
+      assert :crypto.verify(:eddsa, :none, "reloaded key payload", sig_bytes, [
+               pub_key,
+               :ed25519
+             ])
+    end
+
+    test "the persisted file is only readable/writable by its owner", %{path: path} do
+      name = :"key_server_perm_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = GenServer.start_link(KeyServer, [server_name: "perm.example.org"], name: name)
+
+      mode = File.stat!(path).mode |> Bitwise.band(0o777)
+      assert mode == 0o600
+    end
+  end
 end

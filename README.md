@@ -129,6 +129,7 @@ The server is now listening at `http://localhost:8008`. You can point any Matrix
 | `POOL_SIZE` | `20` | Ecto connection pool size |
 | `SECRET_KEY_BASE` | *none* | 64-byte Phoenix secret key. **Required in production** — the release refuses to boot without it (generate with `openssl rand -hex 32`) |
 | `SENTRY_DSN` | *unset* | Optional. Enables crash reporting via [Sentry](https://sentry.io) when set; the app runs normally without it |
+| `SIGNING_KEY_PATH` | *unset* | Optional. Path to persist the server's federation signing key across restarts (generated there on first boot if missing). Unset means a fresh identity every restart — fine for throwaway/dev use, not for a real deployment (invalidates cached `/_matrix/key/v2/server` responses and prior signatures). `docker-compose.yml` already mounts a volume at the default path, `/axon/data/signing.key` |
 
 ## Deploying with Docker
 
