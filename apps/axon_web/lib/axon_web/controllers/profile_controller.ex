@@ -93,15 +93,33 @@ defmodule AxonWeb.ProfileController do
 
       server ->
         if server == local_server_name() do
-          case UserStore.get_profile(user_id) do
-            {:ok, profile} ->
-              {:ok, %{"displayname" => profile.displayname, "avatar_url" => profile.avatar_url}}
-
-            error ->
-              error
-          end
+          fetch_local_profile(user_id)
         else
           fetch_remote_profile(server, user_id)
+        end
+    end
+  end
+
+  defp fetch_local_profile(user_id) do
+    case UserStore.get_profile(user_id) do
+      {:ok, profile} ->
+        {:ok, %{"displayname" => profile.displayname, "avatar_url" => profile.avatar_url}}
+
+      {:error, :not_found} = error ->
+        # On-demand provisioning (spec: `GET /_matrix/app/v1/users/:userId`)
+        # — an AS claiming this user may lazily create it before we give up.
+        case AxonWeb.AppService.Manager.maybe_provision_user(user_id) do
+          :ok ->
+            case UserStore.get_profile(user_id) do
+              {:ok, profile} ->
+                {:ok, %{"displayname" => profile.displayname, "avatar_url" => profile.avatar_url}}
+
+              _ ->
+                error
+            end
+
+          :not_found ->
+            error
         end
     end
   end

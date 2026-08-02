@@ -260,6 +260,7 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
     entry = %{
       method: conn.method,
       path: conn.request_path,
+      query_string: conn.query_string,
       headers: conn.req_headers,
       body: conn.body_params
     }

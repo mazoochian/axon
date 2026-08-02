@@ -5,6 +5,7 @@ defmodule AxonWeb.DirectoryController do
 
   import Ecto.Query
   alias AxonCore.Repo
+  alias AxonWeb.AppService
 
   # GET/POST /_matrix/client/v3/publicRooms
   def public_rooms(conn, params) do
@@ -134,39 +135,60 @@ defmodule AxonWeb.DirectoryController do
 
   # GET /_matrix/client/v3/directory/room/:room_alias
   def get_alias(conn, %{"room_alias" => room_alias}) do
-    case Repo.one(
-           from(a in "room_aliases",
-             where: a.alias == ^room_alias,
-             select: a.room_id
-           )
-         ) do
+    case lookup_alias(room_alias) do
       nil ->
-        {:error, :not_found}
+        # On-demand provisioning (spec: `GET /_matrix/app/v1/rooms/:roomAlias`)
+        # — an AS claiming this alias may lazily create the room via its own
+        # C-S API call, so give it the chance before answering not-found.
+        case AppService.Manager.maybe_provision_alias(room_alias) do
+          :ok ->
+            case lookup_alias(room_alias) do
+              nil -> {:error, :not_found}
+              room_id -> json(conn, %{"room_id" => room_id, "servers" => [server_name()]})
+            end
+
+          :not_found ->
+            {:error, :not_found}
+        end
 
       room_id ->
         json(conn, %{"room_id" => room_id, "servers" => [server_name()]})
     end
   end
 
+  defp lookup_alias(room_alias) do
+    Repo.one(from(a in "room_aliases", where: a.alias == ^room_alias, select: a.room_id))
+  end
+
   # PUT /_matrix/client/v3/directory/room/:room_alias
   def put_alias(conn, %{"room_alias" => room_alias, "room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
+    requesting_as = conn.assigns[:appservice]
 
-    Repo.insert_all(
-      "room_aliases",
-      [
-        %{
-          alias: room_alias,
-          room_id: room_id,
-          creator: user_id,
-          inserted_at: DateTime.utc_now(:microsecond),
-          updated_at: DateTime.utc_now(:microsecond)
-        }
-      ],
-      on_conflict: :nothing
-    )
+    if AppService.Manager.exclusive_conflict?(:aliases, room_alias, requesting_as) do
+      conn
+      |> put_status(400)
+      |> json(%{
+        "errcode" => "M_EXCLUSIVE",
+        "error" => "#{room_alias} is reserved by an application service"
+      })
+    else
+      Repo.insert_all(
+        "room_aliases",
+        [
+          %{
+            alias: room_alias,
+            room_id: room_id,
+            creator: user_id,
+            inserted_at: DateTime.utc_now(:microsecond),
+            updated_at: DateTime.utc_now(:microsecond)
+          }
+        ],
+        on_conflict: :nothing
+      )
 
-    json(conn, %{})
+      json(conn, %{})
+    end
   end
 
   def put_alias(conn, _params) do

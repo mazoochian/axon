@@ -7,35 +7,53 @@ defmodule AxonWeb.RoomController do
   alias AxonCore.{EventStore, Repo}
   alias AxonRoom.{CreateRoom, RestrictedJoin, RoomProcess, RoomUpgrade}
   alias AxonSync.Typing
+  alias AxonWeb.AppService
 
   # POST /_matrix/client/v3/createRoom
   def create(conn, params) do
     user_id = conn.assigns.current_user_id
     server_name = Application.fetch_env!(:axon_web, :server_name)
 
-    # Validate room_version type — must be string if present
-    if Map.has_key?(params, "room_version") and not is_binary(params["room_version"]) do
-      conn
-      |> put_status(400)
-      |> json(%{"errcode" => "M_BAD_JSON", "error" => "room_version must be a string"})
-    else
-      opts = [
-        server_name: server_name,
-        name: params["name"],
-        topic: params["topic"],
-        preset: params["preset"],
-        is_direct: params["is_direct"],
-        invite: params["invite"] || [],
-        room_alias_name: params["room_alias_name"],
-        version: params["room_version"],
-        creation_content: params["creation_content"],
-        initial_state: params["initial_state"] || [],
-        visibility: params["visibility"]
-      ]
+    full_alias =
+      params["room_alias_name"] && "##{params["room_alias_name"]}:#{server_name}"
 
-      with {:ok, room_id} <- CreateRoom.execute(user_id, opts) do
-        json(conn, %{"room_id" => room_id})
-      end
+    # Validate room_version type — must be string if present
+    cond do
+      Map.has_key?(params, "room_version") and not is_binary(params["room_version"]) ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_BAD_JSON", "error" => "room_version must be a string"})
+
+      # Same exclusive-namespace rule as PUT /directory/room/:alias — a
+      # room_alias_name is just alias creation happening inline with
+      # createRoom instead of as a separate call.
+      full_alias &&
+          AppService.Manager.exclusive_conflict?(:aliases, full_alias, conn.assigns[:appservice]) ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_EXCLUSIVE",
+          "error" => "#{full_alias} is reserved by an application service"
+        })
+
+      true ->
+        opts = [
+          server_name: server_name,
+          name: params["name"],
+          topic: params["topic"],
+          preset: params["preset"],
+          is_direct: params["is_direct"],
+          invite: params["invite"] || [],
+          room_alias_name: params["room_alias_name"],
+          version: params["room_version"],
+          creation_content: params["creation_content"],
+          initial_state: params["initial_state"] || [],
+          visibility: params["visibility"]
+        ]
+
+        with {:ok, room_id} <- CreateRoom.execute(user_id, opts) do
+          json(conn, %{"room_id" => room_id})
+        end
     end
   end
 
@@ -347,6 +365,8 @@ defmodule AxonWeb.RoomController do
 
     cond do
       params["user_id"] ->
+        maybe_provision_invitee(params["user_id"])
+
         with {:ok, _event_id} <-
                RoomProcess.send_event(
                  room_id,
@@ -596,18 +616,26 @@ defmodule AxonWeb.RoomController do
     cond do
       String.starts_with?(room_id_or_alias, "#") ->
         # Alias — try local first
-        local_id =
-          Repo.one(
-            from(a in "room_aliases", where: a.alias == ^room_id_or_alias, select: a.room_id)
-          )
+        local_id = lookup_local_alias(room_id_or_alias)
+        alias_server = room_id_or_alias |> String.split(":") |> List.last()
 
-        if local_id do
-          {local_id, []}
-        else
-          # Try federation alias lookup
-          alias_server = room_id_or_alias |> String.split(":") |> List.last()
-          via = if server_params != [], do: server_params, else: [alias_server]
-          resolve_remote_alias(room_id_or_alias, via, local_server)
+        cond do
+          local_id ->
+            {local_id, []}
+
+          # An alias meant for this server but not (yet) known — give an
+          # AS claiming it a chance to lazily provision the room before
+          # falling back to a federation lookup that could never succeed
+          # for a same-server alias anyway.
+          alias_server == local_server ->
+            case AppService.Manager.maybe_provision_alias(room_id_or_alias) do
+              :ok -> {lookup_local_alias(room_id_or_alias), []}
+              :not_found -> {nil, []}
+            end
+
+          true ->
+            via = if server_params != [], do: server_params, else: [alias_server]
+            resolve_remote_alias(room_id_or_alias, via, local_server)
         end
 
       String.starts_with?(room_id_or_alias, "!") ->
@@ -618,11 +646,45 @@ defmodule AxonWeb.RoomController do
     end
   end
 
+  # On-demand provisioning (spec: `GET /_matrix/app/v1/users/:userId`) —
+  # best-effort: an unknown local invitee that matches an AS's `users`
+  # namespace gets a chance to be lazily created before the invite lands,
+  # so it's not left dangling on an account that can never accept it. Not
+  # required for the invite itself to succeed (Matrix doesn't require an
+  # invitee to already exist locally — they might be remote, or never
+  # accept), so failures here are silently ignored.
+  defp maybe_provision_invitee(user_id) do
+    server_name = Application.fetch_env!(:axon_web, :server_name)
+
+    if String.ends_with?(user_id, ":" <> server_name) do
+      case AxonCore.UserStore.get_user(user_id) do
+        {:ok, _} -> :ok
+        {:error, :not_found} -> AppService.Manager.maybe_provision_user(user_id)
+      end
+    end
+  end
+
+  defp lookup_local_alias(room_alias) do
+    Repo.one(from(a in "room_aliases", where: a.alias == ^room_alias, select: a.room_id))
+  end
+
+  # Found while wiring up Application Service alias provisioning (which
+  # hits this same "resolve an alias" territory): a room_alias always
+  # starts with `#`, and `URI.encode/1`'s default predicate doesn't escape
+  # it — but `#` is the URI fragment delimiter, so building a URL string
+  # this way and handing it to Finch (which parses it via `URI.parse`
+  # internally) silently truncated everything from the `#` onward. Every
+  # outbound remote-alias directory query was therefore sending
+  # `room_alias=` (empty) — a real, previously-unnoticed bug, not
+  # introduced here. `URI.encode_www_form/1` percent-encodes `#` correctly
+  # for use as a query *value* (unlike the path-segment case in
+  # `AxonWeb.AppService.Client`, this is safely inside `?room_alias=...`,
+  # so form-encoding's `+`-for-space behavior doesn't matter here).
   defp resolve_remote_alias(room_alias, via_servers, _local_server) do
     Enum.find_value(via_servers, {nil, []}, fn server ->
       case AxonFederation.HttpClient.get(
              server,
-             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode(room_alias)}"
+             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode_www_form(room_alias)}"
            ) do
         {:ok, %{"room_id" => room_id, "servers" => servers}} ->
           {room_id, servers}
