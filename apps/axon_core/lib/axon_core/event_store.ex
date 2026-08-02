@@ -938,6 +938,19 @@ defmodule AxonCore.EventStore do
     end
   end
 
+  @doc """
+  Bulk fetch: `%{event_id => event_map}` for every id in `event_ids` found
+  locally (unknown ids are simply absent, not an error) — one round trip
+  instead of one query per id. For use by `AxonRoom.StateResolver`'s
+  level-by-level ancestor walk.
+  """
+  def get_event_maps([]), do: %{}
+
+  def get_event_maps(event_ids) do
+    Repo.all(from(e in Event, where: e.event_id in ^event_ids))
+    |> Map.new(fn e -> {e.event_id, event_to_map(e)} end)
+  end
+
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

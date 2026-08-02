@@ -117,18 +117,20 @@ defmodule AxonWeb.StateResolverTest do
     assert StateResolver.needs_resolution?(pdu_b, head1)
 
     current_state = RoomProcess.get_state_map(room_id)
-    resolved = StateResolver.resolve_for_auth_check(pdu_b, current_state)
+    resolved = StateResolver.resolve_for_auth_check(pdu_b, current_state, head1)
 
     pl_resolved = resolved[{"m.room.power_levels", ""}]
 
-    assert pl_resolved["event_id"] in [
-             old_pl_event.event_id,
-             current_state[{"m.room.power_levels", ""}]["event_id"]
-           ]
+    # pdu_b's only prev_event (head0) predates the PL change and doesn't
+    # match our current head (head1), so the walk reconstructs the real
+    # historical state as of head0 from scratch rather than falling back to
+    # (newer, unrelated) current_state — deterministically the OLD power
+    # levels, not "either, we're not sure which."
+    assert pl_resolved["event_id"] == old_pl_event.event_id
 
     assert resolved[{"m.room.create", ""}]["event_id"] == create_event.event_id
 
-    resolved_again = StateResolver.resolve_for_auth_check(pdu_b, current_state)
+    resolved_again = StateResolver.resolve_for_auth_check(pdu_b, current_state, head1)
     assert resolved_again[{"m.room.power_levels", ""}]["event_id"] == pl_resolved["event_id"]
   end
 
@@ -171,5 +173,74 @@ defmodule AxonWeb.StateResolverTest do
 
     assert {:ok, event_id} = RoomProcess.apply_remote_event(room_id, forking_pdu)
     assert event_id == forking_pdu["event_id"]
+  end
+
+  test "current_state is rebased onto resolved state after a merge PDU, not just used to gate the auth check" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+    {:ok, room} = EventStore.get_room(room_id)
+    {:ok, create_event} = EventStore.get_state_event(room_id, "m.room.create", "")
+    {:ok, pl_event} = EventStore.get_state_event(room_id, "m.room.power_levels", "")
+
+    {:ok, alice_member_event} =
+      EventStore.get_state_event(room_id, "m.room.member", alice.user_id)
+
+    {head0, depth0} = RoomProcess.get_position(room_id)
+
+    # A foreign event we already know about (e.g. backfilled) but that our
+    # own RoomProcess head never advanced through — inserted directly,
+    # bypassing RoomProcess, to simulate exactly that.
+    name_a = %{
+      "event_id" => "$name_a_rebase_#{System.unique_integer([:positive])}:remote.example",
+      "room_id" => room_id,
+      "sender" => alice.user_id,
+      "type" => "m.room.name",
+      "state_key" => "",
+      "content" => %{"name" => "Set concurrently"},
+      "origin" => "remote.example",
+      "origin_server_ts" => System.os_time(:millisecond),
+      "prev_events" => [head0],
+      "auth_events" => [create_event.event_id, pl_event.event_id, alice_member_event.event_id],
+      "depth" => depth0 + 1,
+      "signatures" => %{},
+      "hashes" => %{}
+    }
+
+    {:ok, _} = EventStore.insert_event(name_a, room.version)
+
+    # The event we actually hand to RoomProcess is a genuine 2-way merge
+    # (prev_events cites both head0 and name_a) but is itself a plain
+    # message — it doesn't touch m.room.name at all. Under the old
+    # blind-overlay behavior, applying a message event never changes
+    # current_state, so name_a's contribution (only reachable via
+    # resolution, never applied to our own head directly) would be lost
+    # entirely. Under the fix, current_state gets rebased onto the
+    # resolved state (which correctly adopts name_a) before the message's
+    # own (no-op) overlay.
+    merge_pdu = %{
+      "event_id" => "$merge_rebase_#{System.unique_integer([:positive])}:remote.example",
+      "room_id" => room_id,
+      "sender" => alice.user_id,
+      "type" => "m.room.message",
+      "content" => %{"msgtype" => "m.text", "body" => "merging branches"},
+      "origin" => "remote.example",
+      "origin_server_ts" => System.os_time(:millisecond),
+      "prev_events" => [head0, name_a["event_id"]],
+      "auth_events" => [create_event.event_id, pl_event.event_id, alice_member_event.event_id],
+      "depth" => depth0 + 1,
+      "signatures" => %{},
+      "hashes" => %{}
+    }
+
+    assert {:ok, _} = RoomProcess.apply_remote_event(room_id, merge_pdu)
+
+    current_state = RoomProcess.get_state_map(room_id)
+    assert current_state[{"m.room.name", ""}]["content"]["name"] == "Set concurrently"
+
+    # Not just the in-memory map — the room's actually-served state too.
+    conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.name")
+    assert conn.status == 200
+    assert decode(conn)["name"] == "Set concurrently"
   end
 end

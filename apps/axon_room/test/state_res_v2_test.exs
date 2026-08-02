@@ -3,12 +3,18 @@ defmodule AxonRoom.StateResV2Test do
   Direct, pure-function unit tests for `AxonRoom.StateResV2` using hand-built
   event DAGs (no DB — a plain in-memory map stands in for `get_event_fn`).
 
-  Note on tie-break direction: for events tied on mainline power position,
-  the exact depth-tiebreak direction (does the older or newer event win a
-  true tie?) is pinned here as *current, observed* behavior rather than
-  asserted as spec-correct — full confidence there needs a cross-check
-  against a reference implementation (Synapse) or Complement's state-res
-  vectors, which is out of scope for this pass. Flagged in the findings list.
+  Tie-break direction (events tied on mainline power position resolve by
+  depth, newer wins) is verified against the spec's own wording
+  (`spec.matrix.org/v1.16/rooms/v2/`: ties resolve with the *newer* event
+  winning) — see "a 3-generation fork resolves deterministically to the
+  newer branch, not an ancestor" below, which also regression-covers a
+  real bug this verification found: the sort key used `-depth`
+  (descending), the opposite of the documented intent, letting an older
+  ancestor pulled into the replay set via auth_diff outrank its own newer
+  descendants. Every conflict test before that one used only
+  two-generation fixtures, so the bug was latent until real
+  multi-generation forks became reachable (`AxonRoom.StateResolver` doing
+  genuine DAG replay instead of a one-hop peek).
   """
 
   use ExUnit.Case, async: true
@@ -94,17 +100,54 @@ defmodule AxonRoom.StateResV2Test do
     assert StateResV2.resolve([single], fn _ -> nil end) == single
   end
 
-  test "keys that don't conflict across state sets pass through untouched" do
+  test "a key present with the same value in every state set passes through untouched (genuinely unconflicted)" do
     create = create_event()
     joined = member_event("$m1", @alice, "join", 1, ["$create"])
 
-    set_a = %{{"m.room.create", ""} => create}
+    set_a = %{{"m.room.create", ""} => create, {"m.room.member", @alice} => joined}
     set_b = %{{"m.room.create", ""} => create, {"m.room.member", @alice} => joined}
 
     resolved = StateResV2.resolve([set_a, set_b], fn _ -> nil end)
 
     assert resolved[{"m.room.create", ""}] == create
     assert resolved[{"m.room.member", @alice}] == joined
+  end
+
+  # Per spec, a key present in only *some* input state sets is conflicted,
+  # not unconflicted — the sets lacking an opinion don't get to wave the
+  # sole candidate value through without an auth check. Getting this wrong
+  # meant a value could reach the resolved state having never once been
+  # checked against AuthRules.
+  describe "a key present in only some state sets is conflicted" do
+    test "a legitimately-authorized single-branch value still survives" do
+      create = create_event()
+      # The room creator's own join is authorized unconditionally (initial
+      # join before join_rules exists) regardless of join_rule, so this
+      # must survive the now-mandatory auth check.
+      creator_join = member_event("$m1", @creator, "join", 1, [create["event_id"]])
+
+      set_a = %{{"m.room.create", ""} => create}
+      set_b = %{{"m.room.create", ""} => create, {"m.room.member", @creator} => creator_join}
+
+      resolved = StateResV2.resolve([set_a, set_b], fn _ -> nil end)
+
+      assert resolved[{"m.room.member", @creator}] == creator_join
+    end
+
+    test "a value that would fail auth is dropped, not waved through" do
+      create = create_event()
+      # join_rule defaults to "invite" and alice is neither invited nor the
+      # creator, so this join is illegitimate even though it's the only
+      # candidate for its key.
+      uninvited_join = member_event("$m1", @alice, "join", 1, [create["event_id"]])
+
+      set_a = %{{"m.room.create", ""} => create}
+      set_b = %{{"m.room.create", ""} => create, {"m.room.member", @alice} => uninvited_join}
+
+      resolved = StateResV2.resolve([set_a, set_b], fn _ -> nil end)
+
+      refute Map.has_key?(resolved, {"m.room.member", @alice})
+    end
   end
 
   test "the same event_id appearing in multiple sets for the same key isn't treated as a conflict" do
@@ -244,6 +287,176 @@ defmodule AxonRoom.StateResV2Test do
       resolved = StateResV2.resolve([set_a, set_b], get_event_fn(store))
       winner = resolved[{"m.room.power_levels", ""}]
       assert winner["event_id"] in ["$pla", "$plb"]
+    end
+
+    test "a 3-generation fork resolves deterministically to the newer branch, not an ancestor" do
+      # Both candidates descend from a shared *second*-generation power_levels
+      # event (pl_mid), not directly from create — regression coverage for a
+      # real, previously-latent bug: reverse_topological_power_ordering used
+      # to sort tied power events by depth *descending*, so an older
+      # ancestor pulled into the replay set via auth_diff could win over its
+      # own newer descendants. Every conflict test before this one used only
+      # two-generation fixtures (both candidates direct children of the same
+      # root), so the bug never triggered.
+      store = events_store()
+      create = put_event(store, create_event())
+
+      creator_joined =
+        put_event(store, member_event("$mc3", @creator, "join", 1, [create["event_id"]]))
+
+      alice_joined =
+        put_event(store, member_event("$ma3", @alice, "join", 1, [create["event_id"]]))
+
+      _pl_mid =
+        put_event(
+          store,
+          pl_event("$plmid", @creator, 2, [create["event_id"]], %{@creator => 100, @alice => 100})
+        )
+
+      pl_a =
+        put_event(
+          store,
+          pl_event("$pla3", @alice, 3, [create["event_id"], "$plmid"], %{
+            @creator => 100,
+            @alice => 100
+          })
+        )
+
+      pl_b =
+        put_event(
+          store,
+          pl_event("$plb3", @alice, 4, [create["event_id"], "$plmid"], %{
+            @creator => 100,
+            @alice => 100
+          })
+        )
+
+      unconflicted = %{
+        {"m.room.create", ""} => create,
+        {"m.room.member", @creator} => creator_joined,
+        {"m.room.member", @alice} => alice_joined
+      }
+
+      set_a = Map.put(unconflicted, {"m.room.power_levels", ""}, pl_a)
+      set_b = Map.put(unconflicted, {"m.room.power_levels", ""}, pl_b)
+
+      resolved = StateResV2.resolve([set_a, set_b], get_event_fn(store))
+      winner = resolved[{"m.room.power_levels", ""}]
+
+      # pl_b (depth 4, the newer of the two tied-mainline-position siblings)
+      # must win — and critically, the shared ancestor pl_mid (depth 2) must
+      # never win despite being pulled into the replay set via auth_diff.
+      assert winner["event_id"] == "$plb3"
+    end
+  end
+
+  describe "conflicted state subgraph (room v12 only)" do
+    test "an intermediate power_levels event needed to authorize the winner is included via the subgraph" do
+      # Shape: pl0 -> plz (branch Z's tip) -> m (grants alice power, using
+      # plz's own authority) -> ply2 (branch Y's tip, sent by alice using
+      # m's grant). plz is directly in m's auth_events, so m genuinely lies
+      # on a path between the two conflicted-set events (ply2 and plz) —
+      # not merely a shared ancestor of one, which auth_diff already
+      # handles. Without the subgraph, m gets excluded from the replay set
+      # (it's also reachable from the unconflicted topic event's own
+      # ancestry, so auth_diff subtracts it) even though ply2 cannot pass
+      # AuthRules.check without it: ply2's sender (alice) only has power
+      # because of m specifically, not plz or pl0 alone.
+      store = events_store()
+      creator = @creator
+      bob = "@bob:localhost"
+      alice = @alice
+
+      create = put_event(store, create_event())
+      creator_joined = put_event(store, member_event("$cj", creator, "join", 1, ["$create"]))
+      bob_joined = put_event(store, member_event("$bj", bob, "join", 1, ["$create"]))
+      alice_joined = put_event(store, member_event("$aj", alice, "join", 1, ["$create"]))
+
+      _pl0 =
+        put_event(
+          store,
+          %{
+            "event_id" => "$pl0",
+            "type" => "m.room.power_levels",
+            "state_key" => "",
+            "sender" => creator,
+            "depth" => 2,
+            "auth_events" => ["$create", "$cj"],
+            "content" => %{"users" => %{bob => 100}, "state_default" => 100}
+          }
+        )
+
+      plz =
+        put_event(
+          store,
+          %{
+            "event_id" => "$plz",
+            "type" => "m.room.power_levels",
+            "state_key" => "",
+            "sender" => bob,
+            "depth" => 3,
+            "auth_events" => ["$create", "$cj", "$bj", "$pl0"],
+            "content" => %{"users" => %{bob => 100}, "state_default" => 100, "ban" => 50}
+          }
+        )
+
+      _m =
+        put_event(
+          store,
+          %{
+            "event_id" => "$m",
+            "type" => "m.room.power_levels",
+            "state_key" => "",
+            "sender" => bob,
+            "depth" => 4,
+            "auth_events" => ["$create", "$cj", "$bj", "$plz"],
+            "content" => %{"users" => %{bob => 100, alice => 100}, "state_default" => 100}
+          }
+        )
+
+      ply2 =
+        put_event(
+          store,
+          %{
+            "event_id" => "$ply2",
+            "type" => "m.room.power_levels",
+            "state_key" => "",
+            "sender" => alice,
+            "depth" => 5,
+            "auth_events" => ["$create", "$cj", "$aj", "$m"],
+            "content" => %{"users" => %{bob => 100}, "state_default" => 100, "ban" => 75}
+          }
+        )
+
+      topic =
+        put_event(
+          store,
+          topic_event("$u", bob, 5, ["$create", "$cj", "$bj", "$m"], "shared")
+        )
+
+      unconflicted = %{
+        {"m.room.create", ""} => create,
+        {"m.room.member", creator} => creator_joined,
+        {"m.room.member", bob} => bob_joined,
+        {"m.room.member", alice} => alice_joined,
+        {"m.room.topic", ""} => topic
+      }
+
+      set_a = Map.put(unconflicted, {"m.room.power_levels", ""}, ply2)
+      set_b = Map.put(unconflicted, {"m.room.power_levels", ""}, plz)
+
+      v11 = StateResV2.resolve([set_a, set_b], get_event_fn(store), "11")
+      v12 = StateResV2.resolve([set_a, set_b], get_event_fn(store), "12")
+
+      # v11 has no subgraph concept: m gets excluded, alice's authority is
+      # invisible during replay, ply2 fails its auth check, and the room
+      # incorrectly stays on the older plz.
+      assert v11[{"m.room.power_levels", ""}]["event_id"] == "$plz"
+
+      # v12: the subgraph correctly pulls m into the replay set, alice's
+      # power is visible when ply2 is checked, and the actually-latest,
+      # properly-authorized event wins.
+      assert v12[{"m.room.power_levels", ""}]["event_id"] == "$ply2"
     end
   end
 end

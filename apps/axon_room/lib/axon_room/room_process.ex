@@ -202,14 +202,28 @@ defmodule AxonRoom.RoomProcess do
   def handle_call({:apply_remote_event, pdu}, _from, state) do
     pdu = with_prev_content(pdu, pdu["state_key"], state.current_state)
 
-    auth_check_state =
+    # When pdu forks away from our head, `resolved_state` isn't just a
+    # disposable auth-check scratch value (that's all it was before
+    # AxonRoom.StateResolver did real DAG replay) — it's the room's actual
+    # correctly-resolved state as of this event's ancestry, and becomes the
+    # new `current_state` going forward too (see the rebase below), not
+    # just what gates AuthRules.check. Without this, current_state after a
+    # fork was whatever the old event happened to blindly overlay onto —
+    # effectively last-write-wins by local insertion order, not state
+    # resolution.
+    {resolved_state, forked?} =
       if StateResolver.needs_resolution?(pdu, state.last_event_id) do
-        StateResolver.resolve_for_auth_check(pdu, state.current_state, state.room_version)
+        {StateResolver.resolve_for_auth_check(
+           pdu,
+           state.current_state,
+           state.last_event_id,
+           state.room_version
+         ), true}
       else
-        state.current_state
+        {state.current_state, false}
       end
 
-    case AuthRules.check(pdu, auth_check_state, state.room_version) do
+    case AuthRules.check(pdu, resolved_state, state.room_version) do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
 
@@ -217,7 +231,8 @@ defmodule AxonRoom.RoomProcess do
         case EventStore.insert_event(pdu, state.room_version) do
           {:ok, persisted} ->
             event_map = EventStore.event_to_map(persisted)
-            new_state = apply_and_advance(state, event_map, persisted.stream_ordering)
+            base_state = if forked?, do: %{state | current_state: resolved_state}, else: state
+            new_state = apply_and_advance(base_state, event_map, persisted.stream_ordering)
             # Fan out to local /sync clients. Not re-broadcast to federation:
             # the origin server is responsible for pushing this PDU to every
             # other server in the room directly (no relay-through-us).
