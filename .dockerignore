@@ -1,9 +1,15 @@
+# Deliberately excluded, and it must stay that way. The README's "fast
+# incremental rebuild" recipe copies _build/prod/rel/axon into an existing
+# image, which only works if the host that built the release has a glibc no
+# newer than the image's. It does not here: releases built on this Fedora
+# host link against GLIBC_2.38, the Complement image is Debian bookworm
+# (glibc 2.36), and the copied beam.smp dies on startup with
+#   beam.smp: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+# Every homeserver container then fails to boot and the whole Complement run
+# hangs instead of failing loudly. Build the image with
+#   docker build -f complement/Dockerfile -t axon-complement:latest .
+# which compiles the release inside the image and cannot skew.
 _build/
-# ...except the built prod release, which the README's fast incremental
-# Complement rebuild copies straight into an existing image. Without this
-# exception that recipe fails with "/_build/prod/rel/axon: not found",
-# since the path is excluded from the build context before COPY sees it.
-!_build/prod/rel/axon/
 deps/
 .git/
 .github/

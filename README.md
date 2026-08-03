@@ -289,6 +289,16 @@ Axon uses [Complement](https://github.com/matrix-org/complement) as its acceptan
 docker build -f complement/Dockerfile -t axon-complement:latest .
 
 # Fast incremental rebuild (patch existing image with new release)
+#
+# ⚠ Only safe when the host's glibc is no newer than the image's. The release
+# is built on the host but runs on Debian bookworm (glibc 2.36) inside the
+# image, so a newer host glibc produces a release the image cannot execute:
+#   beam.smp: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+# Every homeserver container then fails to boot, and Complement HANGS rather
+# than reporting an error — it looks like a server bug, not a build problem.
+# `_build/` is excluded in .dockerignore precisely so this cannot happen by
+# accident; you must remove that exclusion to use this path at all.
+# When in doubt, use the full build above.
 MIX_ENV=prod mix release --overwrite
 docker build -f - -t axon-complement:latest . <<'EOF'
 FROM axon-complement:latest
