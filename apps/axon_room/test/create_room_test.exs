@@ -238,5 +238,196 @@ defmodule AxonRoom.CreateRoomTest do
       assert content_of(room_id, "m.room.join_rules")["join_rule"] == "public"
       assert content_of(room_id, "m.room.member", creator)["membership"] == "join"
     end
+
+    test "m.room.tombstone defaults to PL150 (creator-only, MSC4289) instead of PL100" do
+      creator = new_user("alice")
+      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost", version: "12")
+
+      pl = content_of(room_id, "m.room.power_levels")
+      assert pl["events"]["m.room.tombstone"] == 150
+    end
+
+    test "every other default power level is unchanged from pre-v12" do
+      creator = new_user("alice")
+      {:ok, v11_room} = CreateRoom.execute(creator, server_name: "localhost", version: "11")
+      {:ok, v12_room} = CreateRoom.execute(creator, server_name: "localhost", version: "12")
+
+      v11_pl = content_of(v11_room, "m.room.power_levels") |> Map.delete("users")
+      v12_pl = content_of(v12_room, "m.room.power_levels") |> Map.delete("users")
+
+      v11_events = Map.delete(v11_pl["events"], "m.room.tombstone")
+      v12_events = Map.delete(v12_pl["events"], "m.room.tombstone")
+
+      assert v11_events == v12_events
+      assert Map.delete(v11_pl, "events") == Map.delete(v12_pl, "events")
+    end
+
+    test "trusted_private_chat + invite auto-adds invitees to additional_creators" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "12",
+          preset: "trusted_private_chat",
+          is_direct: true,
+          invite: [bob]
+        )
+
+      create_content = content_of(room_id, "m.room.create")
+      assert create_content["additional_creators"] == [bob]
+    end
+
+    test "trusted_private_chat auto-add unions with, rather than replaces, explicit additional_creators" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+      charlie = new_user("charlie")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "12",
+          preset: "trusted_private_chat",
+          is_direct: true,
+          invite: [bob],
+          creation_content: %{"additional_creators" => [charlie]}
+        )
+
+      create_content = content_of(room_id, "m.room.create")
+      assert Enum.sort(create_content["additional_creators"]) == Enum.sort([bob, charlie])
+    end
+
+    test "trusted_private_chat with no invite doesn't add an empty additional_creators key" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "12",
+          preset: "trusted_private_chat"
+        )
+
+      create_content = content_of(room_id, "m.room.create")
+      refute Map.has_key?(create_content, "additional_creators")
+    end
+
+    test "non-v12 trusted_private_chat does not touch additional_creators (v12-only mechanism)" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "11",
+          preset: "trusted_private_chat",
+          invite: [bob]
+        )
+
+      create_content = content_of(room_id, "m.room.create")
+      refute Map.has_key?(create_content, "additional_creators")
+    end
+
+    test "an additional_creators domain with invalid characters is rejected" do
+      creator = new_user("alice")
+
+      assert CreateRoom.execute(creator,
+               server_name: "localhost",
+               version: "12",
+               creation_content: %{"additional_creators" => ["@invalid:dom$ain$.com"]}
+             ) == {:error, :invalid_additional_creators}
+    end
+  end
+
+  describe "power_level_content_override" do
+    test "is merged on top of the default power_levels content" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "12",
+          invite: [bob],
+          power_level_content_override: %{"users" => %{bob => 100}}
+        )
+
+      pl = content_of(room_id, "m.room.power_levels")
+      assert pl["users"] == %{bob => 100}
+    end
+
+    test "unspecified fields keep the generated defaults (shallow top-level merge)" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator,
+          server_name: "localhost",
+          version: "11",
+          power_level_content_override: %{"invite" => 25}
+        )
+
+      pl = content_of(room_id, "m.room.power_levels")
+      assert pl["invite"] == 25
+      # untouched defaults survive
+      assert pl["ban"] == 50
+      assert pl["users"][creator] == 100
+    end
+
+    test "v12: an override naming the room creator in users is rejected rather than silently applied" do
+      creator = new_user("alice")
+
+      assert CreateRoom.execute(creator,
+               server_name: "localhost",
+               version: "12",
+               power_level_content_override: %{"users" => %{creator => 100}}
+             ) == {:error, :power_levels_may_not_list_creators}
+    end
+
+    test "v12: an override naming an additional_creator in users is also rejected" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      assert CreateRoom.execute(creator,
+               server_name: "localhost",
+               version: "12",
+               creation_content: %{"additional_creators" => [bob]},
+               power_level_content_override: %{"users" => %{bob => 100}}
+             ) == {:error, :power_levels_may_not_list_creators}
+    end
+
+    test "pre-v12: an override that supplies users without the creator is rejected (would lock them out)" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      assert CreateRoom.execute(creator,
+               server_name: "localhost",
+               version: "11",
+               power_level_content_override: %{"users" => %{bob => 100}}
+             ) == {:error, :power_level_content_override_excludes_creator}
+    end
+
+    test "pre-v12: an override that supplies users including the creator is accepted" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      assert {:ok, room_id} =
+               CreateRoom.execute(creator,
+                 server_name: "localhost",
+                 version: "11",
+                 power_level_content_override: %{"users" => %{creator => 100, bob => 50}}
+               )
+
+      pl = content_of(room_id, "m.room.power_levels")
+      assert pl["users"] == %{creator => 100, bob => 50}
+    end
+
+    test "a non-map override is rejected before anything is created" do
+      creator = new_user("alice")
+
+      assert CreateRoom.execute(creator,
+               server_name: "localhost",
+               power_level_content_override: "not-a-map"
+             ) == {:error, :invalid_power_level_content_override}
+    end
   end
 end
