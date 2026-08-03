@@ -60,11 +60,18 @@ defmodule AxonCrypto.KeyServerTest do
       sig_b64 = info.signatures[server_name][info.key_id]
       assert is_binary(sig_b64)
 
-      # Reconstruct the exact document that was signed and verify it.
+      # Reconstruct the *actual* document AxonWeb.KeyController.server_keys/2
+      # serves for GET /_matrix/key/v2/server (see key_controller.ex) and
+      # verify the signature against exactly that — not some subset of it.
+      # Regression: the signature used to be computed over a document
+      # missing "old_verify_keys", which every real client only ever sees
+      # combined with that field, so it never verified for anyone but this
+      # test (which used to reconstruct the same incomplete document).
       unsigned_doc = %{
         "server_name" => info.server_name,
         "valid_until_ts" => info.valid_until_ts,
-        "verify_keys" => %{info.key_id => %{"key" => info.public_key_b64}}
+        "verify_keys" => %{info.key_id => %{"key" => info.public_key_b64}},
+        "old_verify_keys" => %{}
       }
 
       {:ok, pub_key} = Base.decode64(info.public_key_b64, padding: false)
@@ -72,6 +79,30 @@ defmodule AxonCrypto.KeyServerTest do
       payload = CanonicalJSON.encode_to_binary(unsigned_doc)
 
       assert :crypto.verify(:eddsa, :none, payload, sig_bytes, [pub_key, :ed25519])
+    end
+
+    test "the signature does NOT verify without old_verify_keys (documents the wire format it must match)",
+         %{pid: pid} do
+      info = GenServer.call(pid, :server_key_info)
+      sig_b64 = info.signatures[info.server_name][info.key_id]
+
+      # Same reconstruction as AxonWeb.KeyController.server_keys/2's actual
+      # response, minus "old_verify_keys" — this is the document the old,
+      # buggy signature was computed over. Asserting it does *not* verify
+      # pins down why every real recipient's signature check used to fail:
+      # canonical JSON is field-sensitive, so a signature is only valid for
+      # the exact document it was computed over.
+      incomplete_doc = %{
+        "server_name" => info.server_name,
+        "valid_until_ts" => info.valid_until_ts,
+        "verify_keys" => %{info.key_id => %{"key" => info.public_key_b64}}
+      }
+
+      {:ok, pub_key} = Base.decode64(info.public_key_b64, padding: false)
+      {:ok, sig_bytes} = Base.decode64(sig_b64, padding: false)
+      payload = CanonicalJSON.encode_to_binary(incomplete_doc)
+
+      refute :crypto.verify(:eddsa, :none, payload, sig_bytes, [pub_key, :ed25519])
     end
 
     test "valid_until_ts is roughly 7 days out", %{pid: pid} do
