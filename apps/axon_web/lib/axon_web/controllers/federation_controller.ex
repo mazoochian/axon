@@ -121,7 +121,7 @@ defmodule AxonWeb.FederationController do
          {:ok, event_id} <- apply_join_event(room_id, join_event, origin) do
       # Build response: full room state + auth chain
       state_events = EventStore.get_current_state(room_id)
-      state_maps = Enum.map(state_events, &EventStore.event_to_map/1)
+      state_maps = Enum.map(state_events, &EventStore.event_to_pdu/1)
 
       auth_chain = build_auth_chain_for_state(state_events)
 
@@ -129,7 +129,7 @@ defmodule AxonWeb.FederationController do
         "origin" => KeyServer.server_name(),
         "auth_chain" => auth_chain,
         "state" => state_maps,
-        "event" => EventStore.event_to_map_by_id(event_id)
+        "event" => EventStore.event_to_pdu_by_id(event_id)
       })
     else
       {:error, :acl_denied} ->
@@ -567,7 +567,7 @@ defmodule AxonWeb.FederationController do
         json(conn, %{
           "origin" => KeyServer.server_name(),
           "origin_server_ts" => event.origin_server_ts,
-          "pdus" => [EventStore.event_to_map(event)]
+          "pdus" => [EventStore.event_to_pdu(event)]
         })
 
       {:error, :not_found} ->
@@ -589,7 +589,7 @@ defmodule AxonWeb.FederationController do
       auth_chain = build_auth_chain_for_state(state_events)
 
       json(conn, %{
-        "pdus" => Enum.map(state_events, &EventStore.event_to_map/1),
+        "pdus" => Enum.map(state_events, &EventStore.event_to_pdu/1),
         "auth_chain" => auth_chain
       })
     else
@@ -646,7 +646,7 @@ defmodule AxonWeb.FederationController do
             |> get_auth_chain_ids()
             |> Enum.flat_map(fn id ->
               case EventStore.get_event(id) do
-                {:ok, e} -> [EventStore.event_to_map(e)]
+                {:ok, e} -> [EventStore.event_to_pdu(e)]
                 _ -> []
               end
             end)
@@ -701,7 +701,7 @@ defmodule AxonWeb.FederationController do
       json(conn, %{
         "origin" => KeyServer.server_name(),
         "origin_server_ts" => System.os_time(:millisecond),
-        "pdus" => Enum.map(events, &EventStore.event_to_map/1)
+        "pdus" => Enum.map(events, &EventStore.event_to_pdu/1)
       })
     else
       acl_forbidden(conn)
@@ -729,7 +729,7 @@ defmodule AxonWeb.FederationController do
         )
 
       json(conn, %{
-        "events" => Enum.map(events, &EventStore.event_to_map/1)
+        "events" => Enum.map(events, &EventStore.event_to_pdu/1)
       })
     else
       acl_forbidden(conn)
@@ -1185,7 +1185,7 @@ defmodule AxonWeb.FederationController do
     |> Enum.uniq()
     |> Enum.flat_map(fn event_id ->
       case EventStore.get_event(event_id) do
-        {:ok, e} -> [EventStore.event_to_map(e)]
+        {:ok, e} -> [EventStore.event_to_pdu(e)]
         _ -> []
       end
     end)

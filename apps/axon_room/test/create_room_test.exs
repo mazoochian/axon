@@ -175,13 +175,21 @@ defmodule AxonRoom.CreateRoomTest do
       refute String.contains?(room_id, ":")
     end
 
-    test "the create event carries no room_id field" do
+    # The room_id omission is a *federation PDU* rule (EventStore.event_to_pdu/1),
+    # not a property of the in-memory/client view — RoomProcess.get_state/1
+    # returns the client form, which keeps room_id like every other event.
+    # (These used to be the same serialization, so the omission leaked into
+    # every client-facing view too; see AxonWeb.RoomV12Test.)
+    test "the create event's room_id is omitted from the federation PDU form only" do
       creator = new_user("alice")
       {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost", version: "12")
 
       {:ok, state} = RoomProcess.get_state(room_id)
       create_event = Enum.find(state, &(&1["type"] == "m.room.create"))
-      refute Map.has_key?(create_event, "room_id")
+      assert create_event["room_id"] == room_id
+
+      {:ok, stored} = AxonCore.EventStore.get_state_event(room_id, "m.room.create", "")
+      refute Map.has_key?(AxonCore.EventStore.event_to_pdu(stored), "room_id")
     end
 
     test "the creator is not listed in power_levels.users (implicit infinite power instead)" do

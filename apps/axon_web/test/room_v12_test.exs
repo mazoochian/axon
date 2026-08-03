@@ -143,6 +143,97 @@ defmodule AxonWeb.RoomV12Test do
     end
   end
 
+  # Regression (MSC4291, found by Complement's
+  # TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent): the
+  # room_id omission on a v12 create event is a *federation PDU* rule
+  # only. EventStore.event_to_map/1 used to apply it unconditionally and
+  # was the one function both APIs went through, so every client-facing
+  # view of a v12 create event was missing its room_id too — which the CS
+  # API's ClientEvent schema requires unconditionally.
+  describe "client-facing views of a v12 create event keep room_id" do
+    test "/state, /messages, /event/:id, /context and /state?format=event all carry room_id" do
+      alice = register("v12_clientroomid_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "12", "preset" => "public_chat"})
+
+      state_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state")
+      assert state_conn.status == 200
+      create_from_state = decode(state_conn) |> Enum.find(&(&1["type"] == "m.room.create"))
+      assert create_from_state["room_id"] == room_id
+      create_event_id = create_from_state["event_id"]
+
+      # the room_id really is the create event's own id, sigil-swapped
+      assert "!" <> rest = room_id
+      assert "$" <> ^rest = create_event_id
+
+      messages_conn =
+        authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/messages?dir=b&limit=100")
+
+      assert messages_conn.status == 200
+
+      create_from_messages =
+        decode(messages_conn)["chunk"] |> Enum.find(&(&1["type"] == "m.room.create"))
+
+      assert create_from_messages["room_id"] == room_id
+
+      event_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/event/#{URI.encode(create_event_id)}")
+
+      assert event_conn.status == 200
+      assert decode(event_conn)["room_id"] == room_id
+
+      context_conn =
+        authed(alice.token)
+        |> get(
+          "/_matrix/client/v3/rooms/#{room_id}/context/#{URI.encode(create_event_id)}?limit=100"
+        )
+
+      assert context_conn.status == 200
+
+      create_from_context =
+        decode(context_conn)["state"] |> Enum.find(&(&1["type"] == "m.room.create"))
+
+      assert create_from_context["room_id"] == room_id
+
+      format_event_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.create/?format=event")
+
+      assert format_event_conn.status == 200
+      assert decode(format_event_conn)["room_id"] == room_id
+    end
+
+    test "the federation PDU form still omits it (the two must not be conflated)" do
+      alice = register("v12_pduroomid_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "12", "preset" => "public_chat"})
+
+      {:ok, create_event} = EventStore.get_state_event(room_id, "m.room.create", "")
+
+      assert EventStore.event_to_map(create_event)["room_id"] == room_id
+      refute Map.has_key?(EventStore.event_to_pdu(create_event), "room_id")
+    end
+
+    test "a non-create v12 event keeps room_id in both forms" do
+      alice = register("v12_noncreate_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "12", "preset" => "public_chat"})
+
+      {:ok, pl_event} = EventStore.get_state_event(room_id, "m.room.power_levels", "")
+
+      assert EventStore.event_to_map(pl_event)["room_id"] == room_id
+      assert EventStore.event_to_pdu(pl_event)["room_id"] == room_id
+    end
+
+    test "a v11 create event keeps room_id in both forms (the rule is v12-only)" do
+      alice = register("v11_create_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "11", "preset" => "public_chat"})
+
+      {:ok, create_event} = EventStore.get_state_event(room_id, "m.room.create", "")
+
+      assert EventStore.event_to_map(create_event)["room_id"] == room_id
+      assert EventStore.event_to_pdu(create_event)["room_id"] == room_id
+    end
+  end
+
   describe "joining a domainless room_id" do
     test "without a via/server_name hint, returns a clear error instead of guessing a bogus server" do
       alice = register("v12_viahint_#{System.unique_integer([:positive])}")
@@ -225,9 +316,14 @@ defmodule AxonWeb.RoomV12Test do
       assert is_list(resp["state"])
 
       # The create event, wherever it appears in returned state, must not
-      # carry a room_id field on the wire.
+      # carry a room_id field on the *federation wire* (its room_id is its
+      # own reference hash; including it would change the content hash and
+      # make the receiving server compute a different event ID).
       create_in_state = Enum.find(resp["state"], &(&1["type"] == "m.room.create"))
       refute Map.has_key?(create_in_state, "room_id")
+      # (this endpoint returns only `content` without ?format=event, so it
+      # says nothing about room_id either way — the real client-side
+      # assertion lives in the "client-facing views" test below)
       refute create_event_id_conn |> decode() |> Map.has_key?("room_id")
 
       assert EventStore.get_membership(room_id, joiner) == {:ok, "join"}

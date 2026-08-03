@@ -121,6 +121,7 @@ defmodule AxonWeb.Router do
     get("/r0/rooms/:room_id/state/:event_type/:state_key", EventController, :get_state_event)
     get("/r0/rooms/:room_id/event/:event_id", EventController, :get_event)
     get("/r0/rooms/:room_id/messages", EventController, :get_messages)
+    get("/r0/rooms/:room_id/context/:event_id", EventController, :get_context)
     put("/r0/rooms/:room_id/redact/:event_id/:txn_id", EventController, :redact)
     get("/r0/sync", SyncController, :sync)
     put("/r0/directory/room/:room_alias", DirectoryController, :put_alias)
@@ -345,6 +346,7 @@ defmodule AxonWeb.Router do
     get("/v3/rooms/:room_id/state/:event_type/:state_key", EventController, :get_state_event)
     get("/v3/rooms/:room_id/event/:event_id", EventController, :get_event)
     get("/v3/rooms/:room_id/messages", EventController, :get_messages)
+    get("/v3/rooms/:room_id/context/:event_id", EventController, :get_context)
     put("/v3/rooms/:room_id/redact/:event_id/:txn_id", EventController, :redact)
 
     # Relations (reactions, threads) — Phase 5

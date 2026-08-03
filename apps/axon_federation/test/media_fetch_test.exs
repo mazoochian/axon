@@ -148,6 +148,53 @@ defmodule AxonFederation.MediaFetchTest do
     assert req.query_string =~ "allow_remote=false"
   end
 
+  # A remote whose authenticated-media handler is broken/absent answers a
+  # well-formed GET with a 400 rather than the spec's 404 M_UNRECOGNIZED —
+  # Complement's own federation test double does exactly this. Falling
+  # back beats hard-failing a download the deprecated endpoint can serve.
+  test "download/2 falls back to the legacy endpoint on a 400 too", %{
+    port: port,
+    server_name: server_name
+  } do
+    FakeRemoteMatrixServer.put_raw_response(
+      port,
+      {"GET", ~r{^/_matrix/federation/v1/media/download/}},
+      400,
+      "text/plain",
+      "some server's idea of an error"
+    )
+
+    FakeRemoteMatrixServer.put_raw_response(
+      port,
+      {"GET", ~r{^/_matrix/media/v3/download/}},
+      200,
+      "text/plain",
+      "legacy-bytes"
+    )
+
+    assert {:ok, "text/plain", "legacy-bytes", nil} =
+             MediaFetch.download(server_name, "some-media-id")
+  end
+
+  test "download/2 does NOT fall back on a 403 — that means something specific", %{
+    port: port,
+    server_name: server_name
+  } do
+    FakeRemoteMatrixServer.put_response(
+      port,
+      {"GET", ~r{^/_matrix/federation/v1/media/download/}},
+      403,
+      %{"errcode" => "M_FORBIDDEN", "error" => "nope"}
+    )
+
+    assert {:error, {:http_error, 403}} = MediaFetch.download(server_name, "some-media-id")
+
+    refute Enum.any?(
+             FakeRemoteMatrixServer.requests(port),
+             &(&1.path =~ "/_matrix/media/v3/download/")
+           )
+  end
+
   test "download/2 reports a genuine not-found without falling back", %{
     port: port,
     server_name: server_name

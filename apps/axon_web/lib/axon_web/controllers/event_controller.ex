@@ -333,6 +333,67 @@ defmodule AxonWeb.EventController do
     end
   end
 
+  # GET /_matrix/client/v3/rooms/:room_id/context/:event_id
+  #
+  # Previously unimplemented — no route at all, so it 404'd generically.
+  # Returns the target event plus a window of surrounding timeline and the
+  # room's state, which is what a client uses to render a permalink or a
+  # search result in context.
+  def get_context(conn, %{"room_id" => room_id, "event_id" => event_id} = params) do
+    user_id = conn.assigns.current_user_id
+
+    cond do
+      member_or_forgotten?(room_id, user_id) ->
+        conn
+        |> put_status(403)
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+
+      true ->
+        case EventStore.get_event(event_id) do
+          {:ok, %{room_id: ^room_id} = event} ->
+            # Spec: `limit` is the total number of events returned either
+            # side of the target, so split it between the two directions.
+            limit = String.to_integer(params["limit"] || "10")
+            half = max(div(limit, 2), 1)
+
+            before_events =
+              EventStore.get_messages(room_id, event.stream_ordering, "b", half)
+
+            after_events =
+              EventStore.get_messages(room_id, event.stream_ordering, "f", half)
+
+            # get_messages/4 returns "b" newest-first, which is already the
+            # reverse-chronological order the spec wants for events_before.
+            start_ordering =
+              case List.last(before_events) do
+                nil -> event.stream_ordering
+                e -> e.stream_ordering
+              end
+
+            end_ordering =
+              case List.last(after_events) do
+                nil -> event.stream_ordering
+                e -> e.stream_ordering
+              end
+
+            json(conn, %{
+              "start" => Integer.to_string(start_ordering),
+              "end" => Integer.to_string(end_ordering),
+              "events_before" => Enum.map(before_events, &EventStore.event_to_map/1),
+              "event" => EventStore.event_to_map(event),
+              "events_after" => Enum.map(after_events, &EventStore.event_to_map/1),
+              "state" =>
+                room_id |> EventStore.get_current_state() |> Enum.map(&EventStore.event_to_map/1)
+            })
+
+          _ ->
+            conn
+            |> put_status(404)
+            |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Event not found"})
+        end
+    end
+  end
+
   # GET /_matrix/client/v1/rooms/:room_id/relations/:event_id
   # GET /_matrix/client/v1/rooms/:room_id/relations/:event_id/:rel_type
   # GET /_matrix/client/v1/rooms/:room_id/relations/:event_id/:rel_type/:event_type

@@ -8,10 +8,25 @@ defmodule AxonFederation.MediaFetch do
 
   Falls back to the deprecated, unauthenticated `/_matrix/media/v3/...`
   endpoint — with `allow_remote=false`, per spec, so the remote doesn't try
-  to recursively proxy it back to us — but only on an explicit
-  `M_UNRECOGNIZED` 404, the spec's defined signal that a server hasn't
-  implemented the federation media endpoints yet. Any other error is
-  reported as-is rather than masked by a fallback attempt.
+  to recursively proxy it back to us — when the remote's response says it
+  doesn't really serve this endpoint:
+
+  - a `404` carrying `M_UNRECOGNIZED`, the spec's defined signal that a
+    server hasn't implemented the federation media endpoints yet; or
+  - any `400`, which is not spec-mandated as a fallback trigger but is
+    what a server whose authenticated-media handler is broken or absent
+    tends to answer a perfectly well-formed GET with. Hard-failing the
+    user's download over that helps nobody when the deprecated endpoint
+    is sitting right there and works. (Complement's own federation test
+    double is exactly such a server: `HandleMediaRequests` reuses the
+    legacy handler — which validates an `{origin}` path variable — for
+    the authenticated route, whose path has no such variable, so it
+    unconditionally 400s.)
+
+  Any *other* error is reported as-is rather than masked by a fallback
+  attempt: a 403, a 5xx, or a plain 404 without `M_UNRECOGNIZED` all mean
+  something specific that a retry against a deprecated endpoint would only
+  obscure.
   """
 
   alias AxonFederation.HttpClient
@@ -59,6 +74,9 @@ defmodule AxonFederation.MediaFetch do
 
       {:ok, %{status: 404, body: body}} ->
         if unrecognized?(body), do: fallback.(), else: {:error, :not_found}
+
+      {:ok, %{status: 400}} ->
+        fallback.()
 
       {:ok, %{status: status}} ->
         {:error, {:http_error, status}}

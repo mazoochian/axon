@@ -196,7 +196,17 @@ defmodule AxonRoom.RoomProcess do
             broadcast(state.room_id, event_map)
 
             unless shadow_banned_message?(event_map) do
-              broadcast_for_federation(state.room_id, event_map, new_state.current_state)
+              # Federation gets the PDU form, not the client form — they
+              # differ for a room-v12 create event (see
+              # EventStore.event_to_pdu/1). Only reachable in practice for
+              # a create event via a room upgrade, since a brand-new room
+              # has no remote members yet, but deriving it explicitly beats
+              # relying on that.
+              broadcast_for_federation(
+                state.room_id,
+                EventStore.event_to_pdu(persisted),
+                new_state.current_state
+              )
             end
 
             # Push notifications (fire-and-forget)
@@ -264,9 +274,11 @@ defmodule AxonRoom.RoomProcess do
                 :ok
 
               exclude ->
+                # PDU form, not client form — see the sibling call in
+                # handle_call({:send_event, ...}) above.
                 broadcast_for_federation(
                   state.room_id,
-                  event_map,
+                  EventStore.event_to_pdu(persisted),
                   new_state.current_state,
                   exclude
                 )

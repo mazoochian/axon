@@ -174,4 +174,74 @@ defmodule AxonWeb.EventControllerTest do
 
     assert decode(conn1)["event_id"] == decode(conn2)["event_id"]
   end
+
+  # GET /rooms/:room_id/context/:event_id — previously unimplemented (no
+  # route at all, so it 404'd generically); found by Complement's
+  # TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent, which
+  # reads the create event back through this endpoint among others.
+  describe "get_context/2" do
+    test "returns the target event with surrounding timeline and room state" do
+      alice = register("ctx_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+
+      ids = for _ <- 1..5, do: send_message(alice.token, room_id)
+      target = Enum.at(ids, 2)
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/context/#{URI.encode(target)}?limit=4")
+
+      assert conn.status == 200
+      body = decode(conn)
+
+      assert body["event"]["event_id"] == target
+      assert body["event"]["room_id"] == room_id
+
+      before_ids = Enum.map(body["events_before"], & &1["event_id"])
+      after_ids = Enum.map(body["events_after"], & &1["event_id"])
+
+      # events_before is reverse-chronological, events_after chronological,
+      # and neither includes the target itself.
+      refute target in before_ids
+      refute target in after_ids
+      assert Enum.at(ids, 1) in before_ids
+      assert Enum.at(ids, 3) in after_ids
+
+      state_types = Enum.map(body["state"], & &1["type"])
+      assert "m.room.create" in state_types
+      assert is_binary(body["start"]) and is_binary(body["end"])
+    end
+
+    test "404s for an event that doesn't exist, or belongs to another room" do
+      alice = register("ctx_missing_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      other_room = create_room(alice.token)
+      other_event = send_message(alice.token, other_room)
+
+      missing =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/context/%24nope")
+
+      assert missing.status == 404
+
+      wrong_room =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/context/#{URI.encode(other_event)}")
+
+      assert wrong_room.status == 404
+    end
+
+    test "403s for a non-member" do
+      alice = register("ctx_owner_#{System.unique_integer([:positive])}")
+      mallory = register("ctx_outsider_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "private_chat"})
+      event_id = send_message(alice.token, room_id)
+
+      conn =
+        authed(mallory.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/context/#{URI.encode(event_id)}")
+
+      assert conn.status == 403
+    end
+  end
 end

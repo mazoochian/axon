@@ -451,23 +451,28 @@ defmodule AxonCore.EventStoreTest do
     end
   end
 
-  describe "event_to_map_by_id/1 and get_event_map/1" do
+  describe "event_to_pdu_by_id/1 and get_event_map/1" do
     test "both round-trip a persisted event to its wire map" do
       ev = event()
       {:ok, _} = EventStore.insert_event(ev, "10")
 
-      assert EventStore.event_to_map_by_id(ev["event_id"])["event_id"] == ev["event_id"]
+      assert EventStore.event_to_pdu_by_id(ev["event_id"])["event_id"] == ev["event_id"]
       assert EventStore.get_event_map(ev["event_id"])["event_id"] == ev["event_id"]
     end
 
     test "both return nil for an unknown event_id" do
-      assert EventStore.event_to_map_by_id("$nope") == nil
+      assert EventStore.event_to_pdu_by_id("$nope") == nil
       assert EventStore.get_event_map("$nope") == nil
     end
   end
 
-  describe "event_to_map/1 room v12 room_id omission" do
-    test "a v12 m.room.create event has no room_id on the wire" do
+  # The v12 create-event room_id omission is a *federation PDU* rule only
+  # (event_to_pdu/1). event_to_map/1 is the client-facing form and must
+  # keep room_id — the CS API's ClientEvent schema requires it
+  # unconditionally. These used to be the same function, so the client
+  # form was wrongly missing it too.
+  describe "event_to_pdu/1 room v12 room_id omission" do
+    test "a v12 m.room.create event has no room_id in the federation PDU form, but does in the client form" do
       v12_room = "!v12room:localhost"
       {:ok, _} = EventStore.insert_room(v12_room, @creator, "12", false)
 
@@ -480,9 +485,9 @@ defmodule AxonCore.EventStoreTest do
         })
 
       {:ok, persisted} = EventStore.insert_event(ev, "12")
-      wire_map = EventStore.event_to_map(persisted)
 
-      refute Map.has_key?(wire_map, "room_id")
+      refute Map.has_key?(EventStore.event_to_pdu(persisted), "room_id")
+      assert EventStore.event_to_map(persisted)["room_id"] == v12_room
     end
 
     test "a non-create v12 event keeps its room_id" do
@@ -491,9 +496,9 @@ defmodule AxonCore.EventStoreTest do
 
       ev = event(%{"room_id" => v12_room})
       {:ok, persisted} = EventStore.insert_event(ev, "12")
-      wire_map = EventStore.event_to_map(persisted)
 
-      assert wire_map["room_id"] == v12_room
+      assert EventStore.event_to_map(persisted)["room_id"] == v12_room
+      assert EventStore.event_to_pdu(persisted)["room_id"] == v12_room
     end
 
     test "a v11 create event keeps its room_id" do
@@ -505,9 +510,9 @@ defmodule AxonCore.EventStoreTest do
         })
 
       {:ok, persisted} = EventStore.insert_event(ev, "10")
-      wire_map = EventStore.event_to_map(persisted)
 
-      assert wire_map["room_id"] == @room
+      assert EventStore.event_to_map(persisted)["room_id"] == @room
+      assert EventStore.event_to_pdu(persisted)["room_id"] == @room
     end
   end
 

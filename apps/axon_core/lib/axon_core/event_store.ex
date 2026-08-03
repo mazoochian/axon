@@ -911,9 +911,59 @@ defmodule AxonCore.EventStore do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  @doc "Converts an Event schema struct to a wire-format map."
+  @doc """
+  Converts an Event schema struct to a **client-facing** event map — the
+  shape the Client-Server API returns (`/sync`, `/messages`, `/state`,
+  `/event/:id`, `/context`, search results). Always carries `room_id`,
+  including on a room-v12 `m.room.create` event: only the *federation*
+  PDU format omits it there (see `event_to_pdu/1`), and the CS API's
+  ClientEvent schema requires it unconditionally.
+  """
   def event_to_map(%Event{} = e) do
-    base = %{
+    base_event_map(e)
+    |> maybe_put("state_key", e.state_key)
+    |> maybe_put("unsigned", e.unsigned)
+  end
+
+  def event_to_map(m) when is_map(m), do: m
+
+  @doc """
+  Converts an Event schema struct to a **federation PDU** map — the shape
+  that goes out over the server-server API (`/send`, `send_join` state,
+  `/state`, `/backfill`, `/get_missing_events`, `/event`, `/event_auth`).
+
+  Identical to `event_to_map/1` except that a room-v12 `m.room.create`
+  event's `room_id` is omitted: per the v12 PDU schema ("room_id ...
+  Omitted from m.room.create events") the room ID *is* that event's own
+  reference hash with `!` for `$`, so the field is redundant on the wire —
+  and, critically, its presence would change the event's content hash, so
+  a receiving server would compute a different event ID and reject it.
+
+  This distinction used to not exist: `event_to_map/1` stripped `room_id`
+  unconditionally and was the single function both APIs went through, so
+  every *client*-facing view of a v12 create event was missing its
+  `room_id` too (Complement's
+  TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent asserts
+  exactly this across `/state`, `/messages`, `/event/{id}`, `/context`
+  and `/state?format=event`).
+  """
+  def event_to_pdu(%Event{} = e) do
+    base = base_event_map(e)
+
+    base =
+      if e.type == "m.room.create" and e.room_version == "12",
+        do: Map.delete(base, "room_id"),
+        else: base
+
+    base
+    |> maybe_put("state_key", e.state_key)
+    |> maybe_put("unsigned", e.unsigned)
+  end
+
+  def event_to_pdu(m) when is_map(m), do: m
+
+  defp base_event_map(%Event{} = e) do
+    %{
       "event_id" => e.event_id,
       "room_id" => e.room_id,
       "sender" => e.sender,
@@ -927,24 +977,7 @@ defmodule AxonCore.EventStore do
       "signatures" => e.signatures,
       "hashes" => e.hashes
     }
-
-    base =
-      if e.type == "m.room.create" and e.room_version == "12" do
-        # Room v12 (MSC4297): the create event's room_id IS its own event ID
-        # (with "!" instead of "$") — the field is redundant and MUST NOT
-        # appear on the wire. Still stored internally (event_id/room_id
-        # differ only by sigil) for ordinary DB scoping.
-        Map.delete(base, "room_id")
-      else
-        base
-      end
-
-    base
-    |> maybe_put("state_key", e.state_key)
-    |> maybe_put("unsigned", e.unsigned)
   end
-
-  def event_to_map(m) when is_map(m), do: m
 
   @doc "Returns true if the room exists locally."
   def room_exists?(room_id) do
@@ -952,10 +985,10 @@ defmodule AxonCore.EventStore do
     Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.room_id)) != nil
   end
 
-  @doc "Fetch event by ID and convert to wire-format map."
-  def event_to_map_by_id(event_id) do
+  @doc "Fetch event by ID and convert to federation PDU format (its only caller is send_join)."
+  def event_to_pdu_by_id(event_id) do
     case get_event(event_id) do
-      {:ok, e} -> event_to_map(e)
+      {:ok, e} -> event_to_pdu(e)
       _ -> nil
     end
   end
