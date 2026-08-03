@@ -240,6 +240,15 @@ defmodule AxonWeb.Router do
     plug(AxonWeb.Plug.FederationAuth)
   end
 
+  # Server version — unauthenticated per spec (it's how a server that can't yet
+  # authenticate to us identifies what it's talking to), so it deliberately sits
+  # outside the X-Matrix-authenticated federation scope below.
+  scope "/_matrix/federation", AxonWeb do
+    pipe_through(:api)
+
+    get("/v1/version", VersionController, :federation_version)
+  end
+
   scope "/_matrix/federation", AxonWeb do
     pipe_through(:federation)
 
@@ -350,6 +359,7 @@ defmodule AxonWeb.Router do
     put("/v3/rooms/:room_id/redact/:event_id/:txn_id", EventController, :redact)
 
     # Relations (reactions, threads) — Phase 5
+    get("/v1/rooms/:room_id/timestamp_to_event", EventController, :timestamp_to_event)
     get("/v1/rooms/:room_id/relations/:event_id", EventController, :get_relations)
     get("/v1/rooms/:room_id/relations/:event_id/:rel_type", EventController, :get_relations)
 
@@ -492,4 +502,15 @@ defmodule AxonWeb.Router do
     put("/r0/pushrules/:scope/:kind/:rule_id", PushRulesController, :put_rule)
     delete("/r0/pushrules/:scope/:kind/:rule_id", PushRulesController, :delete_rule)
   end
+
+  # -------------------------------------------------------------------------
+  # Unknown /_matrix endpoints — MUST be last, so every real route above wins.
+  #
+  # Without this, an unrouted path falls through to Phoenix's render_errors
+  # path and answers `M_NOT_FOUND`, which the spec reserves for "this endpoint
+  # exists, the thing you asked for doesn't". An unimplemented endpoint is
+  # `M_UNRECOGNIZED`, and a known path called with the wrong method is a 405
+  # rather than a 404 — see AxonWeb.UnrecognizedController.
+  # -------------------------------------------------------------------------
+  match(:*, "/_matrix/*path", AxonWeb.UnrecognizedController, :unrecognized)
 end

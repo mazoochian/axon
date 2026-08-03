@@ -333,6 +333,63 @@ defmodule AxonWeb.EventController do
     end
   end
 
+  # GET /_matrix/client/v1/rooms/:room_id/timestamp_to_event
+  #
+  # "Jump to date": given a timestamp, the closest event in the requested
+  # direction. Membership-gated even for world-readable rooms — the endpoint
+  # reveals when a room was active, which a non-member has no claim to.
+  #
+  # Known gap: this only searches history this server already holds. The spec
+  # also allows asking a remote server over federation when the local search
+  # comes up empty (a user who joined late has no local events from before the
+  # join), which needs the federation half of this endpoint.
+  def timestamp_to_event(conn, %{"room_id" => room_id} = params) do
+    user_id = conn.assigns.current_user_id
+
+    with {:ok, ts} <- parse_timestamp(params["ts"]),
+         {:ok, dir} <- parse_direction(params["dir"]) do
+      cond do
+        member_or_forgotten?(room_id, user_id) ->
+          conn
+          |> put_status(403)
+          |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+
+        event = EventStore.find_event_by_timestamp(room_id, ts, dir) ->
+          json(conn, %{
+            "event_id" => event.event_id,
+            "origin_server_ts" => event.origin_server_ts
+          })
+
+        true ->
+          conn
+          |> put_status(404)
+          |> json(%{
+            "errcode" => "M_NOT_FOUND",
+            "error" => "Unable to find event from #{ts} in direction #{dir}"
+          })
+      end
+    else
+      {:error, errcode, message} ->
+        conn |> put_status(400) |> json(%{"errcode" => errcode, "error" => message})
+    end
+  end
+
+  defp parse_timestamp(nil), do: {:error, "M_MISSING_PARAM", "Missing required parameter: ts"}
+
+  defp parse_timestamp(ts) when is_binary(ts) do
+    case Integer.parse(ts) do
+      {value, ""} when value >= 0 -> {:ok, value}
+      _ -> {:error, "M_INVALID_PARAM", "Query parameter ts must be a non-negative integer"}
+    end
+  end
+
+  # `dir` defaults to "f" per spec.
+  defp parse_direction(nil), do: {:ok, "f"}
+  defp parse_direction(dir) when dir in ["f", "b"], do: {:ok, dir}
+
+  defp parse_direction(_),
+    do: {:error, "M_INVALID_PARAM", "Query parameter dir must be one of \"f\" or \"b\""}
+
   # GET /_matrix/client/v3/rooms/:room_id/context/:event_id
   #
   # Previously unimplemented — no route at all, so it 404'd generically.

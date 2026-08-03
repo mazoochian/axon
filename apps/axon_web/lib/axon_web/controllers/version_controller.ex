@@ -29,6 +29,17 @@ defmodule AxonWeb.VersionController do
     })
   end
 
+  # GET /_matrix/federation/v1/version — unauthenticated by spec (it's how a
+  # server that can't yet talk to us identifies what it's talking to).
+  def federation_version(conn, _params) do
+    json(conn, %{
+      "server" => %{
+        "name" => "Axon",
+        "version" => to_string(Application.spec(:axon_web, :vsn) || "0.0.0")
+      }
+    })
+  end
+
   # GET /_matrix/client/v1/auth_metadata (MSC2965)
   def auth_metadata(conn, _params) do
     case AxonWeb.Oidc.metadata() do

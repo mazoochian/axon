@@ -293,6 +293,42 @@ defmodule AxonCore.EventStore do
   end
 
   @doc """
+  The event closest to `ts` (ms since the epoch) in `dir` — `"f"` for the
+  earliest event at or after it, `"b"` for the latest at or before it. Backs
+  GET /rooms/:id/timestamp_to_event.
+
+  Ties on `origin_server_ts` break by `stream_ordering`, so a room whose events
+  all carry the same timestamp (bridged/imported history, or just a fast
+  sender) still resolves to the topologically nearest event in the requested
+  direction rather than an arbitrary one of the tied set.
+  """
+  def find_event_by_timestamp(room_id, ts, dir) do
+    base =
+      from(e in Event,
+        where: e.room_id == ^room_id and not e.rejected and not e.soft_failed
+      )
+
+    query =
+      case dir do
+        "b" ->
+          from(e in base,
+            where: e.origin_server_ts <= ^ts,
+            order_by: [desc: e.origin_server_ts, desc: e.stream_ordering],
+            limit: 1
+          )
+
+        _ ->
+          from(e in base,
+            where: e.origin_server_ts >= ^ts,
+            order_by: [asc: e.origin_server_ts, asc: e.stream_ordering],
+            limit: 1
+          )
+      end
+
+    Repo.one(query)
+  end
+
+  @doc """
   Paginate events related to `target_event_id` (for GET /rooms/:id/relations/:eventId).
   `rel_type` and `event_type` are optional filters, `nil` means "any".
   """
