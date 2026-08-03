@@ -222,12 +222,66 @@ defmodule AxonWeb.RoomV12Test do
       assert conn.status == 200
     end
 
+    # Regression coverage for Complement's TestMSC4289PrivilegedRoomCreators,
+    # whose "creator can kick admin[...]" subtests send the power_levels
+    # update with `SendEventSynced` — i.e. they require the PUT'd event to
+    # actually show up on /sync (both a from-scratch sync and an
+    # incremental one from an already-held `since` token), not just that
+    # the PUT itself returns 200. Verified directly here since the kick
+    # tests below only check the PUT/kick status codes.
+    test "a power_levels update is visible on both a fresh and an incremental /sync", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      initial_sync = authed(alice.token) |> get("/_matrix/client/v3/sync?timeout=0")
+      since = decode(initial_sync)["next_batch"]
+      assert is_binary(since)
+
+      conn =
+        send_state(alice.token, room_id, "m.room.power_levels", "", %{
+          "users" => %{bob.user_id => 100}
+        })
+
+      assert conn.status == 200
+      event_id = decode(conn)["event_id"]
+      assert is_binary(event_id)
+
+      fresh_sync = authed(alice.token) |> get("/_matrix/client/v3/sync")
+      fresh_events = get_in(decode(fresh_sync), ["rooms", "join", room_id, "timeline", "events"]) || []
+
+      assert Enum.any?(fresh_events, &(&1["event_id"] == event_id)),
+             "expected #{event_id} in a fresh sync's timeline, got #{inspect(Enum.map(fresh_events, & &1["event_id"]))}"
+
+      incremental_sync = authed(alice.token) |> get("/_matrix/client/v3/sync?since=#{since}&timeout=0")
+
+      incremental_events =
+        get_in(decode(incremental_sync), ["rooms", "join", room_id, "timeline", "events"]) || []
+
+      assert Enum.any?(incremental_events, &(&1["event_id"] == event_id)),
+             "expected #{event_id} in an incremental sync's timeline, got #{inspect(incremental_events)}"
+    end
+
     test "creator can kick a member promoted to admin (PL100)", %{
       alice: alice,
       bob: bob,
       room_id: room_id
     } do
       set_bob_power(alice.token, room_id, bob.user_id, 100)
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
+
+      assert conn.status == 200
+    end
+
+    test "creator can kick a member promoted well above PL100 (not just exactly 100)", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      set_bob_power(alice.token, room_id, bob.user_id, 949_342)
 
       conn =
         authed(alice.token)
@@ -376,6 +430,88 @@ defmodule AxonWeb.RoomV12Test do
     end
   end
 
+  describe "power_level_content_override on a v12 room (MSC4289)" do
+    test "power_level_content_override can be set for a non-creator" do
+      alice = register("v12_plco_alice_#{System.unique_integer([:positive])}")
+      bob = register("v12_plco_bob_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(alice.token, %{
+          "room_version" => "12",
+          "invite" => [bob.user_id],
+          "power_level_content_override" => %{"users" => %{bob.user_id => 100}}
+        })
+
+      conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+      assert conn.status == 200
+      assert decode(conn)["users"] == %{bob.user_id => 100}
+    end
+
+    test "power_level_content_override cannot list the room creator (v12 rule 10.4)" do
+      alice = register("v12_plco_creator_#{System.unique_integer([:positive])}")
+      bob = register("v12_plco_creator_bob_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/createRoom", %{
+          "room_version" => "12",
+          "invite" => [bob.user_id],
+          "power_level_content_override" => %{"users" => %{alice.user_id => 100}}
+        })
+
+      assert conn.status == 400
+    end
+  end
+
+  # Regression: RoomUpgrade.ensure_can_tombstone/2 used to read
+  # power_levels.users[user_id] directly to decide whether the caller may
+  # POST /upgrade, defaulting to 0 for anyone absent from that map. A v12
+  # room's creator is *never* listed there (implicit infinite power,
+  # MSC4289 rule 10.4) and v12 requires PL150 to tombstone (vs. 100
+  # pre-v12, which the creator's explicit users=>100 entry satisfies) — so
+  # the room's own creator was refused their own room's upgrade with
+  # M_FORBIDDEN "Insufficient power level to upgrade room". Found by
+  # Complement's TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms.
+  describe "upgrading a v12 room as its creator (MSC4291 x MSC4289)" do
+    test "the creator (implicit infinite power, absent from power_levels.users) can upgrade" do
+      alice = register("v12_upgrade_alice_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "12", "preset" => "public_chat"})
+
+      pl_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+      refute Map.has_key?(decode(pl_conn)["users"] || %{}, alice.user_id)
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "12"})
+
+      assert conn.status == 200
+      assert is_binary(decode(conn)["replacement_room"])
+    end
+
+    test "a non-creator member below PL150 still cannot upgrade a v12 room" do
+      alice = register("v12_upgrade2_alice_#{System.unique_integer([:positive])}")
+      bob = register("v12_upgrade2_bob_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(alice.token, %{
+          "room_version" => "12",
+          "preset" => "public_chat",
+          "invite" => [bob.user_id]
+        })
+
+      join_conn = authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+      assert join_conn.status == 200
+
+      # bob stays at the room's default (unpromoted) power — well below the
+      # PL150 a v12 room requires to tombstone/upgrade.
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{"new_version" => "12"})
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+  end
 
   # Regression (MSC4291, found by Complement's
   # TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent): the
@@ -465,6 +601,40 @@ defmodule AxonWeb.RoomV12Test do
 
       assert EventStore.event_to_map(create_event)["room_id"] == room_id
       assert EventStore.event_to_pdu(create_event)["room_id"] == room_id
+    end
+  end
+
+  # Regression (MSC4297 rule 3.2, found by Complement's
+  # TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent): that
+  # test walks *every* event in the room's timeline (not just a join
+  # template) and asserts none of them lists the create event in its own
+  # `auth_events`. AxonRoom.EventBuilder.select_auth_events/5 already
+  # special-cases the join template (exercised by the "federation: remote
+  # join" test above), but every other locally-built v12 state event
+  # (power_levels, join_rules, the creator's own join) goes through the
+  # same function — assert that holds room-wide, not just for one event
+  # type.
+  describe "every locally-built v12 event omits the create event from its own auth_events" do
+    test "power_levels, join_rules and the creator's join all omit it" do
+      alice = register("v12_authevents_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "12", "preset" => "public_chat"})
+
+      {:ok, create_event} = EventStore.get_state_event(room_id, "m.room.create", "")
+      create_event_id = create_event.event_id
+
+      state_map = EventStore.get_current_state_map(room_id)
+
+      for {{type, _state_key}, event} <- state_map, type != "m.room.create" do
+        refute create_event_id in (event["auth_events"] || []),
+               "#{type}'s auth_events wrongly includes the create event: #{inspect(event["auth_events"])}"
+      end
+
+      # Sanity: the map actually contains the events we mean to check —
+      # an empty state_map would make the loop above vacuously pass.
+      types = state_map |> Map.keys() |> Enum.map(&elem(&1, 0))
+      assert "m.room.power_levels" in types
+      assert "m.room.join_rules" in types
+      assert "m.room.member" in types
     end
   end
 
