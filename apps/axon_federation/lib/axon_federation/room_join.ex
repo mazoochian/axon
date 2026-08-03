@@ -14,7 +14,7 @@ defmodule AxonFederation.RoomJoin do
   alias AxonFederation.HttpClient
   alias AxonRoom.RoomProcess
 
-  @supported_versions ~w(2 3 4 5 6 7 8 9 10 11)
+  @supported_versions ~w(2 3 4 5 6 7 8 9 10 11 12)
 
   @doc """
   Joins a remote room for a local user.

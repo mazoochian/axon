@@ -10,7 +10,7 @@ defmodule AxonRoom.RoomUpgrade do
   """
 
   alias AxonCore.EventStore
-  alias AxonRoom.{CreateRoom, RoomProcess}
+  alias AxonRoom.{AuthRules, CreateRoom, RoomProcess}
 
   @copy_state_types ~w(
     m.room.server_acl m.room.encryption m.room.name m.room.topic m.room.avatar
@@ -28,11 +28,20 @@ defmodule AxonRoom.RoomUpgrade do
 
   @doc "Errors with :insufficient_power_level unless `user_id` may send m.room.tombstone in `room_id`."
   def ensure_can_tombstone(room_id, user_id) do
-    pl = fetch_power_levels(room_id)
-    required = get_in(pl, ["events", "m.room.tombstone"]) || pl["state_default"] || 50
-    power = get_in(pl, ["users", user_id]) || pl["users_default"] || 0
+    # Delegate to AuthRules.can_send_state?/4 rather than reading
+    # power_levels.users directly: a room-v12 creator (or additional
+    # creator) has implicit infinite power and is never listed in
+    # `users` at all (MSC4289 rule 10.4), so a naive `users[user_id]`
+    # lookup reads 0 for them and incorrectly refuses the room's own
+    # creator the /upgrade they're always entitled to. AuthRules already
+    # accounts for this (and for pre-v12's "no power_levels event yet ->
+    # creator implicitly 100" case) via effective_power/4.
+    state_map = EventStore.get_current_state_map(room_id)
+    version = room_version(state_map)
 
-    if power >= required, do: :ok, else: {:error, :insufficient_power_level}
+    if AuthRules.can_send_state?(user_id, "m.room.tombstone", state_map, version),
+      do: :ok,
+      else: {:error, :insufficient_power_level}
   end
 
   @doc """
@@ -206,10 +215,10 @@ defmodule AxonRoom.RoomUpgrade do
     end)
   end
 
-  defp fetch_power_levels(room_id) do
-    case EventStore.get_state_event(room_id, "m.room.power_levels", "") do
-      {:ok, event} -> event.content
-      {:error, :not_found} -> %{}
+  defp room_version(state_map) do
+    case state_map[{"m.room.create", ""}] do
+      %{"content" => %{"room_version" => v}} -> v
+      _ -> "11"
     end
   end
 
