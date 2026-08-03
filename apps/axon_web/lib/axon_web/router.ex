@@ -62,6 +62,11 @@ defmodule AxonWeb.Router do
     get("/v3/profile/:user_id/displayname", ProfileController, :get_displayname)
     get("/v3/profile/:user_id/avatar_url", ProfileController, :get_avatar_url)
 
+    # Generic profile fields (MSC4133, stable since Matrix 1.16) — covers
+    # any keyName other than displayname/avatar_url, which are matched by
+    # the dedicated routes above.
+    get("/v3/profile/:user_id/:key_name", ProfileController, :get_field)
+
     # Public room directory
     get("/v3/publicRooms", DirectoryController, :public_rooms)
     post("/v3/publicRooms", DirectoryController, :public_rooms)
@@ -309,6 +314,13 @@ defmodule AxonWeb.Router do
     put("/v3/profile/:user_id/displayname", ProfileController, :set_displayname)
     put("/v3/profile/:user_id/avatar_url", ProfileController, :set_avatar_url)
 
+    # Generic profile fields (MSC4133, stable since Matrix 1.16). PUT/DELETE
+    # have no separate dedicated routes even for displayname/avatar_url —
+    # ProfileController.put_field/delete_field special-case those two keys
+    # to go through the same storage as the routes above.
+    put("/v3/profile/:user_id/:key_name", ProfileController, :put_field)
+    delete("/v3/profile/:user_id/:key_name", ProfileController, :delete_field)
+
     # Rooms
     post("/v3/createRoom", RoomController, :create)
     get("/v3/joined_rooms", RoomController, :joined_rooms)
@@ -393,6 +405,11 @@ defmodule AxonWeb.Router do
     put("/v3/user/:user_id/account_data/:type", AccountDataController, :put)
     get("/v3/user/:user_id/rooms/:room_id/account_data/:type", AccountDataController, :get_room)
     put("/v3/user/:user_id/rooms/:room_id/account_data/:type", AccountDataController, :put_room)
+
+    # Room tags — https://spec.matrix.org/v1.18/client-server-api/#room-tagging
+    get("/v3/user/:user_id/rooms/:room_id/tags", RoomTagsController, :index)
+    put("/v3/user/:user_id/rooms/:room_id/tags/:tag", RoomTagsController, :put)
+    delete("/v3/user/:user_id/rooms/:room_id/tags/:tag", RoomTagsController, :delete)
 
     # Devices
     get("/v3/devices", DeviceController, :index)
