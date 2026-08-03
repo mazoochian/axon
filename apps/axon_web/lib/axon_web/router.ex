@@ -273,6 +273,7 @@ defmodule AxonWeb.Router do
     get("/v1/event_auth/:room_id/:event_id", FederationController, :event_auth)
     get("/v1/hierarchy/:room_id", FederationController, :hierarchy)
     post("/v1/get_missing_events/:room_id", FederationController, :get_missing_events)
+    get("/v1/timestamp_to_event/:room_id", FederationController, :timestamp_to_event)
     get("/v1/query/directory", FederationController, :query_directory)
     get("/v1/query/profile", FederationController, :query_profile)
 
