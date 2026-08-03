@@ -554,7 +554,7 @@ defmodule AxonRoom.RoomProcess do
       |> Enum.flat_map(fn
         {{"m.room.member", user_id}, event} ->
           membership = get_in(event, ["content", "membership"])
-          server = user_id |> String.split(":") |> List.last()
+          server = user_id |> AxonCore.MatrixId.server_name()
 
           if membership == "join" and server != local_server and server != exclude,
             do: [server],

@@ -91,5 +91,5 @@ defmodule AxonRoom.RestrictedJoin do
     end
   end
 
-  defp server_of(user_id), do: user_id |> String.split(":") |> List.last()
+  defp server_of(user_id), do: user_id |> AxonCore.MatrixId.server_name()
 end

@@ -13,7 +13,7 @@ defmodule AxonFederation.EventVerification do
 
   @doc "Verifies `event`'s signature from its claimed origin. Returns :ok or {:error, reason}."
   def verify_signature(event) do
-    sender_server = event["sender"] |> to_string() |> String.split(":") |> List.last()
+    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
     origin = event["origin"] || sender_server
 
     key_id = get_in(event, ["signatures", origin]) |> maybe_first_key()

@@ -25,7 +25,7 @@ defmodule AxonWeb.FederationController do
     # Verify the origin server is allowed to make this request
     # (user_id's server must match origin)
     origin = conn.assigns[:origin_server]
-    user_server = user_id |> String.split(":") |> List.last()
+    user_server = user_id |> AxonCore.MatrixId.server_name()
 
     cond do
       user_server != origin ->
@@ -162,7 +162,7 @@ defmodule AxonWeb.FederationController do
 
   def make_leave(conn, %{"room_id" => room_id, "user_id" => user_id}) do
     origin = conn.assigns[:origin_server]
-    user_server = user_id |> String.split(":") |> List.last()
+    user_server = user_id |> AxonCore.MatrixId.server_name()
 
     cond do
       user_server != origin ->
@@ -269,8 +269,8 @@ defmodule AxonWeb.FederationController do
 
   defp validate_invite_event(event, room_id, origin) when is_map(event) do
     local_server = KeyServer.server_name()
-    target_server = event["state_key"] |> to_string() |> String.split(":") |> List.last()
-    sender_server = event["sender"] |> to_string() |> String.split(":") |> List.last()
+    target_server = event["state_key"] |> to_string() |> AxonCore.MatrixId.server_name()
+    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
 
     cond do
       event["type"] != "m.room.member" -> {:error, :invalid_invite}
@@ -323,7 +323,7 @@ defmodule AxonWeb.FederationController do
   def make_knock(conn, %{"room_id" => room_id, "user_id" => user_id} = params) do
     supported_versions = (params["ver"] || ["7", "8", "9", "10", "11"]) |> List.wrap()
     origin = conn.assigns[:origin_server]
-    user_server = user_id |> String.split(":") |> List.last()
+    user_server = user_id |> AxonCore.MatrixId.server_name()
 
     cond do
       user_server != origin ->
@@ -367,7 +367,7 @@ defmodule AxonWeb.FederationController do
       "state_key" => user_id,
       "content" => %{"membership" => "knock"},
       "origin_server_ts" => System.os_time(:millisecond),
-      "origin" => user_id |> String.split(":") |> List.last(),
+      "origin" => user_id |> AxonCore.MatrixId.server_name(),
       "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
       "auth_events" =>
         select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
@@ -501,7 +501,7 @@ defmodule AxonWeb.FederationController do
     typing? = content["typing"] == true
     timeout_ms = content["timeout"] || 30_000
 
-    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+    sender_server = user_id |> to_string() |> AxonCore.MatrixId.server_name()
 
     if sender_server == origin and local_room_member?(room_id, user_id) and
          acl_allowed?(room_id, origin) do
@@ -542,7 +542,7 @@ defmodule AxonWeb.FederationController do
     messages = content["messages"] || %{}
     local_server = KeyServer.server_name()
 
-    sender_server = sender |> to_string() |> String.split(":") |> List.last()
+    sender_server = sender |> to_string() |> AxonCore.MatrixId.server_name()
 
     if sender_server == origin do
       Enum.each(messages, fn {target_user_id, device_messages} ->
@@ -572,7 +572,7 @@ defmodule AxonWeb.FederationController do
        )
        when is_map(content) do
     user_id = content["user_id"]
-    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+    sender_server = user_id |> to_string() |> AxonCore.MatrixId.server_name()
 
     if is_binary(user_id) and sender_server == origin do
       KeyStore.record_device_list_update(user_id)
@@ -980,7 +980,7 @@ defmodule AxonWeb.FederationController do
   end
 
   defp local_user?(user_id, local_server) do
-    user_id |> String.split(":") |> List.last() == local_server
+    user_id |> AxonCore.MatrixId.server_name() == local_server
   end
 
   # Guards inbound ephemeral EDUs (m.typing, m.receipt) against a remote
@@ -994,7 +994,7 @@ defmodule AxonWeb.FederationController do
   defp local_room_member?(_room_id, _user_id), do: false
 
   defp apply_inbound_receipt(origin, room_id, receipt_type, user_id, receipt_data) do
-    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+    sender_server = user_id |> to_string() |> AxonCore.MatrixId.server_name()
     event_id = receipt_data["event_ids"] |> List.wrap() |> List.first()
     ts = get_in(receipt_data, ["data", "ts"]) || System.os_time(:millisecond)
 
@@ -1029,7 +1029,7 @@ defmodule AxonWeb.FederationController do
   # room-scoped m.typing/m.receipt EDU naming a room we have no relation to).
   defp apply_inbound_presence(%{"user_id" => user_id, "presence" => presence} = update, origin)
        when presence in ["online", "unavailable", "offline"] do
-    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+    sender_server = user_id |> to_string() |> AxonCore.MatrixId.server_name()
 
     if sender_server == origin and EventStore.known_user?(user_id) do
       AxonSync.Presence.set_remote(
@@ -1219,7 +1219,7 @@ defmodule AxonWeb.FederationController do
       "state_key" => user_id,
       "content" => member_content,
       "origin_server_ts" => System.os_time(:millisecond),
-      "origin" => user_id |> String.split(":") |> List.last(),
+      "origin" => user_id |> AxonCore.MatrixId.server_name(),
       "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
       "auth_events" =>
         select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
@@ -1237,7 +1237,7 @@ defmodule AxonWeb.FederationController do
       "state_key" => user_id,
       "content" => %{"membership" => "leave"},
       "origin_server_ts" => System.os_time(:millisecond),
-      "origin" => user_id |> String.split(":") |> List.last(),
+      "origin" => user_id |> AxonCore.MatrixId.server_name(),
       "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
       "auth_events" =>
         select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),

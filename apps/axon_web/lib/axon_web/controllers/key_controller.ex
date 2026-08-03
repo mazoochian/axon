@@ -110,7 +110,7 @@ defmodule AxonWeb.KeyController do
   # %{server_name => %{user_id => device_ids}} map of remote requests.
   defp split_local_remote(device_keys_req, local_server) do
     Enum.reduce(device_keys_req, {[], %{}}, fn {user_id, device_ids}, {local, remote} ->
-      server = user_id |> String.split(":") |> List.last()
+      server = user_id |> AxonCore.MatrixId.server_name()
 
       if server == local_server do
         {[user_id | local], remote}
@@ -779,7 +779,7 @@ defmodule AxonWeb.KeyController do
   # what they need locally).
   defp split_to_device_targets(messages, local_server) do
     Enum.reduce(messages, {%{}, %{}}, fn {target_user_id, device_messages}, {local, remote} ->
-      server = target_user_id |> String.split(":") |> List.last()
+      server = target_user_id |> AxonCore.MatrixId.server_name()
 
       if server == local_server do
         {Map.put(local, target_user_id, device_messages), remote}
