@@ -339,10 +339,12 @@ defmodule AxonWeb.EventController do
   # direction. Membership-gated even for world-readable rooms — the endpoint
   # reveals when a room was active, which a non-member has no claim to.
   #
-  # Known gap: this only searches history this server already holds. The spec
-  # also allows asking a remote server over federation when the local search
-  # comes up empty (a user who joined late has no local events from before the
-  # join), which needs the federation half of this endpoint.
+  # When this server's own history doesn't reach far enough (a user who
+  # joined late has no local events from before the join), falls back to
+  # AxonFederation.TimestampToEvent, which asks the room's other resident
+  # servers over the federation counterpart of this endpoint and, per spec,
+  # backfills whatever event they name before it's handed back here — so a
+  # client can immediately paginate /context or /messages around it.
   def timestamp_to_event(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
 
@@ -360,6 +362,12 @@ defmodule AxonWeb.EventController do
             "origin_server_ts" => event.origin_server_ts
           })
 
+        result = federation_timestamp_fallback(room_id, ts, dir) ->
+          json(conn, %{
+            "event_id" => result.event_id,
+            "origin_server_ts" => result.origin_server_ts
+          })
+
         true ->
           conn
           |> put_status(404)
@@ -371,6 +379,13 @@ defmodule AxonWeb.EventController do
     else
       {:error, errcode, message} ->
         conn |> put_status(400) |> json(%{"errcode" => errcode, "error" => message})
+    end
+  end
+
+  defp federation_timestamp_fallback(room_id, ts, dir) do
+    case AxonFederation.TimestampToEvent.find(room_id, ts, dir) do
+      {:ok, result} -> result
+      :not_found -> nil
     end
   end
 

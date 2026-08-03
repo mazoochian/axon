@@ -5,7 +5,11 @@ defmodule AxonWeb.TimestampToEventTest do
   Mirrors Complement's `TestJumpToDateEndpoint`: closest event in each
   direction, nothing found beyond either end of the room's history, the
   topological tie-break when every event shares a timestamp, and the
-  membership gate that applies even to a public room.
+  membership gate that applies even to a public room. The "federation"
+  describe block below covers the other half of that same Complement test
+  — Complement's `remoteCharlie` scenarios, where the requesting server
+  never held the target event locally at all and has to ask a resident
+  peer (`AxonFederation.TimestampToEvent`, `AxonWeb.FederationController.timestamp_to_event/2`).
   """
 
   use AxonWeb.ConnCase, async: false
@@ -13,6 +17,8 @@ defmodule AxonWeb.TimestampToEventTest do
   import Ecto.Query, only: [from: 2]
 
   alias AxonCore.EventStore
+  alias AxonFederation.FakeRemoteMatrixServer
+  alias AxonRoom.RoomProcess
 
   defp register(username) do
     conn =
@@ -61,6 +67,43 @@ defmodule AxonWeb.TimestampToEventTest do
     event_id = decode(conn)["event_id"]
     {:ok, event} = EventStore.get_event(event_id)
     {event_id, event.origin_server_ts}
+  end
+
+  # ---- federation-fallback helpers (mirrors AxonWeb.FederationControllerTest's
+  # pattern: a real signed counterparty via AxonFederation.FakeRemoteMatrixServer) ----
+
+  defp signed_remote_event(port, fields) do
+    FakeRemoteMatrixServer.sign_event(port, Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
+  end
+
+  defp remote_user(port, prefix),
+    do:
+      "@#{prefix}_#{System.unique_integer([:positive])}:#{FakeRemoteMatrixServer.server_name(port)}"
+
+  # Seeds a remote member as an already-joined resident of the room, the
+  # same way AxonWeb.FederationControllerTest does — a local self-join
+  # can't target another user, so this goes through the real inbound path
+  # (RoomProcess.apply_remote_event/2) a federated join would take. Once
+  # seeded, AxonCore.EventStore.remote_servers_for_room/1 names this port's
+  # server as one of the room's residents, which is what makes
+  # AxonFederation.TimestampToEvent.find/3 ask it in the first place.
+  defp join_remote_member(port, room_id, member_user_id) do
+    {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+    pdu =
+      signed_remote_event(port, %{
+        "event_id" => "$seedjoin_#{unique()}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => member_user_id,
+        "sender" => member_user_id,
+        "content" => %{"membership" => "join"},
+        "depth" => depth + 1,
+        "prev_events" => if(last_event_id, do: [last_event_id], else: []),
+        "origin_server_ts" => System.os_time(:millisecond)
+      })
+
+    {:ok, _} = RoomProcess.apply_remote_event(room_id, pdu)
   end
 
   defp jump(token, room_id, ts, dir) do
@@ -219,6 +262,174 @@ defmodule AxonWeb.TimestampToEventTest do
       conn = jump(alice.token, room_id, 1_500_000_000_000, "sideways")
       assert conn.status == 400
       assert %{"errcode" => "M_INVALID_PARAM"} = decode(conn)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Federation fallback (Complement's TestJumpToDateEndpoint "federation"
+  # subtests, room_timestamp_to_event_test.go from ~line 168): a member who
+  # joined too late for the local server to hold history around a given
+  # timestamp — the room's create event is always present locally (it's
+  # part of current state), so the "local search finds nothing" case that
+  # actually exercises the fallback is `dir=b` with a `ts` older than
+  # everything this server holds, e.g. an imported/bridged event backdated
+  # to before the room even existed here.
+  # ---------------------------------------------------------------------------
+
+  describe "federation fallback" do
+    @port 19_400
+    @server_name "fake-ts2e.test"
+
+    setup do
+      start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{@port}"
+      })
+
+      on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
+
+      alice = register("alice_fed_#{unique()}")
+      room_id = create_room(alice.token)
+      bob = remote_user(@port, "bob")
+      join_remote_member(@port, room_id, bob)
+
+      %{alice: alice, room_id: room_id, bob: bob}
+    end
+
+    test "finds an event via federation that the local server never held, and backfills it so /context works afterwards",
+         %{alice: alice, room_id: room_id, bob: bob} do
+      old_ts = 1_000
+      imported_event_id = "$imported_#{unique()}"
+
+      pdu =
+        signed_remote_event(@port, %{
+          "event_id" => imported_event_id,
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          # sender must be an already-joined member (bob) — AuthRules
+          # rejects a message from anyone else, same as a live PDU would.
+          "sender" => bob,
+          "content" => %{"msgtype" => "m.text", "body" => "an old imported message"},
+          "depth" => 1,
+          "prev_events" => [],
+          "origin_server_ts" => old_ts
+        })
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/timestamp_to_event/}},
+        200,
+        %{"event_id" => imported_event_id, "origin_server_ts" => old_ts}
+      )
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/event/}},
+        200,
+        %{
+          "origin" => @server_name,
+          "origin_server_ts" => old_ts,
+          "pdus" => [pdu]
+        }
+      )
+
+      # Nothing locally reaches back this far (the room's own create event
+      # postdates old_ts), so this can only succeed via the federation
+      # fallback.
+      conn = jump(alice.token, room_id, old_ts, "b")
+      assert conn.status == 200
+      assert %{"event_id" => ^imported_event_id, "origin_server_ts" => ^old_ts} = decode(conn)
+
+      # Per spec, the server "should try to backfill this event" once it
+      # learns of it — confirm it's now genuinely stored, not just relayed,
+      # which is what lets a client immediately paginate /context or
+      # /messages around it afterwards.
+      assert {:ok, stored} = EventStore.get_event(imported_event_id)
+      assert stored.room_id == room_id
+      assert stored.origin_server_ts == old_ts
+    end
+
+    test "falls back to 404 when the resident server has nothing for that timestamp either", %{
+      alice: alice,
+      room_id: room_id
+    } do
+      old_ts = 2_000
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/timestamp_to_event/}},
+        404,
+        %{"errcode" => "M_NOT_FOUND", "error" => "no event that far back"}
+      )
+
+      conn = jump(alice.token, room_id, old_ts, "b")
+      assert conn.status == 404
+      assert %{"errcode" => "M_NOT_FOUND"} = decode(conn)
+    end
+
+    test "falls back to 404 when the resident server is unreachable", %{
+      alice: alice,
+      room_id: room_id
+    } do
+      old_ts = 3_000
+      # Point the fake server's name at a port nothing is listening on.
+      dead_port = @port + 1
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{dead_port}"
+      })
+
+      conn = jump(alice.token, room_id, old_ts, "b")
+      assert conn.status == 404
+      assert %{"errcode" => "M_NOT_FOUND"} = decode(conn)
+    end
+
+    test "does not trust (or store) an event whose signature fails verification", %{
+      alice: alice,
+      room_id: room_id,
+      bob: bob
+    } do
+      old_ts = 4_000
+      bad_event_id = "$badsig_#{unique()}"
+
+      # A PDU claiming to be signed by @server_name, but actually signed by
+      # a different keypair (a second fake server started just to hold an
+      # unrelated key) — the shape axon would see from an impostor, or a
+      # server whose key rotated out from under a stale response.
+      other_port = @port + 2
+      start_supervised!({FakeRemoteMatrixServer, port: other_port, server_name: "impostor.test"})
+
+      forged_pdu =
+        signed_remote_event(other_port, %{
+          "event_id" => bad_event_id,
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => bob,
+          "content" => %{"msgtype" => "m.text", "body" => "forged"},
+          "depth" => 1,
+          "prev_events" => [],
+          "origin_server_ts" => old_ts
+        })
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/timestamp_to_event/}},
+        200,
+        %{"event_id" => bad_event_id, "origin_server_ts" => old_ts}
+      )
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/event/}},
+        200,
+        %{"origin" => @server_name, "origin_server_ts" => old_ts, "pdus" => [forged_pdu]}
+      )
+
+      conn = jump(alice.token, room_id, old_ts, "b")
+      assert conn.status == 404
+      assert %{"errcode" => "M_NOT_FOUND"} = decode(conn)
+      assert EventStore.get_event(bad_event_id) == {:error, :not_found}
     end
   end
 end

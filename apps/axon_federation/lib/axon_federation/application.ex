@@ -10,7 +10,8 @@ defmodule AxonFederation.Application do
     children = [
       AxonFederation.KeyCache,
       {Task.Supervisor, name: AxonFederation.TaskSupervisor},
-      AxonFederation.OutboundQueue
+      AxonFederation.OutboundQueue,
+      AxonFederation.DeviceListFanout
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
