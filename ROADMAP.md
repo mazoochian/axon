@@ -239,3 +239,61 @@ The remaining 67 have been *grouped*, not individually root-caused, and it would
 - **Complement `tests` package: 67/89 still failing (~75%)**: down from 79, and now grouped into the clusters listed above rather than being wholly undifferentiated — but only a handful have been individually root-caused, so the bulk of the triage the Phase 16 note called for is still ahead. The `TestCannotSendNon*` validation family (small, well-understood surface that this phase already partly moved) and the MSC4289 creator-privilege cluster (one member spot-checked to a specific symptom in the kick path) look like the most tractable next targets. The restricted-rooms cluster *may* partly resolve as further multi-server convergence issues are found — two of its fail-over variants went green with this phase's relay fix — but that is an inference, not a diagnosis, and no knocking test moved at all.
 - **The `TestMessagesOverFederation` near-hang** (Phase 16): **did not reproduce.** Phase 16 saw it block 28+ minutes and force the package to its timeout on both runs it attempted; this phase ran the full package four times, and it did not recur once — the final run completed end to end in ~1359s with no timeout and no hang. That is meaningful evidence for Phase 16's own swap-thrashing hypothesis (the host was under severe memory pressure then, and materially less so during most of these runs) and against a real axon-side stall. It is *not* proof, and nothing was changed that would explain fixing it: no code touched this phase goes anywhere near `EventController.get_messages/2`. Recording it as "most likely host memory pressure, not an axon bug" rather than as fixed — if it never recurs on a quieter machine, it can be closed outright.
 - **The `msc*` packages** remain expected failures, unchanged from Phase 16: still-unstable MSCs axon has never claimed to implement.
+
+## Phase 18 — Parallel-agent compliance push: 22/89 → 35/89
+
+Worked as a fleet: an Opus coordinator holding `master`, a spec auditor, two read-only triage analysts, and nine implementation workers each in its own git worktree with an isolated test database (`AXON_TEST_DB`, added to `config/test.exs` for exactly this). Every worker's brief forbade running Complement — the coordinator owned full runs — and required regression coverage in the normal `mix test` suite rather than a Complement pass alone.
+
+**The headline number is measured, not predicted: 35/89 (~39%), up from 22/89 (~25%).** Full `mix test` ends the phase at **1092 tests, 0 failures** (up from 938).
+
+### The bug that mattered most, and why no amount of reading found it
+
+`make_join` answered `403 M_FORBIDDEN "User ID domain does not match origin"` for any user whose server name carries an explicit port. 26 call sites across 8 files derived a Matrix ID's server with
+
+```elixir
+id |> String.split(":") |> List.last()
+```
+
+which returns the **port**, not the host: `"@charlie:host.docker.internal:41491"` yielded `"41491"`. Every federation endpoint comparing that against the requesting origin rejected the request. Complement addresses every remote homeserver as `host.docker.internal:<port>`, so this failed the *setup* of whole test families long before their actual assertions ran.
+
+This is why an earlier worker's careful static analysis of the `send_join`/`send_leave`/`send_knock` validation cluster correctly found **no bug** — it traced every assertion in Complement's shared helper to code that already satisfied it, and said so, and reported that if those tests were still red the cause had to lie outside that file. It did. The lesson is recorded here deliberately: a well-argued negative result from a worker is a finding, not a failure, and overruling it would have meant "fixing" correct code.
+
+Replaced by `AxonCore.MatrixId.server_name/1` — split on the *first* colon, since sigil and localpart can never contain one — returning `nil` for an ID with no server part at all, notably a room-v12 room ID (a bare hash by design, MSC4291). `room_controller`'s v12 via-hint check had been detecting that case by relying on the old buggy behaviour (`room_server == room_id`) and now tests the `nil` directly.
+
+### Real bugs found and fixed
+
+- **A knocking user could join without an invite.** `check_join`'s `knock` branch accepted `knock` as a valid prior membership for a self-service transition to `join`. Spec rule 4.3.4 permits only `invite`/`join`. Found by a worker while fixing something adjacent, and not by the triage that preceded it.
+- **Room creators could be outranked.** `@infinite_power` was `1_000_000_000`, but a power level is a JSON number a client may legitimately set as high as `2^53 - 1`. An admin promoted above the constant outranked the room's own creator, and the creator failed to outrank them — both directions broken. Now `10^18`, with a new auth rule rejecting any `power_levels` value outside the canonical-JSON-safe integer range.
+- **Rejected events were never persisted.** The `rejected`/`soft_failed` columns were read in a dozen places and written in *none*; an event failing auth was silently dropped. Now stored with `rejected: true`, excluded from derived state, and "unrejected" with a fresh `stream_ordering` on a passing resend (a stale ordering would sort the event before any `since` token a client already holds, so it would never appear in `/sync`).
+- **Events with unknown ancestry were accepted anyway.** When a PDU's `prev_events` could not be resolved, `StateResolver` fell back to the room's *current* state, authorising the event against unrelated state. It now refuses. Narrowed deliberately to "all prev_events unresolvable" so the existing, tested partial-merge behaviour survives.
+- **`m.device_list_update` existed nowhere.** Phase 8 built the local device-list machinery; nothing ever federated it, in either direction. A remote server was never told a local user's devices changed.
+- **`m.room.server_acl`, `/publicRooms` and aliases**: `/publicRooms` never returned `join_rule` or `room_type` at all, breaking the public-room half of its own test as well as the knock half; `DirectoryController.can_manage_aliases?/2` did its own power arithmetic and so did not know about v12 creator privilege.
+- **Space hierarchy** recursed into any room's `m.space.child` links rather than only spaces, was breadth-first where the spec's pagination requires depth-first pre-order, had no pagination at all, and never consulted a restricted room's `allow` list when deciding visibility.
+
+### Endpoints that simply did not exist
+
+`GET /_matrix/client/v3/notifications`; room tags (`/user/{userId}/rooms/{roomId}/tags`); generic profile fields (stable since Matrix 1.16 — verified on the spec page before building, rather than trusted from the audit); `timestamp_to_event` in both the client and federation directions; `room_summary`; federation `hierarchy`; federation `version`; `power_level_content_override` on `createRoom`; and proper `404`/`405 M_UNRECOGNIZED` handling for unknown endpoints, which previously answered `M_NOT_FOUND` and had no notion of 405 at all.
+
+### Unread notification counts
+
+Phase 10 recorded these as always-0. That was already half-stale — Phase 15 had implemented real counts for sliding sync — so the work was to promote that logic into `AxonWeb.SyncHelpers` shared by both sync endpoints (so they cannot drift), and add a persisted notifications ledger written by `AxonPush.Dispatcher` to back `GET /notifications`. Counts stay on-the-fly rather than in a counter table: a counter must remain correct as a read receipt moves *backwards* as well as forwards, and silent drift is worse than a bounded rescan. `unread_thread_notifications` is deliberately absent — there is no per-thread receipt model to compute it from.
+
+### Infrastructure traps found the hard way
+
+- **The host's Postgres was dead** for the whole phase: the box now has PostgreSQL 18 binaries against a v16 data directory, so the service refuses to start. Not migrated — that data directory is shared with unrelated projects and the migration is the owner's call. Worked around with a disposable `postgres:16-alpine` container.
+- **The test suite cannot be run twice concurrently on one host.** `AxonFederation.FakeRemoteMatrixServer` binds fixed ports; a collision crashes the listener and cascades into the whole `axon_web` application shutting down, which presents as 440 of 441 tests failing with a missing ETS table. Environmental, not a regression — but indistinguishable from catastrophe if you only read the summary.
+- **The README's "fast incremental" Complement image rebuild cannot work on this host, and fails silently.** It copies a release built on Fedora (glibc 2.38) into a Debian bookworm image (glibc 2.36); every homeserver container then dies at boot with a `GLIBC_2.38 not found` link error, and Complement *hangs* waiting on servers that never come up rather than failing loudly. Cost a wasted 23-minute run. `_build/` is excluded in `.dockerignore` precisely to prevent this; the exclusion was removed during this phase to "fix" the recipe and had to be put back, with the reason recorded in both files. A single-test smoke check before any long run is now the standing practice.
+- **A 500ms poller with no Ecto sandbox ownership** (the new device-list fan-out) crashed on every tick under test, exhausted its supervisor's restart intensity, and took down the `axon_federation` application — failing 96 unrelated tests with a missing-ETS-table error that pointed nowhere near the cause. Failed polls are now skipped.
+
+### Where it stands, honestly
+
+**35/89.** The package still exits FAIL and 54 tests remain red. What changed beyond the number is the quality of the remaining information: there is now a per-test first-failure extract for every failing test, so the next pass starts from evidence rather than from test names.
+
+Known and unresolved at the end of this phase:
+
+- **A second systemic federation bug is still open.** Outbound `make_join` to a peer is answered `401` and the *receiving* server logs nothing — which should be impossible, since every rejection path in `AxonWeb.Plug.FederationAuth` logs a warning. This gates `TestJoinViaRoomIDAndServerName`, `TestOutboundFederationSend`, the restricted-room remote joins, and plausibly `TestKnocking` (which dies at `502 Failed to deliver invite to remote server` during setup). Under investigation; not diagnosed.
+- **`soft_failed` is still never set.** Axon has only one auth check, against ancestor-resolved state, and no second check against current state from which a genuine soft-failure signal could be derived. Rejection is implemented; soft-failure is not.
+- **`AuthRules` rule 2 is unimplemented** — an event's `auth_events` are never checked against what the selection algorithm would have chosen.
+- **`TestEventAuth` remains genuinely un-root-caused.** The endpoint exists and returns a correct transitive chain; the field name matches the Go client's struct; the selection algorithm was traced and looked right. Recorded as UNKNOWN rather than given a plausible-sounding cause.
+- The per-room summary field building is duplicated between `SpaceController` (per-user visibility) and `FederationController` (per-server visibility). The visibility rules genuinely differ; the field assembly does not, and belongs in a shared module.
+- The `msc*` packages remain expected failures, unchanged since Phase 16.
