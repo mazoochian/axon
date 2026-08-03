@@ -72,13 +72,19 @@ defmodule AxonCrypto.KeyServer do
   def handle_call(:server_key_info, _from, state) do
     public_key_b64 = Base.encode64(state.public_key, padding: false)
 
-    # Build the self-signed key info document
+    # Build the self-signed key info document. Must match, field-for-field,
+    # what AxonWeb.KeyController.server_keys/2 actually serves — the
+    # signature covers the canonical JSON of the exact response body (minus
+    # "signatures"), so omitting a field here that the controller adds back
+    # in (e.g. "old_verify_keys") produces a signature that verifies against
+    # a document nobody ever receives, and fails for every real recipient.
     unsigned_doc = %{
       "server_name" => state.server_name,
       "valid_until_ts" => state.valid_until_ts,
       "verify_keys" => %{
         state.key_id => %{"key" => public_key_b64}
-      }
+      },
+      "old_verify_keys" => %{}
     }
 
     sig_bytes =

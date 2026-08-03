@@ -110,8 +110,22 @@ defmodule AxonFederation.RoomJoin do
       on_conflict: :nothing
     )
 
-    # Store all auth chain events first (they are referenced by state events)
-    all_events = (auth_chain ++ state_events) |> Enum.uniq_by(& &1["event_id"])
+    # Store all auth chain events first (they are referenced by state events).
+    # Room versions 3+ never carry "event_id" on the wire (it's derived from
+    # the reference hash) — dedup and storage both need a real, non-nil key
+    # per event, or Enum.uniq_by/2 collapses every such event down to
+    # whichever one happened to come first (matching send_transaction's
+    # `pdu["event_id"] || compute_event_id(pdu)` handling of the same
+    # id-less wire format).
+    all_events =
+      (auth_chain ++ state_events)
+      |> Enum.map(fn event ->
+        case event["event_id"] do
+          nil -> Map.put(event, "event_id", EventHash.reference_hash(event))
+          _ -> event
+        end
+      end)
+      |> Enum.uniq_by(& &1["event_id"])
 
     Enum.each(all_events, fn event ->
       case EventStore.insert_event(event, room_version) do

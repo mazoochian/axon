@@ -291,8 +291,16 @@ defmodule AxonWeb.Router do
     get("/v1/media/thumbnail/:media_id", MediaController, :federation_thumbnail)
   end
 
+  # Key notary lookup — deliberately unauthenticated per spec (like
+  # /_matrix/key/v2/server above): a server calls this precisely because it
+  # doesn't have (or can't trust) the target's key yet, so requiring an
+  # X-Matrix signature here is a chicken-and-egg deadlock. gomatrixserverlib
+  # (and other implementations) fall back to this notary endpoint whenever
+  # a direct /v2/server fetch fails its checks, so gating it behind
+  # FederationAuth silently breaks that fallback with a 401 that never even
+  # reaches AxonWeb.Plug.FederationAuth's own rejection logging.
   scope "/_matrix/key", AxonWeb do
-    pipe_through(:federation)
+    pipe_through(:api)
 
     post("/v2/query", FederationController, :query_keys)
     get("/v2/query/:server_name/:key_id", FederationController, :query_keys)
