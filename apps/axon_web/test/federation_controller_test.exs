@@ -810,6 +810,186 @@ defmodule AxonWeb.FederationControllerTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # m.room.server_acl enforcement (AxonRoom.ServerAcl)
+  # ---------------------------------------------------------------------------
+
+  describe "m.room.server_acl enforcement" do
+    defp deny_fake_server(room_id, owner) do
+      {:ok, _} =
+        RoomProcess.send_event(
+          room_id,
+          owner,
+          "m.room.server_acl",
+          %{"allow" => ["*"], "allow_ip_literals" => true, "deny" => [@server_name]},
+          state_key: ""
+        )
+    end
+
+    test "a PDU from a denied server is soft-failed, not applied" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+      deny_fake_server(room_id, owner)
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      pdu =
+        signed_remote_event(%{
+          "event_id" => "$acldenied_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "should be blocked"},
+          "depth" => depth + 1,
+          "prev_events" => [last_event_id],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      conn = signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [pdu], "edus" => []})
+
+      assert conn.status == 200
+      assert Map.has_key?(decode(conn)["pdus"], pdu["event_id"])
+      assert EventStore.get_event(pdu["event_id"]) == {:error, :not_found}
+    end
+
+    test "a pre-existing member of a now-denied server keeps their membership" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+      deny_fake_server(room_id, owner)
+
+      assert EventStore.get_membership(room_id, remote_member) == {:ok, "join"}
+    end
+
+    test "make_join 403s when the origin server is denied by the room's ACL" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      deny_fake_server(room_id, owner)
+      joiner = remote_user("joiner")
+
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+        )
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+
+    test "send_join 403s when the origin server is denied" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      joiner = remote_user("joiner")
+
+      make_join_conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+        )
+
+      template = decode(make_join_conn)["event"]
+      deny_fake_server(room_id, owner)
+
+      join_event =
+        signed_remote_event(
+          Map.merge(template, %{
+            "event_id" => "$acljoin_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
+
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+
+      conn = signed_put(path, join_event)
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+
+    test "get_state / get_state_ids / backfill / get_missing_events 403 when the origin is denied" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      deny_fake_server(room_id, owner)
+
+      assert signed_get("/_matrix/federation/v1/state/#{URI.encode(room_id)}").status == 403
+      assert signed_get("/_matrix/federation/v1/state_ids/#{URI.encode(room_id)}").status == 403
+      assert signed_get("/_matrix/federation/v1/backfill/#{URI.encode(room_id)}").status == 403
+
+      conn =
+        signed_post("/_matrix/federation/v1/get_missing_events/#{URI.encode(room_id)}", %{
+          "known_ids" => []
+        })
+
+      assert conn.status == 403
+    end
+
+    test "a typing EDU from a denied server is dropped" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+      deny_fake_server(room_id, owner)
+
+      typing_edu = %{
+        "edu_type" => "m.typing",
+        "content" => %{"room_id" => room_id, "user_id" => remote_member, "typing" => true}
+      }
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [], "edus" => [typing_edu]})
+
+      assert conn.status == 200
+      refute remote_member in AxonSync.Typing.typing_user_ids(room_id)
+    end
+
+    test "a receipt EDU from a denied server is dropped" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+
+      {:ok, msg_event_id} =
+        RoomProcess.send_event(room_id, owner, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => "anchor"
+        })
+
+      deny_fake_server(room_id, owner)
+
+      receipt_edu = %{
+        "edu_type" => "m.receipt",
+        "content" => %{
+          room_id => %{
+            "m.read" => %{remote_member => %{"event_ids" => [msg_event_id], "data" => %{"ts" => 1}}}
+          }
+        }
+      }
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        signed_put("/_matrix/federation/v1/send/#{txn_id}", %{
+          "pdus" => [],
+          "edus" => [receipt_edu]
+        })
+
+      assert conn.status == 200
+
+      count =
+        Repo.aggregate(
+          from(r in "receipts", where: r.room_id == ^room_id and r.user_id == ^remote_member),
+          :count
+        )
+
+      assert count == 0
+    end
+  end
+
   describe "GET /_matrix/key/v2/query" do
     test "returns this server's own signed key document" do
       conn = signed_post("/_matrix/key/v2/query", %{})

@@ -11,7 +11,7 @@ defmodule AxonWeb.FederationController do
   alias AxonCore.{EventStore, KeyStore, Repo}
   alias AxonCore.Schema.Event
   alias AxonCrypto.{EventHash, KeyServer}
-  alias AxonRoom.{RestrictedJoin, RoomProcess}
+  alias AxonRoom.{RestrictedJoin, RoomProcess, ServerAcl}
   alias AxonFederation.{Backfill, EventVerification}
   require Logger
 
@@ -37,6 +37,9 @@ defmodule AxonWeb.FederationController do
         conn
         |> put_status(404)
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
+
+      not acl_allowed?(room_id, origin) ->
+        acl_forbidden(conn)
 
       true ->
         room_ctx = RoomProcess.get_room_ctx(room_id)
@@ -110,8 +113,10 @@ defmodule AxonWeb.FederationController do
     # here used to make validate_join_event's room_id check always fail and
     # left the event with no event_id to persist under).
     join_event = params
+    origin = conn.assigns[:origin_server]
 
-    with :ok <- validate_join_event(join_event, room_id),
+    with :ok <- check_acl(room_id, origin),
+         :ok <- validate_join_event(join_event, room_id),
          :ok <- verify_event_signature(join_event),
          {:ok, event_id} <- apply_join_event(room_id, join_event) do
       # Build response: full room state + auth chain
@@ -127,6 +132,9 @@ defmodule AxonWeb.FederationController do
         "event" => EventStore.event_to_map_by_id(event_id)
       })
     else
+      {:error, :acl_denied} ->
+        acl_forbidden(conn)
+
       {:error, :invalid_join} ->
         conn
         |> put_status(400)
@@ -167,6 +175,9 @@ defmodule AxonWeb.FederationController do
         |> put_status(404)
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
 
+      not acl_allowed?(room_id, origin) ->
+        acl_forbidden(conn)
+
       true ->
         version = get_room_version(room_id)
         template = build_leave_template(room_id, user_id)
@@ -185,11 +196,16 @@ defmodule AxonWeb.FederationController do
   def send_leave(conn, %{"room_id" => room_id} = params) do
     # See send_join/2 — the body IS the leave event; don't strip its fields.
     leave_event = params
+    origin = conn.assigns[:origin_server]
 
-    with :ok <- verify_event_signature(leave_event),
+    with :ok <- check_acl(room_id, origin),
+         :ok <- verify_event_signature(leave_event),
          {:ok, _} <- apply_leave_event(room_id, leave_event) do
       json(conn, %{})
     else
+      {:error, :acl_denied} ->
+        acl_forbidden(conn)
+
       {:error, sig_error}
       when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
         conn
@@ -222,6 +238,9 @@ defmodule AxonWeb.FederationController do
         conn
         |> put_status(404)
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
+
+      not acl_allowed?(room_id, origin) ->
+        acl_forbidden(conn)
 
       true ->
         room_ctx = RoomProcess.get_room_ctx(room_id)
@@ -266,12 +285,17 @@ defmodule AxonWeb.FederationController do
   def send_knock(conn, %{"room_id" => room_id} = params) do
     # See send_join/2 — the body IS the knock event; don't strip its fields.
     knock_event = params
+    origin = conn.assigns[:origin_server]
 
-    with :ok <- validate_knock_event(knock_event, room_id),
+    with :ok <- check_acl(room_id, origin),
+         :ok <- validate_knock_event(knock_event, room_id),
          :ok <- verify_event_signature(knock_event),
          {:ok, _event_id} <- apply_knock_event(room_id, knock_event) do
       json(conn, %{"knock_room_state" => EventStore.stripped_state_events(room_id)})
     else
+      {:error, :acl_denied} ->
+        acl_forbidden(conn)
+
       {:error, :invalid_knock} ->
         conn
         |> put_status(400)
@@ -378,7 +402,8 @@ defmodule AxonWeb.FederationController do
 
     sender_server = user_id |> to_string() |> String.split(":") |> List.last()
 
-    if sender_server == origin and local_room_member?(room_id, user_id) do
+    if sender_server == origin and local_room_member?(room_id, user_id) and
+         acl_allowed?(room_id, origin) do
       if typing?,
         do: AxonSync.Typing.start(room_id, user_id, timeout_ms),
         else: AxonSync.Typing.stop(room_id, user_id)
@@ -456,13 +481,19 @@ defmodule AxonWeb.FederationController do
   # ---------------------------------------------------------------------------
 
   def get_state(conn, %{"room_id" => room_id}) do
-    state_events = EventStore.get_current_state(room_id)
-    auth_chain = build_auth_chain_for_state(state_events)
+    origin = conn.assigns[:origin_server]
 
-    json(conn, %{
-      "pdus" => Enum.map(state_events, &EventStore.event_to_map/1),
-      "auth_chain" => auth_chain
-    })
+    if acl_allowed?(room_id, origin) do
+      state_events = EventStore.get_current_state(room_id)
+      auth_chain = build_auth_chain_for_state(state_events)
+
+      json(conn, %{
+        "pdus" => Enum.map(state_events, &EventStore.event_to_map/1),
+        "auth_chain" => auth_chain
+      })
+    else
+      acl_forbidden(conn)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -471,19 +502,24 @@ defmodule AxonWeb.FederationController do
 
   def get_state_ids(conn, %{"room_id" => room_id} = params) do
     _event_id = params["event_id"]
+    origin = conn.assigns[:origin_server]
 
-    state_events = EventStore.get_current_state(room_id)
-    state_ids = Enum.map(state_events, & &1.event_id)
+    if acl_allowed?(room_id, origin) do
+      state_events = EventStore.get_current_state(room_id)
+      state_ids = Enum.map(state_events, & &1.event_id)
 
-    auth_chain_ids =
-      state_events
-      |> Enum.flat_map(&get_auth_chain_ids(&1))
-      |> Enum.uniq()
+      auth_chain_ids =
+        state_events
+        |> Enum.flat_map(&get_auth_chain_ids(&1))
+        |> Enum.uniq()
 
-    json(conn, %{
-      "pdu_ids" => state_ids,
-      "auth_chain_ids" => auth_chain_ids
-    })
+      json(conn, %{
+        "pdu_ids" => state_ids,
+        "auth_chain_ids" => auth_chain_ids
+      })
+    else
+      acl_forbidden(conn)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -491,38 +527,44 @@ defmodule AxonWeb.FederationController do
   # ---------------------------------------------------------------------------
 
   def backfill(conn, %{"room_id" => room_id} = params) do
-    v_param = params["v"] || []
-    limit = String.to_integer(params["limit"] || "100")
+    origin = conn.assigns[:origin_server]
 
-    # Find the ordering of the v events, then return events before them
-    from_ordering =
-      case v_param do
-        [] ->
-          EventStore.room_max_stream_ordering(room_id)
+    if acl_allowed?(room_id, origin) do
+      v_param = params["v"] || []
+      limit = String.to_integer(params["limit"] || "100")
 
-        ids ->
-          Repo.one(
-            from(e in Event,
-              where: e.event_id in ^ids and e.room_id == ^room_id,
-              select: min(e.stream_ordering)
-            )
-          ) || 0
-      end
+      # Find the ordering of the v events, then return events before them
+      from_ordering =
+        case v_param do
+          [] ->
+            EventStore.room_max_stream_ordering(room_id)
 
-    events =
-      Repo.all(
-        from(e in Event,
-          where: e.room_id == ^room_id and e.stream_ordering < ^from_ordering,
-          order_by: [desc: e.stream_ordering],
-          limit: ^limit
+          ids ->
+            Repo.one(
+              from(e in Event,
+                where: e.event_id in ^ids and e.room_id == ^room_id,
+                select: min(e.stream_ordering)
+              )
+            ) || 0
+        end
+
+      events =
+        Repo.all(
+          from(e in Event,
+            where: e.room_id == ^room_id and e.stream_ordering < ^from_ordering,
+            order_by: [desc: e.stream_ordering],
+            limit: ^limit
+          )
         )
-      )
 
-    json(conn, %{
-      "origin" => KeyServer.server_name(),
-      "origin_server_ts" => System.os_time(:millisecond),
-      "pdus" => Enum.map(events, &EventStore.event_to_map/1)
-    })
+      json(conn, %{
+        "origin" => KeyServer.server_name(),
+        "origin_server_ts" => System.os_time(:millisecond),
+        "pdus" => Enum.map(events, &EventStore.event_to_map/1)
+      })
+    else
+      acl_forbidden(conn)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -530,21 +572,27 @@ defmodule AxonWeb.FederationController do
   # ---------------------------------------------------------------------------
 
   def get_missing_events(conn, %{"room_id" => room_id} = params) do
-    known_ids = MapSet.new(params["known_ids"] || [])
-    limit = params["limit"] || 10
+    origin = conn.assigns[:origin_server]
 
-    events =
-      Repo.all(
-        from(e in Event,
-          where: e.room_id == ^room_id and e.event_id not in ^MapSet.to_list(known_ids),
-          order_by: [desc: e.stream_ordering],
-          limit: ^limit
+    if acl_allowed?(room_id, origin) do
+      known_ids = MapSet.new(params["known_ids"] || [])
+      limit = params["limit"] || 10
+
+      events =
+        Repo.all(
+          from(e in Event,
+            where: e.room_id == ^room_id and e.event_id not in ^MapSet.to_list(known_ids),
+            order_by: [desc: e.stream_ordering],
+            limit: ^limit
+          )
         )
-      )
 
-    json(conn, %{
-      "events" => Enum.map(events, &EventStore.event_to_map/1)
-    })
+      json(conn, %{
+        "events" => Enum.map(events, &EventStore.event_to_map/1)
+      })
+    else
+      acl_forbidden(conn)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -723,7 +771,8 @@ defmodule AxonWeb.FederationController do
     event_id = receipt_data["event_ids"] |> List.wrap() |> List.first()
     ts = get_in(receipt_data, ["data", "ts"]) || System.os_time(:millisecond)
 
-    if sender_server == origin and is_binary(event_id) and local_room_member?(room_id, user_id) do
+    if sender_server == origin and is_binary(event_id) and local_room_member?(room_id, user_id) and
+         acl_allowed?(room_id, origin) do
       Repo.insert_all(
         "receipts",
         [
@@ -825,18 +874,23 @@ defmodule AxonWeb.FederationController do
   defp process_inbound_pdu(pdu, origin) do
     room_id = pdu["room_id"]
 
-    if room_exists?(room_id) do
-      case verify_event_signature(pdu) do
-        :ok ->
-          apply_remote_event(pdu, room_id, origin)
+    cond do
+      not room_exists?(room_id) ->
+        # Soft-fail: we don't know this room
+        {:error, :unknown_room}
 
-        {:error, reason} ->
-          Logger.warning("Inbound PDU signature failed from #{origin}: #{inspect(reason)}")
-          {:error, :bad_signature}
-      end
-    else
-      # Soft-fail: we don't know this room
-      {:error, :unknown_room}
+      not acl_allowed?(room_id, origin) ->
+        {:error, :acl_denied}
+
+      true ->
+        case verify_event_signature(pdu) do
+          :ok ->
+            apply_remote_event(pdu, room_id, origin)
+
+          {:error, reason} ->
+            Logger.warning("Inbound PDU signature failed from #{origin}: #{inspect(reason)}")
+            {:error, :bad_signature}
+        end
     end
   end
 
@@ -871,6 +925,29 @@ defmodule AxonWeb.FederationController do
 
   defp room_exists?(room_id) do
     Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.room_id)) != nil
+  end
+
+  # m.room.server_acl (Server-Server API "Server Access Control Lists")
+  # gating for every federation endpoint the spec lists as MUST-protect,
+  # plus the per-PDU/per-EDU checks on /send. Deliberately a network-layer
+  # check only (AxonRoom.ServerAcl), not routed through AuthRules — a
+  # denied server's already-accepted events/state stay put, only further
+  # requests get rejected.
+  defp acl_allowed?(room_id, server_name) do
+    case EventStore.get_state_event(room_id, "m.room.server_acl", "") do
+      {:ok, %{content: content}} -> ServerAcl.allowed_by_content?(content, server_name)
+      {:error, :not_found} -> true
+    end
+  end
+
+  defp check_acl(room_id, server_name) do
+    if acl_allowed?(room_id, server_name), do: :ok, else: {:error, :acl_denied}
+  end
+
+  defp acl_forbidden(conn) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Server denied by ACL"})
   end
 
   defp get_room_version(room_id) do
