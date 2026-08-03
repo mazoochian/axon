@@ -118,7 +118,7 @@ defmodule AxonWeb.FederationController do
     with :ok <- check_acl(room_id, origin),
          :ok <- validate_join_event(join_event, room_id),
          :ok <- verify_event_signature(join_event),
-         {:ok, event_id} <- apply_join_event(room_id, join_event) do
+         {:ok, event_id} <- apply_join_event(room_id, join_event, origin) do
       # Build response: full room state + auth chain
       state_events = EventStore.get_current_state(room_id)
       state_maps = Enum.map(state_events, &EventStore.event_to_map/1)
@@ -199,12 +199,18 @@ defmodule AxonWeb.FederationController do
     origin = conn.assigns[:origin_server]
 
     with :ok <- check_acl(room_id, origin),
+         :ok <- validate_leave_event(leave_event, room_id),
          :ok <- verify_event_signature(leave_event),
-         {:ok, _} <- apply_leave_event(room_id, leave_event) do
+         {:ok, _} <- apply_leave_event(room_id, leave_event, origin) do
       json(conn, %{})
     else
       {:error, :acl_denied} ->
         acl_forbidden(conn)
+
+      {:error, :invalid_leave} ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid leave event"})
 
       {:error, sig_error}
       when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
@@ -212,10 +218,13 @@ defmodule AxonWeb.FederationController do
         |> put_status(403)
         |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Bad event signature"})
 
-      _ ->
+      {:error, :auth_failed} ->
         conn
-        |> put_status(400)
-        |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid leave event"})
+        |> put_status(403)
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Event failed auth check"})
+
+      _ ->
+        conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
     end
   end
 
@@ -290,7 +299,7 @@ defmodule AxonWeb.FederationController do
     with :ok <- check_acl(room_id, origin),
          :ok <- validate_knock_event(knock_event, room_id),
          :ok <- verify_event_signature(knock_event),
-         {:ok, _event_id} <- apply_knock_event(room_id, knock_event) do
+         {:ok, _event_id} <- apply_knock_event(room_id, knock_event, origin) do
       json(conn, %{"knock_room_state" => EventStore.stripped_state_events(room_id)})
     else
       {:error, :acl_denied} ->
@@ -322,18 +331,22 @@ defmodule AxonWeb.FederationController do
       event["type"] != "m.room.member" -> {:error, :invalid_knock}
       event["room_id"] != room_id -> {:error, :invalid_knock}
       get_in(event, ["content", "membership"]) != "knock" -> {:error, :invalid_knock}
+      event["state_key"] != event["sender"] -> {:error, :invalid_knock}
       true -> :ok
     end
   end
 
-  # Goes through RoomProcess.apply_remote_event/2 (not a direct
+  # Goes through RoomProcess.apply_remote_event/3 (not a direct
   # EventStore.insert_event) so the room's live GenServer state, local
   # /sync fan-out, and federation fan-out all learn about the knock
   # immediately — a direct DB write would leave them stale until the next
   # restart, silently breaking auth checks for that user's subsequent
-  # events and federation fan-out to them.
-  defp apply_knock_event(room_id, knock_event) do
-    case RoomProcess.apply_remote_event(room_id, knock_event) do
+  # events and federation fan-out to them. relay_exclude: origin — this
+  # resident server is the only one positioned to relay the new knock on
+  # to every OTHER server with a member in the room (the knocking user's
+  # own server only knows about us, not them yet); see apply_remote_event/3.
+  defp apply_knock_event(room_id, knock_event, origin) do
+    case RoomProcess.apply_remote_event(room_id, knock_event, relay_exclude: origin) do
       {:ok, event_id} -> {:ok, event_id}
       {:error, _reason} -> {:error, :auth_failed}
     end
@@ -845,27 +858,50 @@ defmodule AxonWeb.FederationController do
       event["type"] != "m.room.member" -> {:error, :invalid_join}
       event["room_id"] != room_id -> {:error, :invalid_join}
       get_in(event, ["content", "membership"]) != "join" -> {:error, :invalid_join}
+      event["state_key"] != event["sender"] -> {:error, :invalid_join}
+      true -> :ok
+    end
+  end
+
+  # send_leave is specifically for a remote user lodging their own
+  # departure (make_leave/send_leave only ever build/accept a self-leave —
+  # a kick/ban is a *local* action taken by someone with sufficient power,
+  # never routed through this endpoint), so state_key must equal sender
+  # exactly like join/knock. Previously this endpoint had no type/content
+  # validation at all — any signed, auth-valid event (e.g. an ordinary
+  # message) from a joined member would be silently accepted and applied.
+  defp validate_leave_event(event, room_id) do
+    cond do
+      event["type"] != "m.room.member" -> {:error, :invalid_leave}
+      event["room_id"] != room_id -> {:error, :invalid_leave}
+      get_in(event, ["content", "membership"]) != "leave" -> {:error, :invalid_leave}
+      event["state_key"] != event["sender"] -> {:error, :invalid_leave}
       true -> :ok
     end
   end
 
   defp verify_event_signature(event), do: EventVerification.verify_signature(event)
 
-  # See apply_knock_event/2 — must go through RoomProcess.apply_remote_event/2,
+  # See apply_knock_event/3 — must go through RoomProcess.apply_remote_event/3,
   # not a direct EventStore.insert_event, or the room's live GenServer never
   # learns the remote user joined (federation fan-out silently excludes them,
   # /sync doesn't show the join in real time, and their next event over
   # send_transaction gets wrongly auth-rejected as "not_joined" until the
-  # room process happens to restart).
-  defp apply_join_event(room_id, join_event) do
-    case RoomProcess.apply_remote_event(room_id, join_event) do
+  # room process happens to restart). relay_exclude: origin relays the join
+  # on to this room's other resident servers — without it, a room with 3+
+  # servers never converges (see apply_remote_event/3's doc).
+  defp apply_join_event(room_id, join_event, origin) do
+    case RoomProcess.apply_remote_event(room_id, join_event, relay_exclude: origin) do
       {:ok, event_id} -> {:ok, event_id}
       {:error, _reason} -> {:error, :auth_failed}
     end
   end
 
-  defp apply_leave_event(room_id, leave_event) do
-    case RoomProcess.apply_remote_event(room_id, leave_event) do
+  # relay_exclude: origin — see apply_join_event/3. A self-leave via
+  # send_leave has the exact same "acting server can't fan out to peers it
+  # doesn't know" shape as a join.
+  defp apply_leave_event(room_id, leave_event, origin) do
+    case RoomProcess.apply_remote_event(room_id, leave_event, relay_exclude: origin) do
       {:ok, event_id} -> {:ok, event_id}
       {:error, _reason} -> {:error, :auth_failed}
     end

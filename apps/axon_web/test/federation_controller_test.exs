@@ -32,6 +32,19 @@ defmodule AxonWeb.FederationControllerTest do
     :ok
   end
 
+  defp wait_until(deadline_ms, fun) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        flunk("condition not met before deadline")
+      else
+        Process.sleep(20)
+        wait_until(deadline_ms, fun)
+      end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
@@ -98,6 +111,54 @@ defmodule AxonWeb.FederationControllerTest do
 
   defp signed_remote_event(fields) do
     FakeRemoteMatrixServer.sign_event(@port, Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
+  end
+
+  # ---- port-parameterized variants (multi-server relay tests only, which
+  # need arbitrary/dynamic fake servers rather than the shared @port) ----
+
+  defp remote_user_at(port, prefix),
+    do:
+      "@#{prefix}_#{System.unique_integer([:positive])}:#{FakeRemoteMatrixServer.server_name(port)}"
+
+  defp signed_get_at(port, path) do
+    header = FakeRemoteMatrixServer.sign_request(port, "GET", path)
+    build_conn() |> put_req_header("authorization", header) |> get(path)
+  end
+
+  defp signed_put_at(port, path, body) do
+    header = FakeRemoteMatrixServer.sign_request(port, "PUT", path, body)
+
+    build_conn()
+    |> put_req_header("authorization", header)
+    |> put_req_header("content-type", "application/json")
+    |> put(path, Jason.encode!(body))
+  end
+
+  defp signed_remote_event_at(port, fields) do
+    FakeRemoteMatrixServer.sign_event(port, Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
+  end
+
+  defp join_remote_member_at(port, room_id, member_user_id) do
+    {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+    pdu =
+      signed_remote_event_at(port, %{
+        "event_id" => "$seedjoin_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => member_user_id,
+        "sender" => member_user_id,
+        "content" => %{"membership" => "join"},
+        "depth" => depth + 1,
+        "prev_events" => if(last_event_id, do: [last_event_id], else: []),
+        "origin_server_ts" => System.os_time(:millisecond)
+      })
+
+    {:ok, _} = RoomProcess.apply_remote_event(room_id, pdu)
+  end
+
+  defp pdus_contain_event_id?(body, event_id) do
+    (body["pdus"] || []) |> Enum.any?(&(&1["event_id"] == event_id))
   end
 
   # ---------------------------------------------------------------------------
@@ -941,7 +1002,10 @@ defmodule AxonWeb.FederationControllerTest do
       txn_id = "txn_#{System.unique_integer([:positive])}"
 
       conn =
-        signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [], "edus" => [typing_edu]})
+        signed_put("/_matrix/federation/v1/send/#{txn_id}", %{
+          "pdus" => [],
+          "edus" => [typing_edu]
+        })
 
       assert conn.status == 200
       refute remote_member in AxonSync.Typing.typing_user_ids(room_id)
@@ -965,7 +1029,9 @@ defmodule AxonWeb.FederationControllerTest do
         "edu_type" => "m.receipt",
         "content" => %{
           room_id => %{
-            "m.read" => %{remote_member => %{"event_ids" => [msg_event_id], "data" => %{"ts" => 1}}}
+            "m.read" => %{
+              remote_member => %{"event_ids" => [msg_event_id], "data" => %{"ts" => 1}}
+            }
           }
         }
       }
@@ -987,6 +1053,202 @@ defmodule AxonWeb.FederationControllerTest do
         )
 
       assert count == 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Multi-server relay: send_join/leave/knock must fan the event out to the
+  # room's OTHER resident servers, not just apply it locally. The acting
+  # user's own server only knows about the one server it went through
+  # (make_join/send_join etc. are the first time it learns the room's
+  # state at all) — this resident server is the only one positioned to
+  # tell everyone else. Before this fix, RoomProcess.apply_remote_event/2
+  # never relayed at all, so a 3rd+ server never learned about a join/
+  # leave/knock that happened via a 2nd server — room membership never
+  # converged across more than 2 homeservers.
+  # ---------------------------------------------------------------------------
+
+  describe "send_join/leave/knock relay to a room's other resident servers" do
+    # Deliberately NOT @port/@server_name (shared, reused across every
+    # other test in this file) — AxonFederation.OutboundQueue's
+    # per-destination concurrency/circuit-breaker state lives in a global
+    # ETS table, not reset between tests, so a real-delivery test sharing
+    # a destination name with dozens of others became flaky (an unrelated
+    # earlier test's in-flight/failed delivery to the same name could trip
+    # the breaker right as one of these ran). Fresh, uniquely-named/ported
+    # servers per test sidesteps that entirely.
+    setup do
+      port_a = 18_910 + System.unique_integer([:positive, :monotonic])
+      port_b = 18_910 + System.unique_integer([:positive, :monotonic])
+      server_a = "fake-relay-a-#{System.unique_integer([:positive])}.test"
+      server_b = "fake-relay-b-#{System.unique_integer([:positive])}.test"
+
+      start_supervised!({FakeRemoteMatrixServer, port: port_a, server_name: server_a})
+      start_supervised!({FakeRemoteMatrixServer, port: port_b, server_name: server_b})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        server_a => "http://127.0.0.1:#{port_a}",
+        server_b => "http://127.0.0.1:#{port_b}"
+      })
+
+      %{port_a: port_a, port_b: port_b, server_a: server_a, server_b: server_b}
+    end
+
+    test "a join via send_join is relayed to the room's other resident server", %{
+      port_a: port_a,
+      port_b: port_b
+    } do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+
+      # bob (server A) is already resident.
+      bob = remote_user_at(port_a, "bob")
+      join_remote_member_at(port_a, room_id, bob)
+
+      # charlie (server B) now joins through axon — the only server
+      # charlie's own server talked to. axon must relay charlie's join to
+      # bob's server on its own.
+      charlie = remote_user_at(port_b, "charlie")
+
+      make_join_conn =
+        signed_get_at(
+          port_b,
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie)}"
+        )
+
+      template = decode(make_join_conn)["event"]
+
+      join_event =
+        signed_remote_event_at(
+          port_b,
+          Map.merge(template, %{
+            "event_id" => "$relayjoin_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
+
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+
+      conn = signed_put_at(port_b, path, join_event)
+      assert conn.status == 200
+
+      wait_until(System.monotonic_time(:millisecond) + 5_000, fn ->
+        Enum.any?(FakeRemoteMatrixServer.requests(port_a), fn req ->
+          req.method == "PUT" and req.path =~ "/_matrix/federation/v1/send/" and
+            pdus_contain_event_id?(req.body, join_event["event_id"])
+        end)
+      end)
+
+      # ...but NOT relayed back to charlie's own server — it already has
+      # the event (it built and signed it).
+      refute Enum.any?(FakeRemoteMatrixServer.requests(port_b), fn req ->
+               req.method == "PUT" and req.path =~ "/_matrix/federation/v1/send/" and
+                 pdus_contain_event_id?(req.body, join_event["event_id"])
+             end)
+    end
+
+    test "a leave via send_leave is relayed to the room's other resident server", %{
+      port_a: port_a,
+      port_b: port_b
+    } do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+
+      bob = remote_user_at(port_a, "bob")
+      join_remote_member_at(port_a, room_id, bob)
+
+      charlie = remote_user_at(port_b, "charlie")
+      join_remote_member_at(port_b, room_id, charlie)
+
+      make_leave_conn =
+        signed_get_at(
+          port_b,
+          "/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(charlie)}"
+        )
+
+      template = decode(make_leave_conn)["event"]
+
+      leave_event =
+        signed_remote_event_at(
+          port_b,
+          Map.merge(template, %{
+            "event_id" => "$relayleave_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
+
+      path =
+        "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}"
+
+      conn = signed_put_at(port_b, path, leave_event)
+      assert conn.status == 200
+
+      wait_until(System.monotonic_time(:millisecond) + 5_000, fn ->
+        Enum.any?(FakeRemoteMatrixServer.requests(port_a), fn req ->
+          req.method == "PUT" and req.path =~ "/_matrix/federation/v1/send/" and
+            pdus_contain_event_id?(req.body, leave_event["event_id"])
+        end)
+      end)
+    end
+
+    test "a knock via send_knock is relayed to the room's other resident server", %{
+      port_a: port_a,
+      port_b: port_b
+    } do
+      owner = new_local_user("owner")
+
+      {:ok, room_id} =
+        CreateRoom.execute(owner,
+          server_name: "localhost",
+          initial_state: [
+            %{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}
+          ]
+        )
+
+      # The room only allows knocking, not a free join — bob needs an
+      # invite first (an invited member can always join regardless of
+      # join_rule).
+      bob = remote_user_at(port_a, "bob")
+
+      {:ok, _} =
+        RoomProcess.send_event(room_id, owner, "m.room.member", %{"membership" => "invite"},
+          state_key: bob
+        )
+
+      join_remote_member_at(port_a, room_id, bob)
+
+      charlie = remote_user_at(port_b, "charlie")
+
+      make_knock_conn =
+        signed_get_at(
+          port_b,
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(charlie)}"
+        )
+
+      template = decode(make_knock_conn)["event"]
+
+      knock_event =
+        signed_remote_event_at(
+          port_b,
+          Map.merge(template, %{
+            "event_id" => "$relayknock_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
+
+      path =
+        "/_matrix/federation/v1/send_knock/#{URI.encode(room_id)}/#{URI.encode(knock_event["event_id"])}"
+
+      conn = signed_put_at(port_b, path, knock_event)
+      assert conn.status == 200
+
+      wait_until(System.monotonic_time(:millisecond) + 5_000, fn ->
+        Enum.any?(FakeRemoteMatrixServer.requests(port_a), fn req ->
+          req.method == "PUT" and req.path =~ "/_matrix/federation/v1/send/" and
+            pdus_contain_event_id?(req.body, knock_event["event_id"])
+        end)
+      end)
     end
   end
 

@@ -24,14 +24,21 @@ defmodule AxonFederation.MediaFetch do
     fetch(
       server_name,
       "/_matrix/federation/v1/media/download/#{media_id}",
-      fn -> legacy_fetch(server_name, "/_matrix/media/v3/download/#{server_name}/#{media_id}?allow_remote=false") end
+      fn ->
+        legacy_fetch(
+          server_name,
+          "/_matrix/media/v3/download/#{server_name}/#{media_id}?allow_remote=false"
+        )
+      end
     )
   end
 
   @doc "Fetch a thumbnail. Returns `{:ok, content_type, body}` or `{:error, reason}`."
   def thumbnail(server_name, media_id, query) when is_map(query) do
     qs = URI.encode_query(query)
-    path = "/_matrix/federation/v1/media/thumbnail/#{media_id}" <> if(qs == "", do: "", else: "?#{qs}")
+
+    path =
+      "/_matrix/federation/v1/media/thumbnail/#{media_id}" <> if(qs == "", do: "", else: "?#{qs}")
 
     legacy_qs = URI.encode_query(Map.put(query, "allow_remote", "false"))
     legacy_path = "/_matrix/media/v3/thumbnail/#{server_name}/#{media_id}?#{legacy_qs}"
@@ -201,7 +208,10 @@ defmodule AxonFederation.MediaFetch do
         {:error, {:http_error, status}}
 
       {:error, reason} ->
-        Logger.warning("Legacy remote media fetch failed for #{path_with_query}: #{inspect(reason)}")
+        Logger.warning(
+          "Legacy remote media fetch failed for #{path_with_query}: #{inspect(reason)}"
+        )
+
         {:error, reason}
     end
   end

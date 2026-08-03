@@ -188,7 +188,9 @@ defmodule AxonWeb.MediaController do
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Remote media not found"})
 
       {:error, reason} ->
-        Logger.warning("Remote media fetch failed for #{origin_server}/#{media_id}: #{inspect(reason)}")
+        Logger.warning(
+          "Remote media fetch failed for #{origin_server}/#{media_id}: #{inspect(reason)}"
+        )
 
         conn
         |> put_status(502)
@@ -259,7 +261,9 @@ defmodule AxonWeb.MediaController do
             end
 
           {:error, reason} ->
-            Logger.error("Federation thumbnail generation failed for #{media_id}: #{inspect(reason)}")
+            Logger.error(
+              "Federation thumbnail generation failed for #{media_id}: #{inspect(reason)}"
+            )
 
             conn
             |> put_status(502)

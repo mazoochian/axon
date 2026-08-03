@@ -64,7 +64,8 @@ defmodule AxonFederation.MediaFetchTest do
       body
     )
 
-    assert {:ok, "image/png", "fake-png-bytes"} = MediaFetch.download(server_name, "some-media-id")
+    assert {:ok, "image/png", "fake-png-bytes"} =
+             MediaFetch.download(server_name, "some-media-id")
   end
 
   test "download/2 falls back to the legacy endpoint on M_UNRECOGNIZED", %{

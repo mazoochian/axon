@@ -88,11 +88,29 @@ defmodule AxonRoom.RoomProcess do
   (serialized through this GenServer, same as local sends), persists,
   updates in-memory state, and fans the event out to local `/sync` clients.
 
-  Returns `{:ok, event_id}` or `{:error, reason}`.
+  By default this does NOT relay the event on to this room's other
+  federated peers — for an ordinary `/send` transaction PDU, the sending
+  server already pushed it to every resident server itself, so relaying it
+  further would just be duplicate traffic (and risks amplifying loops once
+  more than two servers are in a room).
+
+  `opts[:relay_exclude]`, if set, flips that: after applying, the event is
+  *also* fanned out to every other server with a joined member in the room
+  (excluding the given server name). This is specifically for
+  `send_join`/`send_leave`/`send_knock` — the one case where the acting
+  user's own server structurally *can't* do this fan-out itself, since it
+  only just learned the room's full membership from this same request and
+  has no other server to tell but the one resident server it went
+  through. That resident server is the only one positioned to relay the
+  new event on to everyone else — without this, a room with 3+ servers
+  never converges on membership beyond the resident server's own view
+  (each newly-joined/knocked/left server's peers never learn about it).
+  `relay_exclude` is normally the acting user's own server (already has
+  the event — it built and signed it).
   """
-  def apply_remote_event(room_id, pdu) do
+  def apply_remote_event(room_id, pdu, opts \\ []) do
     with {:ok, pid} <- get_or_start(room_id) do
-      GenServer.call(pid, {:apply_remote_event, pdu}, 30_000)
+      GenServer.call(pid, {:apply_remote_event, pdu, opts}, 30_000)
     end
   end
 
@@ -199,7 +217,7 @@ defmodule AxonRoom.RoomProcess do
   end
 
   @impl true
-  def handle_call({:apply_remote_event, pdu}, _from, state) do
+  def handle_call({:apply_remote_event, pdu, opts}, _from, state) do
     pdu = with_prev_content(pdu, pdu["state_key"], state.current_state)
 
     # When pdu forks away from our head, `resolved_state` isn't just a
@@ -233,10 +251,27 @@ defmodule AxonRoom.RoomProcess do
             event_map = EventStore.event_to_map(persisted)
             base_state = if forked?, do: %{state | current_state: resolved_state}, else: state
             new_state = apply_and_advance(base_state, event_map, persisted.stream_ordering)
-            # Fan out to local /sync clients. Not re-broadcast to federation:
-            # the origin server is responsible for pushing this PDU to every
-            # other server in the room directly (no relay-through-us).
+            # Fan out to local /sync clients. Not re-broadcast to federation
+            # by default: for an ordinary /send transaction PDU, the origin
+            # server already pushed it to every other resident server
+            # itself (relaying it further here would just duplicate that).
+            # See apply_remote_event/3's doc for the send_join/leave/knock
+            # exception, opted into via opts[:relay_exclude].
             broadcast(state.room_id, event_map)
+
+            case Keyword.get(opts, :relay_exclude, :no_relay) do
+              :no_relay ->
+                :ok
+
+              exclude ->
+                broadcast_for_federation(
+                  state.room_id,
+                  event_map,
+                  new_state.current_state,
+                  exclude
+                )
+            end
+
             AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
 
             Phoenix.PubSub.broadcast(
@@ -438,7 +473,10 @@ defmodule AxonRoom.RoomProcess do
   # Broadcast for federation fan-out via PubSub. axon_web subscribes and sends
   # the event to remote servers. This avoids a cross-app dependency from
   # axon_room to axon_federation (they're at the same supervision level).
-  defp broadcast_for_federation(_room_id, event_map, current_state) do
+  # `exclude`, when set, drops one server name from the fan-out target
+  # list — used by the send_join/leave/knock relay case to skip sending
+  # the event straight back to the server that just gave it to us.
+  defp broadcast_for_federation(_room_id, event_map, current_state, exclude \\ nil) do
     local_server = Application.get_env(:axon_web, :server_name, "localhost")
 
     remote_servers =
@@ -447,7 +485,10 @@ defmodule AxonRoom.RoomProcess do
         {{"m.room.member", user_id}, event} ->
           membership = get_in(event, ["content", "membership"])
           server = user_id |> String.split(":") |> List.last()
-          if membership == "join" and server != local_server, do: [server], else: []
+
+          if membership == "join" and server != local_server and server != exclude,
+            do: [server],
+            else: []
 
         _ ->
           []
