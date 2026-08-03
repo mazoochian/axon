@@ -9,7 +9,12 @@ defmodule AxonWeb.SyncHelpers do
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, KeyStore, Repo}
+  alias AxonPush.{RuleEvaluator, UserRules}
   alias AxonSync.Presence
+
+  # A room with more unread events than this undercounts rather than doing
+  # unbounded work on every sync poll — see unread_counts/2's doc.
+  @notification_scan_cap 500
 
   # Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}_${eph_cursor}"
   # dl_cursor tracks device_list_updates.id; ad_cursor tracks account_data_stream.id;
@@ -295,5 +300,78 @@ defmodule AxonWeb.SyncHelpers do
       "sender" => event.sender,
       "content" => event.content || %{}
     }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Notification/highlight counts
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Per-room unread/highlight counts for `user_id` in `room_id`: every event
+  since their `m.read` receipt (room start if they've never sent one),
+  re-evaluated against their *current* merged push rules
+  (`AxonPush.RuleEvaluator`/`AxonPush.UserRules`), capped at
+  #{@notification_scan_cap} scanned events. Shared by classic `/sync`
+  (`unread_notifications`) and sliding sync
+  (`notification_count`/`highlight_count`) so the two can't drift apart —
+  this used to be a private copy inside `SlidingSyncController` only,
+  before classic `/sync` grew the same feature.
+
+  Deliberately computed on the fly rather than via a maintained counter
+  table: a counter has to stay correct as a read receipt moves both
+  forward (decrement as things get read) *and* backward (a client
+  re-marking older messages unread, or a slow/out-of-order receipt), and
+  getting either direction wrong silently rots the badge with no signal
+  that it happened. Re-deriving from the room's events plus the receipt's
+  current position on every read is strictly more query work per sync,
+  but categorically can't drift — the tradeoff made here is the scan cap
+  above, not correctness.
+
+  Returns `%{notification_count: integer, highlight_count: integer}`.
+  """
+  def unread_counts(room_id, user_id) do
+    since_ordering = read_receipt_ordering(room_id, user_id)
+    rules = UserRules.effective_rules(user_id)
+
+    room_id
+    |> EventStore.get_events_since(since_ordering, @notification_scan_cap)
+    |> Enum.reject(&(&1.sender == user_id))
+    |> Enum.reduce(%{notification_count: 0, highlight_count: 0}, fn event, acc ->
+      case RuleEvaluator.should_notify?(EventStore.event_to_map(event), room_id, user_id, rules) do
+        {:notify, actions} ->
+          acc = %{acc | notification_count: acc.notification_count + 1}
+          if highlight?(actions), do: %{acc | highlight_count: acc.highlight_count + 1}, else: acc
+
+        :dont_notify ->
+          acc
+      end
+    end)
+  end
+
+  @doc "The stream_ordering of `user_id`'s current `m.read` receipt in `room_id`, or 0 if they've never sent one."
+  def read_receipt_ordering(room_id, user_id) do
+    receipt_event_id =
+      Repo.one(
+        from(r in "receipts",
+          where: r.room_id == ^room_id and r.user_id == ^user_id and r.receipt_type == "m.read",
+          select: r.event_id
+        )
+      )
+
+    with event_id when not is_nil(event_id) <- receipt_event_id,
+         {:ok, event} <- EventStore.get_event(event_id) do
+      event.stream_ordering
+    else
+      _ -> 0
+    end
+  end
+
+  @doc "True if a push rule's actions include the `highlight` tweak set to a truthy value."
+  def highlight?(actions) do
+    Enum.any?(actions, fn
+      %{"set_tweak" => "highlight", "value" => value} -> value != false
+      %{"set_tweak" => "highlight"} -> true
+      _ -> false
+    end)
   end
 end

@@ -393,6 +393,9 @@ defmodule AxonWeb.Router do
     # spec endpoint (would land at /v5/sync when stabilized).
     post("/unstable/org.matrix.msc4186/sync", SlidingSyncController, :sync)
 
+    # Paginated notification history (AxonPush.Notifications ledger)
+    get("/v3/notifications", NotificationsController, :index)
+
     # Directory (mutations require auth)
     put("/v3/directory/room/:room_alias", DirectoryController, :put_alias)
     delete("/v3/directory/room/:room_alias", DirectoryController, :delete_alias)
