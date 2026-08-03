@@ -183,7 +183,7 @@ defmodule AxonWeb.RoomController do
           EventStore.set_knock_preview_state(
             room_id,
             user_id,
-            EventStore.stripped_state_events(room_id)
+            AxonWeb.SyncHelpers.preview_state_events(room_id)
           )
 
           json(conn, %{"room_id" => room_id})
@@ -476,7 +476,7 @@ defmodule AxonWeb.RoomController do
       body = %{
         "room_version" => room_ctx.room_version,
         "event" => invite_event,
-        "invite_room_state" => EventStore.stripped_state_events(room_id)
+        "invite_room_state" => AxonWeb.SyncHelpers.preview_state_events(room_id)
       }
 
       path =

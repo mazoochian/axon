@@ -118,11 +118,20 @@ defmodule AxonWeb.MediaController do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  # Every `put_resp_content_type/2` call below is deliberately 2-arity with
+  # an explicit `nil` charset, not the 1-arity default: `Plug.Conn`'s
+  # default charset is `"utf-8"`, which it appends unconditionally
+  # (`"image/png; charset=utf-8"`) regardless of whether the media type is
+  # even text. Per spec the response's Content-Type must echo back exactly
+  # what was supplied at upload (`POST .../media/v3/upload`'s
+  # `Content-Type` header, stored byte-for-byte, arbitrary and opaque —
+  # not necessarily even a real IANA type) — silently mutating it broke
+  # every client comparing the two verbatim.
   defp serve_local(conn, media_id, override_filename \\ nil) do
     case Store.download(media_id) do
       {:ok, %{content_type: content_type, data: data, filename: stored_filename}} ->
         conn
-        |> put_resp_content_type(content_type)
+        |> put_resp_content_type(content_type, nil)
         |> put_resp_header(
           "content-disposition",
           content_disposition(content_type, override_filename || stored_filename)
@@ -149,7 +158,7 @@ defmodule AxonWeb.MediaController do
              ) do
           {:ok, {ct, data}} ->
             conn
-            |> put_resp_content_type(ct)
+            |> put_resp_content_type(ct, nil)
             |> put_resp_header("content-disposition", "inline")
             |> send_resp(200, data)
 
@@ -186,7 +195,7 @@ defmodule AxonWeb.MediaController do
     case AxonFederation.MediaFetch.download(origin_server, media_id) do
       {:ok, content_type, data, remote_filename} ->
         conn
-        |> put_resp_content_type(content_type)
+        |> put_resp_content_type(content_type, nil)
         |> put_resp_header(
           "content-disposition",
           content_disposition(content_type, override_filename || remote_filename)
@@ -215,7 +224,7 @@ defmodule AxonWeb.MediaController do
     case AxonFederation.MediaFetch.thumbnail(origin_server, media_id, query) do
       {:ok, content_type, data, _filename} ->
         conn
-        |> put_resp_content_type(content_type)
+        |> put_resp_content_type(content_type, nil)
         |> send_resp(200, data)
 
       {:error, :not_found} ->
