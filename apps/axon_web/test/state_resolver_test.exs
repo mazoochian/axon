@@ -117,7 +117,7 @@ defmodule AxonWeb.StateResolverTest do
     assert StateResolver.needs_resolution?(pdu_b, head1)
 
     current_state = RoomProcess.get_state_map(room_id)
-    resolved = StateResolver.resolve_for_auth_check(pdu_b, current_state, head1)
+    {:ok, resolved} = StateResolver.resolve_for_auth_check(pdu_b, current_state, head1)
 
     pl_resolved = resolved[{"m.room.power_levels", ""}]
 
@@ -130,7 +130,7 @@ defmodule AxonWeb.StateResolverTest do
 
     assert resolved[{"m.room.create", ""}]["event_id"] == create_event.event_id
 
-    resolved_again = StateResolver.resolve_for_auth_check(pdu_b, current_state, head1)
+    {:ok, resolved_again} = StateResolver.resolve_for_auth_check(pdu_b, current_state, head1)
     assert resolved_again[{"m.room.power_levels", ""}]["event_id"] == pl_resolved["event_id"]
   end
 
