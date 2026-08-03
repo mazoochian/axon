@@ -30,11 +30,43 @@ defmodule AxonWeb.RoomController do
         version: params["room_version"],
         creation_content: params["creation_content"],
         initial_state: params["initial_state"] || [],
-        visibility: params["visibility"]
+        visibility: params["visibility"],
+        power_level_content_override: params["power_level_content_override"]
       ]
 
       with {:ok, room_id} <- CreateRoom.execute(user_id, opts) do
         json(conn, %{"room_id" => room_id})
+      else
+        # These two power_level_content_override validation failures don't
+        # have a fallback_controller.ex mapping (out of this file's
+        # ownership) — handled directly here rather than adding one.
+        {:error, :power_levels_may_not_list_creators} ->
+          conn
+          |> put_status(400)
+          |> json(%{
+            "errcode" => "M_BAD_JSON",
+            "error" =>
+              "power_level_content_override may not list the room's creator(s) in users (room v12+)"
+          })
+
+        {:error, :power_level_content_override_excludes_creator} ->
+          conn
+          |> put_status(400)
+          |> json(%{
+            "errcode" => "M_BAD_JSON",
+            "error" => "power_level_content_override.users must include the room creator"
+          })
+
+        {:error, :invalid_power_level_content_override} ->
+          conn
+          |> put_status(400)
+          |> json(%{
+            "errcode" => "M_BAD_JSON",
+            "error" => "power_level_content_override must be an object"
+          })
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
@@ -335,14 +367,16 @@ defmodule AxonWeb.RoomController do
   end
 
   # POST /_matrix/client/v3/rooms/:room_id/upgrade
-  def upgrade(conn, %{"room_id" => room_id, "new_version" => new_version})
+  def upgrade(conn, %{"room_id" => room_id, "new_version" => new_version} = params)
       when is_binary(new_version) do
     user_id = conn.assigns.current_user_id
     server_name = Application.fetch_env!(:axon_web, :server_name)
+    upgrade_opts = [additional_creators: params["additional_creators"]]
 
     with :ok <- RoomUpgrade.ensure_joined(room_id, user_id),
          :ok <- RoomUpgrade.ensure_can_tombstone(room_id, user_id),
-         {:ok, new_room_id} <- RoomUpgrade.execute(room_id, user_id, new_version, server_name) do
+         {:ok, new_room_id} <-
+           RoomUpgrade.execute(room_id, user_id, new_version, server_name, upgrade_opts) do
       json(conn, %{"replacement_room" => new_room_id})
     else
       {:error, :not_joined} ->
@@ -365,6 +399,11 @@ defmodule AxonWeb.RoomController do
           "errcode" => "M_UNSUPPORTED_ROOM_VERSION",
           "error" => "Unsupported room version"
         })
+
+      # Same atom CreateRoom uses for a malformed additional_creators —
+      # fallback_controller.ex already maps it to 400 M_INVALID_PARAM.
+      {:error, :invalid_additional_creators} = err ->
+        err
     end
   end
 

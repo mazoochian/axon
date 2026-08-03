@@ -287,4 +287,140 @@ defmodule AxonWeb.RoomControllerTest do
       assert decode(conn)["errcode"] == "M_NOT_FOUND"
     end
   end
+
+  defp get_state_event(token, room_id, type) do
+    conn = authed(token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/#{type}?format=event")
+    {conn.status, decode(conn)}
+  end
+
+  describe "createRoom power_level_content_override" do
+    test "is merged into the room's initial m.room.power_levels event" do
+      alice = register("alice_plco1_#{System.unique_integer([:positive])}")
+      bob = register("bob_plco1_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(alice.token, %{
+          "room_version" => "12",
+          "invite" => [bob.user_id],
+          "power_level_content_override" => %{"users" => %{bob.user_id => 100}}
+        })
+
+      {200, pl_event} = get_state_event(alice.token, room_id, "m.room.power_levels")
+      assert pl_event["content"]["users"] == %{bob.user_id => 100}
+    end
+
+    test "v12: an override naming the room creator in users is rejected with 400, room still unusable/not returned" do
+      alice = register("alice_plco2_#{System.unique_integer([:positive])}")
+      bob = register("bob_plco2_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/createRoom", %{
+          "room_version" => "12",
+          "invite" => [bob.user_id],
+          "power_level_content_override" => %{"users" => %{alice.user_id => 100}}
+        })
+
+      assert conn.status == 400
+    end
+
+    test "pre-v12: an override with a users map that excludes the creator is rejected with 400" do
+      alice = register("alice_plco3_#{System.unique_integer([:positive])}")
+      bob = register("bob_plco3_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/createRoom", %{
+          "power_level_content_override" => %{"users" => %{bob.user_id => 100}}
+        })
+
+      assert conn.status == 400
+    end
+  end
+
+  describe "createRoom room v12 defaults (MSC4289)" do
+    test "m.room.tombstone defaults to power level 150, not 100" do
+      alice = register("alice_v12tomb_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "12"})
+
+      {200, pl_event} = get_state_event(alice.token, room_id, "m.room.power_levels")
+      assert pl_event["content"]["events"]["m.room.tombstone"] == 150
+    end
+  end
+
+  describe "createRoom trusted_private_chat + is_direct (MSC4289 additional_creators)" do
+    test "invitees become additional_creators in a v12 DM" do
+      alice = register("alice_dm1_#{System.unique_integer([:positive])}")
+      bob = register("bob_dm1_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(alice.token, %{
+          "room_version" => "12",
+          "preset" => "trusted_private_chat",
+          "is_direct" => true,
+          "invite" => [bob.user_id]
+        })
+
+      {200, create_event} = get_state_event(alice.token, room_id, "m.room.create")
+      assert create_event["content"]["additional_creators"] == [bob.user_id]
+    end
+  end
+
+  describe "upgrade additional_creators (MSC4289)" do
+    test "additional_creators is accepted and appears on the new room's create event" do
+      alice = register("alice_up1_#{System.unique_integer([:positive])}")
+      bob = register("bob_up1_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{
+          "new_version" => "12",
+          "additional_creators" => [bob.user_id]
+        })
+
+      assert conn.status == 200
+      new_room_id = decode(conn)["replacement_room"]
+
+      {200, create_event} = get_state_event(alice.token, new_room_id, "m.room.create")
+      assert create_event["content"]["additional_creators"] == [bob.user_id]
+
+      # The upgrader (new primary creator) and the new additional creator
+      # must both be absent from the copied power_levels.users map (rule
+      # 10.4 — creators are never listed there).
+      {200, pl_event} = get_state_event(alice.token, new_room_id, "m.room.power_levels")
+      refute Map.has_key?(pl_event["content"]["users"], alice.user_id)
+      refute Map.has_key?(pl_event["content"]["users"], bob.user_id)
+    end
+
+    test "a malformed additional_creators entry is rejected with 400" do
+      alice = register("alice_up2_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{
+          "new_version" => "12",
+          "additional_creators" => ["not-a-user-id"]
+        })
+
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+    end
+
+    test "additional_creators on an upgrade to a non-v12 version is rejected with 400" do
+      alice = register("alice_up3_#{System.unique_integer([:positive])}")
+      bob = register("bob_up3_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/upgrade", %{
+          "new_version" => "10",
+          "additional_creators" => [bob.user_id]
+        })
+
+      assert conn.status == 400
+    end
+  end
 end

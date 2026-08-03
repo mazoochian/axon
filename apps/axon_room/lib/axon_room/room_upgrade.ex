@@ -40,13 +40,22 @@ defmodule AxonRoom.RoomUpgrade do
   `new_version`, copying over ACLs/encryption/name/topic/avatar/guest_access/
   history_visibility/join_rules/power_levels/canonical_alias.
 
+  Options:
+    - `:additional_creators` — list of user IDs to set as the new room's
+      `additional_creators` (room v12 / MSC4289 only — ignored for any
+      other target version). Validated the same way `CreateRoom` validates
+      it at room-creation time (array of well-formed user IDs).
+
   Returns `{:ok, new_room_id}` or `{:error, reason}`.
 
   Note: does not migrate other members into the new room — clients follow
   the tombstone's `replacement_room` themselves, per spec.
   """
-  def execute(old_room_id, user_id, new_version, server_name) do
-    with :ok <- CreateRoom.check_version_supported(new_version) do
+  def execute(old_room_id, user_id, new_version, server_name, opts \\ []) do
+    additional_creators = opts[:additional_creators] || []
+
+    with :ok <- CreateRoom.check_version_supported(new_version),
+         :ok <- validate_additional_creators(new_version, additional_creators) do
       extra_create_content = fetch_create_extras(old_room_id)
       initial_state = copy_initial_state(old_room_id)
 
@@ -57,7 +66,8 @@ defmodule AxonRoom.RoomUpgrade do
           new_version,
           server_name,
           extra_create_content,
-          initial_state
+          initial_state,
+          additional_creators
         )
       else
         execute_legacy(
@@ -71,6 +81,22 @@ defmodule AxonRoom.RoomUpgrade do
       end
     end
   end
+
+  # additional_creators is a room v12 (MSC4289) concept — an omitted/empty
+  # list is always fine (the common case: no additional creators
+  # requested), regardless of target version. A non-empty list only makes
+  # sense when upgrading *to* v12 (see TestMSC4289PrivilegedRoomCreators_Upgrades
+  # in Complement); everything else is rejected with the same
+  # :invalid_additional_creators atom CreateRoom uses (fallback_controller.ex
+  # already maps it to 400 M_INVALID_PARAM), rather than silently ignoring a
+  # param the client explicitly set.
+  defp validate_additional_creators(_version, []), do: :ok
+
+  defp validate_additional_creators("12", list) do
+    CreateRoom.check_additional_creators("12", %{"additional_creators" => list})
+  end
+
+  defp validate_additional_creators(_version, _list), do: {:error, :invalid_additional_creators}
 
   defp execute_legacy(
          old_room_id,
@@ -113,23 +139,37 @@ defmodule AxonRoom.RoomUpgrade do
   # tombstone event_id yet to include, which is fine — it's informational,
   # not auth-rule-checked in any room version), then tombstone the old room
   # once the new room_id is known.
+  #
+  # The upgrader (`user_id`) always becomes the new room's primary creator
+  # (they're the one whose CreateRoom.execute/2 call this is), regardless of
+  # who created the old room — the old room's own creator/additional_creators
+  # are *not* inherited automatically; only `additional_creators` explicitly
+  # passed to this upgrade becomes the new room's additional_creators (see
+  # TestMSC4289PrivilegedRoomCreators_Upgrades in Complement, which asserts
+  # exactly this for both v11->v12 and v12->v12 upgrades).
   defp execute_v12(
          old_room_id,
          user_id,
          new_version,
          server_name,
          extra_create_content,
-         initial_state
+         initial_state,
+         additional_creators
        ) do
-    creation_content = Map.put(extra_create_content, "predecessor", %{"room_id" => old_room_id})
+    creation_content =
+      extra_create_content
+      |> Map.put("predecessor", %{"room_id" => old_room_id})
+      |> maybe_put_additional_creators(additional_creators)
 
     # The copied m.room.power_levels almost always lists the old room's
     # creator (a normal pre-v12 room has no other way to grant them power)
     # — but v12 rule 10.4 rejects a power_levels event that lists a
-    # creator in `users` at all, since they get implicit infinite power
-    # instead. Without stripping this, upgrading any ordinary room to v12
-    # would fail immediately after creating it.
-    initial_state = strip_creator_from_power_levels(initial_state, user_id)
+    # creator (primary or additional) in `users` at all, since they get
+    # implicit infinite power instead. Without stripping this, upgrading
+    # any ordinary room to v12 (or naming a moderator as an additional
+    # creator on upgrade) would fail immediately after creating it.
+    initial_state =
+      strip_creators_from_power_levels(initial_state, [user_id | additional_creators])
 
     with {:ok, new_room_id} <-
            CreateRoom.execute(user_id,
@@ -150,10 +190,15 @@ defmodule AxonRoom.RoomUpgrade do
     end
   end
 
-  defp strip_creator_from_power_levels(initial_state, creator_id) do
+  defp maybe_put_additional_creators(content, []), do: content
+
+  defp maybe_put_additional_creators(content, list),
+    do: Map.put(content, "additional_creators", list)
+
+  defp strip_creators_from_power_levels(initial_state, creator_ids) do
     Enum.map(initial_state, fn
       %{"type" => "m.room.power_levels", "content" => content} = ev ->
-        users = Map.delete(content["users"] || %{}, creator_id)
+        users = Map.drop(content["users"] || %{}, creator_ids)
         %{ev | "content" => Map.put(content, "users", users)}
 
       ev ->
