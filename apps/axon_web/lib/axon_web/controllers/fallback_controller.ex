@@ -179,6 +179,18 @@ defmodule AxonWeb.FallbackController do
     })
   end
 
+  def call(conn, {:error, :remote_invite_failed}) do
+    conn
+    |> put_status(502)
+    |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to deliver invite to remote server"})
+  end
+
+  def call(conn, {:error, :remote_leave_failed}) do
+    conn
+    |> put_status(502)
+    |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to deliver leave to remote server"})
+  end
+
   def call(conn, {:error, _reason}) do
     conn
     |> put_status(500)

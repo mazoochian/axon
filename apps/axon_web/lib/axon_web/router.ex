@@ -249,6 +249,8 @@ defmodule AxonWeb.Router do
     get("/v1/make_leave/:room_id/:user_id", FederationController, :make_leave)
     put("/v2/send_leave/:room_id/:event_id", FederationController, :send_leave)
     put("/v1/send_leave/:room_id/:event_id", FederationController, :send_leave)
+    put("/v2/invite/:room_id/:event_id", FederationController, :invite)
+    put("/v1/invite/:room_id/:event_id", FederationController, :invite)
     get("/v1/event/:event_id", FederationController, :get_event)
     get("/v1/state/:room_id", FederationController, :get_state)
     get("/v1/state_ids/:room_id", FederationController, :get_state_ids)

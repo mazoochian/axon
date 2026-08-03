@@ -11,6 +11,8 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
 
   use AxonWeb.ConnCase, async: false
 
+  import AxonWeb.TestHelpers, only: [register: 1, authed: 1, jp: 3]
+
   alias AxonFederation.{FakeRemoteMatrixServer, KeyCache}
   alias AxonCore.EventStore
   alias AxonRoom.{CreateRoom, RoomProcess}
@@ -185,5 +187,162 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
 
     assert send_leave_conn.status == 200
     assert EventStore.get_membership(room_id, remote_member) == {:ok, "leave"}
+  end
+
+  test "inbound federated invite: shows up in /sync, and can be rejected via a federated leave" do
+    invitee = register("fedinvite_local_#{System.unique_integer([:positive])}")
+    inviter = remote_user("inviter")
+    room_id = "!federatedroom_#{System.unique_integer([:positive])}:#{@server_name}"
+
+    invite_event =
+      signed_remote_event(%{
+        "event_id" => "$invite_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "sender" => inviter,
+        "state_key" => invitee.user_id,
+        "content" => %{"membership" => "invite"},
+        "depth" => 3,
+        "prev_events" => [],
+        "origin_server_ts" => System.os_time(:millisecond)
+      })
+
+    invite_room_state = [
+      %{
+        "type" => "m.room.name",
+        "state_key" => "",
+        "sender" => inviter,
+        "content" => %{"name" => "A room we've never seen before"}
+      }
+    ]
+
+    invite_path =
+      "/_matrix/federation/v2/invite/#{URI.encode(room_id)}/#{URI.encode(invite_event["event_id"])}"
+
+    invite_conn =
+      signed_put(invite_path, %{
+        "room_version" => "10",
+        "event" => invite_event,
+        "invite_room_state" => invite_room_state
+      })
+
+    assert invite_conn.status == 200
+    returned_event = decode(invite_conn)["event"]
+    # axon's own signature was added on top of the inviting server's
+    assert Map.has_key?(returned_event["signatures"], "localhost")
+    assert Map.has_key?(returned_event["signatures"], @server_name)
+
+    assert EventStore.get_membership(room_id, invitee.user_id) == {:ok, "invite"}
+
+    sync_conn = authed(invitee.token) |> get("/_matrix/client/v3/sync")
+    sync_body = decode(sync_conn)
+    invite_data = sync_body["rooms"]["invite"][room_id]
+    refute is_nil(invite_data)
+
+    invite_state_types =
+      invite_data["invite_state"]["events"] |> Enum.map(& &1["type"])
+
+    # the sender's invite_room_state preview came through...
+    assert "m.room.name" in invite_state_types
+    # ...alongside the invite membership event itself
+    assert "m.room.member" in invite_state_types
+
+    # --- Rejecting it: axon has no local RoomProcess for this room (never
+    # became resident), so this must go out via make_leave/send_leave
+    # against the inviting server, not the ordinary local send_event path.
+    # The fake server stands in as the room's resident server (in reality
+    # a different server than the inviter can be resident, but for this
+    # test @server_name plays both roles) and answers both requests.
+    FakeRemoteMatrixServer.put_response(
+      @port,
+      {"GET", ~r{^/_matrix/federation/v1/make_leave/}},
+      200,
+      %{
+        "room_version" => "10",
+        "event" => %{
+          "type" => "m.room.member",
+          "room_id" => room_id,
+          "content" => %{"membership" => "leave"},
+          "depth" => 4,
+          "prev_events" => [invite_event["event_id"]],
+          "auth_events" => []
+        }
+      }
+    )
+
+    FakeRemoteMatrixServer.put_response(
+      @port,
+      {"PUT", ~r{^/_matrix/federation/v2/send_leave/}},
+      200,
+      %{}
+    )
+
+    leave_conn = authed(invitee.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
+    assert leave_conn.status == 200
+
+    make_leave_seen =
+      wait_until(fn ->
+        Enum.find(FakeRemoteMatrixServer.requests(@port), fn r ->
+          r.method == "GET" and r.path =~ "/make_leave/"
+        end)
+      end)
+
+    refute is_nil(make_leave_seen), "expected axon to call make_leave against the inviting server"
+
+    send_leave_seen =
+      wait_until(fn ->
+        Enum.find(FakeRemoteMatrixServer.requests(@port), fn r ->
+          r.method == "PUT" and r.path =~ "/send_leave/"
+        end)
+      end)
+
+    refute is_nil(send_leave_seen), "expected axon to call send_leave against the inviting server"
+    assert EventStore.get_membership(room_id, invitee.user_id) == {:ok, "leave"}
+  end
+
+  test "outbound federated invite: a local room owner invites a remote user over federation" do
+    owner = register("fedinvite_owner_#{System.unique_integer([:positive])}")
+
+    {:ok, room_id} =
+      CreateRoom.execute(owner.user_id, server_name: "localhost", preset: "private_chat")
+
+    target = remote_user("invitee")
+
+    # The fake remote server signs the event and hands it back, per spec.
+    FakeRemoteMatrixServer.put_response(
+      @port,
+      {"PUT", ~r{^/_matrix/federation/v2/invite/}},
+      200,
+      %{
+        "event" =>
+          signed_remote_event(%{
+            "type" => "m.room.member",
+            "room_id" => room_id,
+            "sender" => owner.user_id,
+            "state_key" => target,
+            "content" => %{"membership" => "invite"},
+            "event_id" => "$outboundinvite_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond),
+            "depth" => 2,
+            "prev_events" => []
+          })
+      }
+    )
+
+    invite_conn =
+      authed(owner.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", %{"user_id" => target})
+
+    assert invite_conn.status == 200
+
+    request_seen =
+      Enum.find(FakeRemoteMatrixServer.requests(@port), fn r ->
+        r.method == "PUT" and r.path =~ "/_matrix/federation/v2/invite/"
+      end)
+
+    refute is_nil(request_seen), "expected axon to call the target server's federation/v2/invite"
+    assert get_in(request_seen.body, ["event", "content", "membership"]) == "invite"
+
+    assert EventStore.get_membership(room_id, target) == {:ok, "invite"}
   end
 end

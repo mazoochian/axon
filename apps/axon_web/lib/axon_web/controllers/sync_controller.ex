@@ -267,7 +267,8 @@ defmodule AxonWeb.SyncController do
     filtered_timeline = apply_type_filter(timeline_events, tl_types)
 
     ephemeral =
-      SyncHelpers.build_receipt_events(room_id) ++ SyncHelpers.build_typing_event(room_id)
+      SyncHelpers.build_receipt_events(room_id) ++
+        SyncHelpers.build_typing_event(room_id, is_initial_sync)
 
     room_account_data = SyncHelpers.build_room_account_data(room_id, user_id)
 

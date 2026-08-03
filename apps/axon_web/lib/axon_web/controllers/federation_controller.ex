@@ -229,6 +229,94 @@ defmodule AxonWeb.FederationController do
   end
 
   # ---------------------------------------------------------------------------
+  # PUT /_matrix/federation/v2/invite/:room_id/:event_id
+  #
+  # A remote resident server inviting one of our local users. Previously
+  # unimplemented entirely — no route, no handler — so a federated invite
+  # 404'd outright and a local user could never learn one existed. Unlike
+  # make_join/send_join, we don't (and structurally can't) already have
+  # this room's state: we may be seeing it for the very first time. We
+  # don't become resident just from an invite — only the bare membership
+  # row plus the sender's `invite_room_state` preview are stored, exactly
+  # enough for /sync's invite_state (AxonWeb.SyncHelpers.build_invite_state/2)
+  # to show something and for AxonFederation.RoomLeave to reject it later.
+  # ---------------------------------------------------------------------------
+
+  def invite(conn, %{"room_id" => room_id} = params) do
+    origin = conn.assigns[:origin_server]
+    event = params["event"]
+    room_version = params["room_version"] || "11"
+    invite_room_state = params["invite_room_state"] || []
+
+    with :ok <- check_acl(room_id, origin),
+         :ok <- validate_invite_event(event, room_id, origin),
+         {:ok, signed_event} <-
+           accept_invite(room_id, room_version, event, invite_room_state) do
+      json(conn, %{"event" => signed_event})
+    else
+      {:error, :acl_denied} ->
+        acl_forbidden(conn)
+
+      {:error, :invalid_invite} ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid invite event"})
+
+      _ ->
+        conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
+    end
+  end
+
+  defp validate_invite_event(event, room_id, origin) when is_map(event) do
+    local_server = KeyServer.server_name()
+    target_server = event["state_key"] |> to_string() |> String.split(":") |> List.last()
+    sender_server = event["sender"] |> to_string() |> String.split(":") |> List.last()
+
+    cond do
+      event["type"] != "m.room.member" -> {:error, :invalid_invite}
+      event["room_id"] != room_id -> {:error, :invalid_invite}
+      get_in(event, ["content", "membership"]) != "invite" -> {:error, :invalid_invite}
+      target_server != local_server -> {:error, :invalid_invite}
+      sender_server != origin -> {:error, :invalid_invite}
+      true -> :ok
+    end
+  end
+
+  defp validate_invite_event(_event, _room_id, _origin), do: {:error, :invalid_invite}
+
+  defp accept_invite(room_id, room_version, event, invite_room_state) do
+    signed_event = KeyServer.sign_event(event)
+    now = DateTime.utc_now(:microsecond)
+
+    Repo.insert_all(
+      "rooms",
+      [
+        %{
+          room_id: room_id,
+          version: room_version,
+          creator: event["sender"],
+          is_public: false,
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
+      on_conflict: :nothing
+    )
+
+    result =
+      case EventStore.insert_event(signed_event, room_version) do
+        {:ok, _persisted} -> :ok
+        {:error, :already_exists} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+
+    with :ok <- result do
+      EventStore.set_invite_preview_state(room_id, signed_event["state_key"], invite_room_state)
+      {:ok, signed_event}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/make_knock/:room_id/:user_id
   # ---------------------------------------------------------------------------
 

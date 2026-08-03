@@ -745,6 +745,36 @@ defmodule AxonCore.EventStore do
     (preview || %{})["events"] || []
   end
 
+  @doc """
+  Persists a federated invite's `invite_room_state` preview (per spec: a
+  stripped snapshot of some room state the inviting server hands over
+  since we have no other way to learn anything about a room we're not
+  otherwise resident in) — mirrors set_knock_preview_state/3 exactly.
+  """
+  def set_invite_preview_state(room_id, user_id, events) do
+    Repo.update_all(
+      from(m in "room_memberships",
+        where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "invite"
+      ),
+      set: [preview_state: %{"events" => events}]
+    )
+
+    :ok
+  end
+
+  @doc "Returns the stored invite preview's stripped events for a room the user was invited to."
+  def get_invite_preview_state(room_id, user_id) do
+    preview =
+      Repo.one(
+        from(m in "room_memberships",
+          where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "invite",
+          select: m.preview_state
+        )
+      )
+
+    (preview || %{})["events"] || []
+  end
+
   def get_left_rooms_since(user_id, since_ordering, opts \\ []) do
     exclude_forgotten = Keyword.get(opts, :exclude_forgotten, false)
 

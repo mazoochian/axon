@@ -219,17 +219,26 @@ defmodule AxonWeb.SyncHelpers do
     end
   end
 
-  # Unlike receipts (only included when non-empty), typing is always
-  # included whenever the room is in the response at all — the room only
-  # got here because something ephemeral changed, and an empty user_ids
-  # list is itself meaningful (someone stopped typing).
-  def build_typing_event(room_id) do
-    [
-      %{
-        "type" => "m.typing",
-        "content" => %{"user_ids" => AxonSync.Typing.typing_user_ids(room_id)}
-      }
-    ]
+  # Unlike receipts (only included when non-empty), typing is included with
+  # an empty user_ids list on an *incremental* sync — the room only got
+  # there because something ephemeral changed, so an empty list is itself
+  # meaningful ("someone stopped typing", vs. absent meaning "nothing to
+  # report"). An *initial* sync includes every joined room regardless of
+  # any ephemeral change (build_rooms_response/6 doesn't gate on one), so
+  # there's no such transition to report there — an empty typing entry
+  # would be attached to every single joined room on every initial sync,
+  # which is exactly what a room denied by ACL (m.room.server_acl) must
+  # NOT still leak: Complement's TestACLsForEDUs asserts a denied room's
+  # `ephemeral.events` is empty, not `[{"type": "m.typing", "content":
+  # {"user_ids": []}}]`.
+  def build_typing_event(room_id, is_initial_sync \\ false) do
+    user_ids = AxonSync.Typing.typing_user_ids(room_id)
+
+    if user_ids == [] and is_initial_sync do
+      []
+    else
+      [%{"type" => "m.typing", "content" => %{"user_ids" => user_ids}}]
+    end
   end
 
   # Presence for the user themselves plus anyone sharing a joined room with
@@ -262,7 +271,16 @@ defmodule AxonWeb.SyncHelpers do
   invitee is allowed to see before joining.
   """
   def build_invite_state(room_id, user_id) do
-    stripped = EventStore.stripped_state_events(room_id)
+    # Real current_room_state, when we have any — true for a same-server
+    # invite (the inviting server is resident with full state) or a room
+    # we used to be joined to. Falls back to the invite_room_state preview
+    # the *inviting* server handed us for a purely federated invite, where
+    # this is the only state we have ever seen for the room at all.
+    stripped =
+      case EventStore.stripped_state_events(room_id) do
+        [] -> EventStore.get_invite_preview_state(room_id, user_id)
+        events -> events
+      end
 
     case EventStore.get_state_event(room_id, "m.room.member", user_id) do
       {:ok, invite_event} -> stripped ++ [stripped_event(invite_event)]

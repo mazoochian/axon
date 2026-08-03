@@ -5,7 +5,7 @@ defmodule AxonWeb.RoomController do
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
-  alias AxonRoom.{CreateRoom, RestrictedJoin, RoomProcess, RoomUpgrade}
+  alias AxonRoom.{AuthRules, CreateRoom, EventBuilder, RestrictedJoin, RoomProcess, RoomUpgrade}
   alias AxonSync.Typing
 
   # POST /_matrix/client/v3/createRoom
@@ -194,14 +194,47 @@ defmodule AxonWeb.RoomController do
   end
 
   # POST /_matrix/client/v3/rooms/:room_id/leave
+  #
+  # A room this server is actually resident in (has a create event/full
+  # state — true for any room we've ever joined, or created, or been
+  # invited to *by a local user*) leaves through the normal local
+  # RoomProcess path, same as always. A room known only via a *federated*
+  # invite (AxonWeb.FederationController.invite/2 persists just the bare
+  # membership row, deliberately not becoming resident) has no local
+  # RoomProcess to send through at all — rejecting it has to go out via
+  # make_leave/send_leave against the inviting server instead, exactly
+  # like a federated join. Previously this endpoint only had the resident
+  # path, so rejecting a federated invite silently did nothing but locally
+  # discard the invite (the inviting server, and anyone else in the room,
+  # never learned about the rejection).
   def leave(conn, %{"room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
 
-    with {:ok, _event_id} <-
-           RoomProcess.send_event(room_id, user_id, "m.room.member", %{"membership" => "leave"},
-             state_key: user_id
-           ) do
-      json(conn, %{})
+    if resident_room?(room_id) do
+      with {:ok, _event_id} <-
+             RoomProcess.send_event(room_id, user_id, "m.room.member", %{"membership" => "leave"},
+               state_key: user_id
+             ) do
+        json(conn, %{})
+      end
+    else
+      with {:ok, via_server} <- invite_sender_server(room_id, user_id),
+           :ok <- AxonFederation.RoomLeave.leave_via_federation(room_id, user_id, [via_server]) do
+        json(conn, %{})
+      else
+        _ -> {:error, :remote_leave_failed}
+      end
+    end
+  end
+
+  defp resident_room?(room_id) do
+    match?({:ok, _}, EventStore.get_state_event(room_id, "m.room.create", ""))
+  end
+
+  defp invite_sender_server(room_id, user_id) do
+    case EventStore.get_state_event(room_id, "m.room.member", user_id) do
+      {:ok, %{sender: sender}} -> {:ok, sender |> String.split(":") |> List.last()}
+      _ -> {:error, :no_invite_found}
     end
   end
 
@@ -347,14 +380,7 @@ defmodule AxonWeb.RoomController do
 
     cond do
       params["user_id"] ->
-        with {:ok, _event_id} <-
-               RoomProcess.send_event(
-                 room_id,
-                 user_id,
-                 "m.room.member",
-                 %{"membership" => "invite"},
-                 state_key: params["user_id"]
-               ) do
+        with {:ok, _event_id} <- invite_user(room_id, user_id, params["user_id"]) do
           json(conn, %{})
         end
 
@@ -368,6 +394,68 @@ defmodule AxonWeb.RoomController do
           "errcode" => "M_MISSING_PARAM",
           "error" => "user_id, or medium+address, required"
         })
+    end
+  end
+
+  # A same-server invite goes through RoomProcess.send_event/5 as before —
+  # auth-checked, built, persisted, and broadcast the normal local way. A
+  # cross-server invite previously did the exact same thing regardless of
+  # the target's server, which meant the resulting m.room.member "invite"
+  # event only ever existed in *our* DB — nothing ever told the invitee's
+  # own homeserver about it over federation (there was no outbound
+  # `PUT .../federation/v2/invite/...` call anywhere in the codebase, and
+  # no inbound route to receive one either), so a federated invite was
+  # silently a no-op from the invitee's perspective.
+  defp invite_user(room_id, sender, target_user_id) do
+    local_server = AxonCrypto.KeyServer.server_name()
+    target_server = target_user_id |> String.split(":") |> List.last()
+
+    if target_server == local_server do
+      RoomProcess.send_event(room_id, sender, "m.room.member", %{"membership" => "invite"},
+        state_key: target_user_id
+      )
+    else
+      federate_invite(room_id, sender, target_user_id, target_server)
+    end
+  end
+
+  # Builds and self-signs the invite event exactly like a local send would
+  # (same AxonRoom.EventBuilder, same auth check — a would-be inviter
+  # without invite power is rejected here, before anything is sent out,
+  # not just for the same-server case), then round-trips it through the
+  # target server's federation `/invite` endpoint per spec: they add their
+  # own signature and hand back the final event, which is what actually
+  # gets persisted — via RoomProcess.apply_remote_event/2, the same path
+  # any other remote-originated event takes, so local /sync fan-out works
+  # identically to a same-server invite.
+  defp federate_invite(room_id, sender, target_user_id, target_server) do
+    room_ctx = RoomProcess.get_room_ctx(room_id)
+
+    invite_event =
+      EventBuilder.build(sender, "m.room.member", %{"membership" => "invite"}, room_ctx,
+        state_key: target_user_id
+      )
+
+    with :ok <- AuthRules.check(invite_event, room_ctx.current_state, room_ctx.room_version) do
+      body = %{
+        "room_version" => room_ctx.room_version,
+        "event" => invite_event,
+        "invite_room_state" => EventStore.stripped_state_events(room_id)
+      }
+
+      path =
+        "/_matrix/federation/v2/invite/#{URI.encode(room_id)}/#{URI.encode(invite_event["event_id"])}"
+
+      case AxonFederation.HttpClient.put(target_server, path, body) do
+        {:ok, %{"event" => signed_event}} when is_map(signed_event) ->
+          RoomProcess.apply_remote_event(room_id, signed_event)
+
+        {:ok, _malformed} ->
+          {:error, :remote_invite_failed}
+
+        {:error, _reason} ->
+          {:error, :remote_invite_failed}
+      end
     end
   end
 

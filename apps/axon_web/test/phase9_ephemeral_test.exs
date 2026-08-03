@@ -165,6 +165,17 @@ defmodule AxonWeb.Phase9EphemeralTest do
       assert typing_event2["content"]["user_ids"] == []
     end
 
+    test "an initial (no-since) sync omits m.typing entirely when nobody is typing" do
+      alice = register("alice_typing_initial_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      body = sync_once(alice.token)
+      room_data = body["rooms"]["join"][room_id]
+
+      typing_events = Enum.filter(room_data["ephemeral"]["events"], &(&1["type"] == "m.typing"))
+      assert typing_events == []
+    end
+
     test "rejects setting another user's typing state, and non-members" do
       alice = register("alice_typing_perm_#{System.unique_integer([:positive])}")
       bob = register("bob_typing_perm_#{System.unique_integer([:positive])}")
