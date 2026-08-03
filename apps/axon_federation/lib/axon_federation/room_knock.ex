@@ -14,7 +14,7 @@ defmodule AxonFederation.RoomKnock do
   alias AxonCrypto.{EventHash, KeyServer}
   alias AxonFederation.HttpClient
 
-  @supported_versions ~w(7 8 9 10 11)
+  @supported_versions ~w(7 8 9 10 11 12)
 
   @doc """
   Knocks on a remote room for a local user. `via_servers` is a list of
