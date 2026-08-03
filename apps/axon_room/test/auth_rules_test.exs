@@ -155,15 +155,27 @@ defmodule AxonRoom.AuthRulesTest do
       assert AuthRules.check(event, st_invited, "11") == :ok
     end
 
-    test "knock join_rule: only invited or knocking users may join" do
+    test "knock join_rule: requires a prior invite, not just a knock" do
       st = state([create_event(), join_rules_event("knock")])
       event = member_event_to_send(@alice, @alice, "join")
       assert AuthRules.check(event, st, "11") == {:error, :not_invited}
 
-      st_knocked =
-        state([create_event(), join_rules_event("knock"), member_event(@alice, "knock")])
+      st_invited =
+        state([create_event(), join_rules_event("knock"), member_event(@alice, "invite")])
 
-      assert AuthRules.check(event, st_knocked, "11") == :ok
+      assert AuthRules.check(event, st_invited, "11") == :ok
+    end
+
+    # Regression: spec rule 4.3.4 ("If the join_rule is invite or knock then
+    # allow if membership state is invite or join") does NOT list "knock" as
+    # a sufficient prior state for self-joining. Knocking only earns the
+    # right to be seen/invited/rejected — it is never a self-service join.
+    # A knocking user attempting to join directly (without ever being
+    # invited) must still be refused.
+    test "knock join_rule: a knocking (not invited) user still cannot join directly" do
+      st = state([create_event(), join_rules_event("knock"), member_event(@alice, "knock")])
+      event = member_event_to_send(@alice, @alice, "join")
+      assert AuthRules.check(event, st, "11") == {:error, :not_invited}
     end
 
     test "restricted join_rule: allowed when invited or when creator" do
@@ -263,6 +275,12 @@ defmodule AxonRoom.AuthRulesTest do
       event = member_event_to_send(@alice, @bob, "invite")
       assert AuthRules.check(event, st, "11") == {:error, :insufficient_power}
     end
+
+    test "a room member with invite power can accept a knock (knock -> invite)", %{base: st} do
+      st = Map.put(st, {"m.room.member", @alice}, elem(member_event(@alice, "knock"), 1))
+      event = member_event_to_send(@creator, @alice, "invite")
+      assert AuthRules.check(event, st, "11") == :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -356,6 +374,45 @@ defmodule AxonRoom.AuthRulesTest do
       event = member_event_to_send(@creator, @alice, "leave")
       assert AuthRules.check(event, st, "11") == {:error, :insufficient_power}
     end
+
+    # Regression: rescinding a knock and rejecting someone's knock are both
+    # ordinary "leave" events targeting a user whose current membership is
+    # "knock" — spec rule 4.5.1 (self) and rule 4.5.4 (other, kick-power
+    # gated) both apply to a "knock" starting state exactly like "invite" or
+    # "join". Neither branch of check_leave/4 used to recognize "knock".
+    test "a knocking user can rescind their own knock (self-leave)" do
+      st = state([create_event(), join_rules_event("knock"), member_event(@alice, "knock")])
+      event = member_event_to_send(@alice, @alice, "leave")
+      assert AuthRules.check(event, st, "11") == :ok
+    end
+
+    test "a room member with kick power can reject another user's knock" do
+      st =
+        state([
+          create_event(),
+          join_rules_event("knock"),
+          member_event(@creator, "join"),
+          member_event(@alice, "knock"),
+          power_levels_event(%{"users" => %{@creator => 100}, "kick" => 50})
+        ])
+
+      event = member_event_to_send(@creator, @alice, "leave")
+      assert AuthRules.check(event, st, "11") == :ok
+    end
+
+    test "rejecting a knock still requires kick power, not just membership" do
+      st =
+        state([
+          create_event(),
+          join_rules_event("knock"),
+          member_event(@creator, "join"),
+          member_event(@alice, "knock"),
+          power_levels_event(%{"users" => %{@creator => 0, @alice => 0}, "kick" => 50})
+        ])
+
+      event = member_event_to_send(@creator, @alice, "leave")
+      assert AuthRules.check(event, st, "11") == {:error, :insufficient_power}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -393,6 +450,20 @@ defmodule AxonRoom.AuthRulesTest do
       st = state([create_event()])
       event = member_event_to_send(@alice, @bob, "ban")
       assert AuthRules.check(event, st, "11") == {:error, :not_joined}
+    end
+
+    test "a knocking user can be banned (knock -> ban), unaffected by the knock/leave fix" do
+      st =
+        state([
+          create_event(),
+          join_rules_event("knock"),
+          member_event(@creator, "join"),
+          member_event(@alice, "knock"),
+          power_levels_event(%{"users" => %{@creator => 100}, "ban" => 50})
+        ])
+
+      event = member_event_to_send(@creator, @alice, "ban")
+      assert AuthRules.check(event, st, "11") == :ok
     end
   end
 

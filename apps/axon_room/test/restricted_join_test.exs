@@ -177,4 +177,45 @@ defmodule AxonRoom.RestrictedJoinTest do
     assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) ==
              {:error, :restricted_join_denied}
   end
+
+  # Regression: Complement's "mangled join rules" subtest deliberately sends
+  # an `allow` that isn't a well-formed list of
+  # `{"type": "m.room_membership", "room_id": "..."}` maps. This used to
+  # raise (bracket-access on a non-map / Enum.filter on a non-list) instead
+  # of denying the join — a crash inside the HTTP request process instead of
+  # a clean "not authorised" result.
+  describe "malformed allow (mangled join rules)" do
+    test "a list of bare strings instead of maps is denied, not a crash" do
+      insert_membership(@space_room, @alice, "join")
+      current_state = %{{"m.room.member", @creator} => member_event(@creator, "join")}
+
+      assert RestrictedJoin.authorise(%{"allow" => ["invalid"]}, @alice, current_state) ==
+               {:error, :restricted_join_denied}
+    end
+
+    test "a bare string (not a list at all) for allow is denied, not a crash" do
+      insert_membership(@space_room, @alice, "join")
+      current_state = %{{"m.room.member", @creator} => member_event(@creator, "join")}
+
+      assert RestrictedJoin.authorise(%{"allow" => "invalid"}, @alice, current_state) ==
+               {:error, :restricted_join_denied}
+    end
+
+    test "a mix of malformed and well-formed entries still honors the valid entry" do
+      insert_membership(@space_room, @alice, "join")
+      current_state = %{{"m.room.member", @creator} => member_event(@creator, "join")}
+
+      allow = ["invalid", 42, %{"no_type" => "here"}, %{"type" => "m.room_membership", "room_id" => @space_room}]
+
+      assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) ==
+               {:ok, @creator}
+    end
+
+    test "allow entirely absent from join_rule_content is denied, not a crash" do
+      current_state = %{{"m.room.member", @creator} => member_event(@creator, "join")}
+
+      assert RestrictedJoin.authorise(%{}, @alice, current_state) ==
+               {:error, :restricted_join_denied}
+    end
+  end
 end

@@ -23,9 +23,9 @@ defmodule AxonRoom.RestrictedJoin do
   Returns `{:ok, authoriser_user_id}` or `{:error, :restricted_join_denied}`.
   """
   def authorise(join_rule_content, user_id, current_state) do
-    allow = join_rule_content["allow"] || []
+    allow = join_rule_content["allow"]
 
-    if allow != [] and satisfies_allow_rule?(allow, user_id) do
+    if is_list(allow) and allow != [] and satisfies_allow_rule?(allow, user_id) do
       case pick_authoriser(current_state) do
         nil -> {:error, :restricted_join_denied}
         authoriser -> {:ok, authoriser}
@@ -35,13 +35,22 @@ defmodule AxonRoom.RestrictedJoin do
     end
   end
 
+  # `allow` is untrusted room-state content — it could be a list of bare
+  # strings, numbers, or anything else a malicious/buggy client sent instead
+  # of `{"type": "m.room_membership", "room_id": "..."}` objects (Complement's
+  # "mangled join rules" test does exactly this deliberately). Anything that
+  # isn't a well-formed entry is filtered out rather than raising; an `allow`
+  # that yields no usable entries simply denies the join (fail closed).
   defp satisfies_allow_rule?(allow, user_id) do
     allow
-    |> Enum.filter(&(&1["type"] == "m.room_membership"))
+    |> Enum.filter(&valid_allow_entry?/1)
     |> Enum.map(& &1["room_id"])
-    |> Enum.reject(&is_nil/1)
+    |> Enum.filter(&is_binary/1)
     |> Enum.any?(&joined?(&1, user_id))
   end
+
+  defp valid_allow_entry?(%{"type" => "m.room_membership"}), do: true
+  defp valid_allow_entry?(_), do: false
 
   defp joined?(room_id, user_id) do
     Repo.exists?(
