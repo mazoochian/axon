@@ -141,7 +141,213 @@ defmodule AxonWeb.RoomV12Test do
 
       assert conn.status >= 400
     end
+
+    test "an additional_creators entry with an invalid domain is rejected" do
+      alice = register("v12_badaddl_domain_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/createRoom", %{
+          "room_version" => "12",
+          "creation_content" => %{"additional_creators" => ["@invalid:dom$ain$.com"]}
+        })
+
+      assert conn.status >= 400
+    end
   end
+
+  # Regression coverage for the "MSC4289 privileged room creators" Complement
+  # cluster (ROADMAP Phase 17): a room v12 creator's implicit infinite power
+  # must be honored consistently across *every* power comparison — not just
+  # ordinary event-sending — including kick, ban, redaction-send, and being
+  # outranked by nothing a client can legitimately set. The originally
+  # reported symptom was a creator's own kick being refused with
+  # M_FORBIDDEN "Insufficient power level": root-caused to `@infinite_power`
+  # in AuthRules being smaller (1_000_000_000) than the largest power level
+  # a client can actually set on another user (the canonical-JSON-safe max
+  # integer, 9_007_199_254_740_991) — so a promoted admin at/above that
+  # ceiling would out-rank the "infinite" creator in `has_power_over?/5`.
+  describe "creator privilege is honored across every power check (MSC4289)" do
+    setup do
+      alice = register("v12_priv_alice_#{System.unique_integer([:positive])}")
+      bob = register("v12_priv_bob_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(alice.token, %{
+          "room_version" => "12",
+          "preset" => "public_chat",
+          "invite" => [bob.user_id]
+        })
+
+      conn = authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+      assert conn.status == 200
+
+      %{alice: alice, bob: bob, room_id: room_id}
+    end
+
+    defp set_bob_power(alice_token, room_id, bob_user_id, level) do
+      conn =
+        send_state(alice_token, room_id, "m.room.power_levels", "", %{
+          "users" => %{bob_user_id => level}
+        })
+
+      assert conn.status == 200
+    end
+
+    test "creator can kick a member promoted to admin (PL100)", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      set_bob_power(alice.token, room_id, bob.user_id, 100)
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
+
+      assert conn.status == 200
+    end
+
+    test "creator can kick a member even at the canonical-JSON-max power level", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      # 2^53 - 1: the largest integer a client can legitimately set via
+      # canonical JSON. Before the @infinite_power fix, this out-ranked the
+      # creator's "infinite" power (1_000_000_000) and the kick was
+      # incorrectly refused.
+      set_bob_power(alice.token, room_id, bob.user_id, 9_007_199_254_740_991)
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
+
+      assert conn.status == 200
+    end
+
+    test "an admin at the canonical-JSON-max power level still cannot kick the creator", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      set_bob_power(alice.token, room_id, bob.user_id, 9_007_199_254_740_991)
+
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => alice.user_id})
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+
+    test "creator can ban a member promoted to admin (PL100)", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      set_bob_power(alice.token, room_id, bob.user_id, 100)
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/ban", %{"user_id" => bob.user_id})
+
+      assert conn.status == 200
+    end
+
+    test "an admin at PL100 cannot ban the creator", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      set_bob_power(alice.token, room_id, bob.user_id, 100)
+
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/ban", %{"user_id" => alice.user_id})
+
+      assert conn.status == 403
+    end
+
+    test "creator can send m.room.redaction even when its required send-power is raised above default",
+         %{alice: alice, bob: bob, room_id: room_id} do
+      conn =
+        send_state(alice.token, room_id, "m.room.power_levels", "", %{
+          "events" => %{"m.room.redaction" => 100}
+        })
+
+      assert conn.status == 200
+
+      target_event_id = send_event(alice.token, room_id, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "redact me"
+      })
+
+      txn_id = "txn_redact_#{System.unique_integer([:positive])}"
+
+      redact_conn =
+        authed(alice.token)
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{room_id}/redact/#{target_event_id}/#{txn_id}",
+          %{}
+        )
+
+      assert redact_conn.status == 200
+
+      # Control: bob, still at the room's default (unpromoted) power, is
+      # refused sending a redaction under the same elevated requirement.
+      bob_txn_id = "txn_redact_bob_#{System.unique_integer([:positive])}"
+
+      bob_redact_conn =
+        authed(bob.token)
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{room_id}/redact/#{target_event_id}/#{bob_txn_id}",
+          %{}
+        )
+
+      assert bob_redact_conn.status == 403
+    end
+
+    test "creator is absent from power_levels.users yet outranks an admin at any level", %{
+      alice: alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      set_bob_power(alice.token, room_id, bob.user_id, 100)
+
+      pl_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+
+      pl = decode(pl_conn)
+      refute Map.has_key?(pl["users"] || %{}, alice.user_id)
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
+
+      assert conn.status == 200
+    end
+
+    test "control: a non-creator member without power cannot kick another member", %{
+      alice: _alice,
+      bob: bob,
+      room_id: room_id
+    } do
+      charlie = register("v12_priv_charlie_#{System.unique_integer([:positive])}")
+
+      conn = authed(charlie.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+      assert conn.status == 200
+
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => charlie.user_id})
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+  end
+
 
   # Regression (MSC4291, found by Complement's
   # TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent): the

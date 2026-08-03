@@ -681,6 +681,160 @@ defmodule AxonRoom.AuthRulesTest do
       event = state_event(@bob, "m.room.name", %{"name" => "hijack"})
       assert AuthRules.check(event, st, "12") == {:error, :insufficient_power}
     end
+
+    # Regression for the ROADMAP Phase 17 MSC4289 cluster: the originally
+    # reported symptom (a v12 creator's own kick refused with M_FORBIDDEN
+    # "Insufficient power level") was `@infinite_power` (1_000_000_000)
+    # being smaller than the largest power level a client can legitimately
+    # set via canonical JSON (2^53 - 1 = 9_007_199_254_740_991) — so an
+    # admin promoted to/above that ceiling would out-rank the "infinite"
+    # creator in `has_power_over?/5`, in *both* directions.
+    test "the creator can kick an admin even at the canonical-JSON-max power level" do
+      st =
+        state([
+          v12_create_event(@creator),
+          member_event(@creator, "join"),
+          member_event(@bob, "join"),
+          power_levels_event(%{"users" => %{@bob => 9_007_199_254_740_991}})
+        ])
+
+      event = member_event_to_send(@creator, @bob, "leave")
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "an admin at the canonical-JSON-max power level still cannot kick the creator" do
+      st =
+        state([
+          v12_create_event(@creator),
+          member_event(@creator, "join"),
+          member_event(@bob, "join"),
+          power_levels_event(%{"users" => %{@bob => 9_007_199_254_740_991}})
+        ])
+
+      event = member_event_to_send(@bob, @creator, "leave")
+      assert AuthRules.check(event, st, "12") == {:error, :insufficient_power}
+    end
+
+    test "the creator can ban an admin even at the canonical-JSON-max power level" do
+      st =
+        state([
+          v12_create_event(@creator),
+          member_event(@creator, "join"),
+          member_event(@bob, "join"),
+          power_levels_event(%{"users" => %{@bob => 9_007_199_254_740_991}})
+        ])
+
+      event = member_event_to_send(@creator, @bob, "ban")
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "an admin at the canonical-JSON-max power level still cannot ban the creator" do
+      st =
+        state([
+          v12_create_event(@creator),
+          member_event(@creator, "join"),
+          member_event(@bob, "join"),
+          power_levels_event(%{"users" => %{@bob => 9_007_199_254_740_991}})
+        ])
+
+      event = member_event_to_send(@bob, @creator, "ban")
+      assert AuthRules.check(event, st, "12") == {:error, :insufficient_power}
+    end
+
+    test "the creator can send a redaction even when its required power is raised above default" do
+      st =
+        state([
+          v12_create_event(@creator),
+          member_event(@creator, "join"),
+          member_event(@bob, "join"),
+          power_levels_event(%{"events" => %{"m.room.redaction" => 100}})
+        ])
+
+      event = %{
+        "type" => "m.room.redaction",
+        "sender" => @creator,
+        "content" => %{"redacts" => "$someevent"}
+      }
+
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "control: a non-creator without power cannot send a redaction under the same elevated requirement" do
+      st =
+        state([
+          v12_create_event(@creator),
+          member_event(@creator, "join"),
+          member_event(@bob, "join"),
+          power_levels_event(%{"events" => %{"m.room.redaction" => 100}})
+        ])
+
+      event = %{
+        "type" => "m.room.redaction",
+        "sender" => @bob,
+        "content" => %{"redacts" => "$someevent"}
+      }
+
+      assert AuthRules.check(event, st, "12") == {:error, :insufficient_power}
+    end
+  end
+
+  describe "room v12 additional_creators domain validation" do
+    test "an additional_creators entry with an invalid domain (bad characters) is rejected" do
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{"additional_creators" => ["@invalid:dom$ain$.com"]}
+      }
+
+      assert AuthRules.check(event, %{}, "12") == {:error, :invalid_additional_creators}
+    end
+
+    test "additional_creators entries with valid domains (including a port) are accepted" do
+      event = %{
+        "type" => "m.room.create",
+        "sender" => @creator,
+        "prev_events" => [],
+        "content" => %{"additional_creators" => ["@foo:example.com", "@bar:baz.code:8448"]}
+      }
+
+      assert AuthRules.check(event, %{}, "12") == :ok
+    end
+  end
+
+  describe "m.room.power_levels numeric range validation" do
+    test "a users.* value beyond the canonical-JSON-safe integer range is rejected" do
+      st = state([v12_create_event(@creator), member_event(@creator, "join")])
+
+      event =
+        state_event(@creator, "m.room.power_levels", %{
+          "users" => %{@bob => 9_007_199_254_740_992}
+        })
+
+      assert AuthRules.check(event, st, "12") == {:error, :power_level_value_out_of_range}
+    end
+
+    test "a users.* value exactly at the canonical-JSON-safe max is accepted" do
+      st = state([v12_create_event(@creator), member_event(@creator, "join")])
+
+      event =
+        state_event(@creator, "m.room.power_levels", %{
+          "users" => %{@bob => 9_007_199_254_740_991}
+        })
+
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "an out-of-range value nested under events.* is also rejected" do
+      st = state([v12_create_event(@creator), member_event(@creator, "join")])
+
+      event =
+        state_event(@creator, "m.room.power_levels", %{
+          "events" => %{"m.room.name" => 9_007_199_254_740_992}
+        })
+
+      assert AuthRules.check(event, st, "12") == {:error, :power_level_value_out_of_range}
+    end
   end
 
   # ---------------------------------------------------------------------------
