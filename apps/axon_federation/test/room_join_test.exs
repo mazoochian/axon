@@ -246,6 +246,44 @@ defmodule AxonFederation.RoomJoinTest do
     assert log =~ "Failed to insert event"
   end
 
+  # Room versions 3+ never carry "event_id" on the wire — it's derived from
+  # the event's reference hash, not transmitted. Regression: import_room_state
+  # used to key its dedup (Enum.uniq_by(&1["event_id"])) directly off that
+  # absent field, so every such event hashed to the same `nil` key and only
+  # the first one in the combined auth_chain++state list survived — losing
+  # the join_rules/power_levels/etc. state entirely while still reporting a
+  # successful join. This exact failure mode broke
+  # TestJoinViaRoomIDAndServerName end-to-end (join returned 200 OK, but the
+  # imported room had no join_rules state, so the next remote join through it
+  # was wrongly rejected as "Join not allowed").
+  defp remote_state_events_without_event_id(room_id) do
+    remote_state_events(room_id)
+    |> Enum.map(&Map.delete(&1, "event_id"))
+  end
+
+  test "state/auth_chain events with no event_id on the wire (room v3+ format) are all stored, not collapsed to one",
+       %{user_id: user_id} do
+    room_id = remote_room_id()
+
+    FakeRemoteMatrixServer.make_join_response(@port, room_id, user_id, "11")
+    FakeRemoteMatrixServer.send_join_response(@port, remote_state_events_without_event_id(room_id), [])
+
+    assert RoomJoin.join_via_federation(room_id, user_id, [@server_name]) == {:ok, room_id}
+
+    assert {:ok, state_events} = AxonRoom.RoomProcess.get_state(room_id)
+    types = Enum.map(state_events, & &1["type"]) |> Enum.sort()
+
+    assert types == [
+             "m.room.create",
+             "m.room.join_rules",
+             "m.room.member",
+             "m.room.member"
+           ]
+
+    join_rules = Enum.find(state_events, &(&1["type"] == "m.room.join_rules"))
+    assert join_rules["content"]["join_rule"] == "public"
+  end
+
   test "a join event that itself fails to insert (missing room_id in the make_join template) is logged, not a crash",
        %{user_id: user_id} do
     room_id = remote_room_id()
