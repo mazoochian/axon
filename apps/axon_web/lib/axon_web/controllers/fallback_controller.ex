@@ -146,12 +146,24 @@ defmodule AxonWeb.FallbackController do
     })
   end
 
+  # 400, not 403: listing a creator in power_levels.users isn't a permission
+  # the sender lacks — no sender has it, in any room, ever — so it's a
+  # malformed event rather than an authorization failure.
   def call(conn, {:error, :power_levels_may_not_list_creators}) do
     conn
-    |> put_status(403)
+    |> put_status(400)
     |> json(%{
-      "errcode" => "M_FORBIDDEN",
+      "errcode" => "M_BAD_JSON",
       "error" => "power_levels.users may not list the room's creator(s) (room v12+)"
+    })
+  end
+
+  def call(conn, {:error, :power_level_value_out_of_range}) do
+    conn
+    |> put_status(400)
+    |> json(%{
+      "errcode" => "M_BAD_JSON",
+      "error" => "power_levels values must fit in a canonical-JSON-safe integer"
     })
   end
 

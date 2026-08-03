@@ -87,7 +87,35 @@ defmodule AxonWeb.RoomV12Test do
       bad_pl = Map.put(pl, "users", Map.put(pl["users"] || %{}, alice.user_id, 100))
       conn = send_state(alice.token, room_id, "m.room.power_levels", "", bad_pl)
 
-      assert conn.status == 403
+      # 400, not 403 — no sender in any room may do this, so it's a malformed
+      # event rather than a permission the sender happens to lack.
+      assert conn.status == 400
+      assert %{"errcode" => "M_BAD_JSON"} = decode(conn)
+    end
+
+    test "a power level beyond the canonical-JSON-safe integer range is rejected" do
+      alice = register("v12_plmax_#{System.unique_integer([:positive])}")
+      bob = register("v12_plmax_bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"room_version" => "12", "preset" => "public_chat"})
+
+      pl_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+
+      pl = decode(pl_conn)
+
+      # 2^53, one past the largest integer canonical JSON can round-trip.
+      too_big = Map.put(pl, "users", Map.put(pl["users"] || %{}, bob.user_id, 9_007_199_254_740_992))
+      conn = send_state(alice.token, room_id, "m.room.power_levels", "", too_big)
+
+      assert conn.status == 400
+      assert %{"errcode" => "M_BAD_JSON"} = decode(conn)
+
+      # The largest value that *does* fit is accepted.
+      ok_pl = Map.put(pl, "users", Map.put(pl["users"] || %{}, bob.user_id, 9_007_199_254_740_991))
+      conn = send_state(alice.token, room_id, "m.room.power_levels", "", ok_pl)
+
+      assert conn.status == 200
     end
 
     test "a non-creator member is still power-gated normally" do
