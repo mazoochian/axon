@@ -226,6 +226,32 @@ defmodule AxonCore.EventStoreTest do
     end
   end
 
+  describe "unknown_ids/1" do
+    test "empty for an empty list" do
+      assert EventStore.unknown_ids([]) == []
+    end
+
+    test "returns ids not stored at all, whether accepted or rejected are present or not" do
+      accepted = event()
+      {:ok, _} = EventStore.insert_event(accepted, "10")
+
+      rejected = event()
+      {:ok, _} = EventStore.insert_rejected_event(rejected, "10")
+
+      assert EventStore.unknown_ids([
+               accepted["event_id"],
+               rejected["event_id"],
+               "$never-existed"
+             ]) == ["$never-existed"]
+    end
+
+    test "a rejected event counts as known, not unknown" do
+      rejected = event()
+      {:ok, _} = EventStore.insert_rejected_event(rejected, "10")
+      assert EventStore.unknown_ids([rejected["event_id"]]) == []
+    end
+  end
+
   describe "insert_event/2 — unrejecting a previously-rejected event" do
     test "flips rejected to false, applies state, and gets a fresh (later) stream_ordering" do
       # Mirrors TestUnrejectRejectedEvents: an event is first rejected
