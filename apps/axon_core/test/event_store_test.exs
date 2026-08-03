@@ -146,6 +146,129 @@ defmodule AxonCore.EventStoreTest do
     end
   end
 
+  describe "insert_rejected_event/2" do
+    test "persists the raw event marked rejected but never materializes it into state" do
+      ev =
+        event(%{
+          "type" => "m.room.topic",
+          "state_key" => "",
+          "content" => %{"topic" => "should not apply"}
+        })
+
+      assert {:ok, persisted} = EventStore.insert_rejected_event(ev, "10")
+      assert persisted.event_id == ev["event_id"]
+      assert persisted.rejected == true
+
+      # Stored — GET /event/{id} etc. can still see it.
+      assert {:ok, fetched} = EventStore.get_event(ev["event_id"])
+      assert fetched.rejected == true
+
+      # But never applied: no current_room_state row for it.
+      assert EventStore.get_state_event(@room, "m.room.topic", "") == {:error, :not_found}
+    end
+
+    test "a rejected membership event does not derive a room_memberships row" do
+      bob = "@bob:remote.example"
+
+      ev =
+        event(%{
+          "type" => "m.room.member",
+          "state_key" => bob,
+          "sender" => bob,
+          "content" => %{"membership" => "join"}
+        })
+
+      assert {:ok, _} = EventStore.insert_rejected_event(ev, "10")
+      assert EventStore.get_membership(@room, bob) == {:ok, nil}
+    end
+
+    test "excluded from get_events_since (i.e. what /sync draws from)" do
+      ev = event()
+      {:ok, _} = EventStore.insert_rejected_event(ev, "10")
+
+      events = EventStore.get_events_since(@room, 0, 1000)
+      refute Enum.any?(events, &(&1.event_id == ev["event_id"]))
+    end
+
+    test "excluded from get_current_state_map/1" do
+      ev =
+        event(%{"type" => "m.room.topic", "state_key" => "", "content" => %{"topic" => "nope"}})
+
+      {:ok, _} = EventStore.insert_rejected_event(ev, "10")
+      state = EventStore.get_current_state_map(@room)
+      refute Map.has_key?(state, {"m.room.topic", ""})
+    end
+
+    test "never downgrades an event that was already accepted" do
+      ev = event()
+      {:ok, _} = EventStore.insert_event(ev, "10")
+
+      assert {:ok, persisted} = EventStore.insert_rejected_event(ev, "10")
+      assert persisted.rejected == false
+    end
+  end
+
+  describe "any_rejected?/1" do
+    test "false for an empty list" do
+      refute EventStore.any_rejected?([])
+    end
+
+    test "false when none of the ids are rejected (or don't exist)" do
+      ev = event()
+      {:ok, _} = EventStore.insert_event(ev, "10")
+      refute EventStore.any_rejected?([ev["event_id"], "$never-existed"])
+    end
+
+    test "true when at least one id is a stored, rejected event" do
+      ev = event()
+      {:ok, _} = EventStore.insert_rejected_event(ev, "10")
+      assert EventStore.any_rejected?(["$unrelated", ev["event_id"]])
+    end
+  end
+
+  describe "insert_event/2 — unrejecting a previously-rejected event" do
+    test "flips rejected to false, applies state, and gets a fresh (later) stream_ordering" do
+      # Mirrors TestUnrejectRejectedEvents: an event is first rejected
+      # (here: directly, standing in for "its ancestor was missing"), then
+      # a second, unrelated event is accepted while it's still rejected,
+      # then the rejected event finally gets accepted on a later attempt.
+      ev =
+        event(%{
+          "type" => "m.room.topic",
+          "state_key" => "",
+          "content" => %{"topic" => "unrejected"}
+        })
+
+      {:ok, rejected_persisted} = EventStore.insert_rejected_event(ev, "10")
+      assert rejected_persisted.rejected == true
+      # Not applied yet.
+      assert EventStore.get_state_event(@room, "m.room.topic", "") == {:error, :not_found}
+
+      later = event()
+      {:ok, later_persisted} = EventStore.insert_event(later, "10")
+      assert rejected_persisted.stream_ordering < later_persisted.stream_ordering
+
+      {:ok, unrejected} = EventStore.insert_event(ev, "10")
+      assert unrejected.rejected == false
+      assert unrejected.event_id == ev["event_id"]
+      # Sorts *after* the event that was already accepted while this one
+      # was still rejected — otherwise it would sort before any `since`
+      # token captured in the meantime and never appear as a "new" event.
+      assert unrejected.stream_ordering > later_persisted.stream_ordering
+
+      assert {:ok, state_event} = EventStore.get_state_event(@room, "m.room.topic", "")
+      assert state_event.content["topic"] == "unrejected"
+    end
+
+    test "an idempotent resend of an already-accepted event does not bump its stream_ordering" do
+      ev = event()
+      {:ok, first} = EventStore.insert_event(ev, "10")
+      {:ok, second} = EventStore.insert_event(ev, "10")
+
+      assert first.stream_ordering == second.stream_ordering
+    end
+  end
+
   describe "event_to_map/1" do
     # Regression: "origin" was silently dropped when rebuilding the wire map
     # from a persisted %Event{}, which broke signature verification on every

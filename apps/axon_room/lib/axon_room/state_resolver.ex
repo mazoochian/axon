@@ -55,7 +55,50 @@ defmodule AxonRoom.StateResolver do
   treats "present in some but not all input sets" as conflicted, not a
   free pass — see its own moduledoc), forcing spurious re-auth-checks
   across a whole branch's untouched state just because one unrelated
-  ancestor was unfetchable.
+  ancestor was unfetchable. This "drop the branch" leniency applies only
+  to *internal* recursion inside an already-known ancestor's own history
+  (`do_resolve_state_at/6`'s own prev_events walk) — see
+  `resolve_for_auth_check/4` below for the very different rule that
+  applies at the top level, to the PDU's own prev_events.
+
+  ## Unknown top-level ancestor: refuse, don't guess
+
+  If a *PDU's own* `prev_events` are all unresolvable (not locally known,
+  and beyond what `AxonFederation.Backfill` could close — the common case
+  is exactly one `prev_event`, so "all" and "the only one" coincide most
+  of the time), `resolve_for_auth_check/4` returns `:unresolvable` rather
+  than silently falling back to the room's current top state. Guessing
+  here is actively wrong, not just imprecise: it would auth-check (and
+  very likely accept) an event whose actual history this server does not
+  have, against state that has nothing to do with that event's real
+  ancestry. The caller (`AxonRoom.RoomProcess`) treats `:unresolvable` as
+  a rejection — the event is stored
+  (`AxonCore.EventStore.insert_rejected_event/2`) but never applied. When
+  a PDU has *several* `prev_events` and only some are unresolvable, the
+  resolvable ones are still used (same "drop the branch, don't guess an
+  empty one" rule as the internal recursion above) — that's a real,
+  DAG-grounded partial merge, not a guess against unrelated state, so it
+  isn't refused.
+
+  This does **not** affect the common paths that never reach this
+  function in the first place: `needs_resolution?/2` already short-circuits
+  to `false` (no resolution attempted, current_state used directly) for
+  the by-far-most-common case of an ordinary `/send` PDU whose single
+  `prev_event` is exactly this server's own current head, and for a
+  brand-new room's initial `m.room.create` (`prev_events == []`). A
+  `send_join`/`send_leave`/`send_knock` we're resident for normally lands
+  in that same "matches our head" case too, since the joining server built
+  it from a `/make_join` template sourced from our own state a moment
+  earlier; only a genuine race (another event landed in between) would
+  route it through real resolution, and in that case the referenced
+  ancestor is — barring a real gap — something we already have. Joining
+  *someone else's* room via `send_join` bypasses this module entirely
+  (`AxonFederation.RoomJoin` inserts the state-snapshot events directly).
+  Backfill catch-up (`AxonFederation.Backfill`) applies fetched events
+  oldest-first specifically so each one's own `prev_events` are already
+  persisted by the time it reaches this function; `:unresolvable` there
+  means catch-up itself did not actually manage to close the gap for that
+  event, which is exactly when refusing is correct.
   """
 
   require Logger
@@ -88,6 +131,21 @@ defmodule AxonRoom.StateResolver do
   `RoomProcess`'s own current head — the base case the walk bottoms out
   at in O(1) whenever a branch actually leads back to it, which is the
   common case even for a two-way merge (one branch is usually just "us").
+
+  Returns `{:ok, state}`, or `:unresolvable` if `pdu` has at least one
+  `prev_event` and *none* of them could be resolved (unknown locally,
+  or beyond the walk cap) — see the "Unknown top-level ancestor" section
+  of this module's doc for why that's a refusal rather than a guess.
+
+  Note this is deliberately narrower than "any unresolved branch is
+  refused": if `pdu` has *multiple* `prev_events` and only some are
+  unresolvable, the resolvable ones still get used (same "drop the
+  unknown branch" rule described above for `do_resolve_state_at/6`'s
+  internal recursion — consistent behavior top-to-bottom, and it's a
+  real, DAG-grounded partial merge, not a guess against unrelated state).
+  Only the case this module's doc calls "the sharpest, most concrete
+  bug" — a PDU whose ancestry resolves to *nothing* we know, so the old
+  code substituted the room's unrelated current state — is refused here.
   """
   def resolve_for_auth_check(pdu, current_state, last_event_id, room_version \\ "11") do
     prev_events = pdu["prev_events"] || []
@@ -109,10 +167,14 @@ defmodule AxonRoom.StateResolver do
         end
       end)
 
-    case Enum.uniq(branch_states) do
-      [] -> current_state
-      [single] -> single
-      many -> StateResV2.resolve(many, &EventStore.get_event_map/1, room_version)
+    case {prev_events, Enum.uniq(branch_states)} do
+      # No prev_events at all (e.g. m.room.create) — nothing to resolve,
+      # not a failure of any kind.
+      {[], []} -> {:ok, current_state}
+      # Had prev_events, but every single one was unresolvable.
+      {_, []} -> :unresolvable
+      {_, [single]} -> {:ok, single}
+      {_, many} -> {:ok, StateResV2.resolve(many, &EventStore.get_event_map/1, room_version)}
     end
   end
 

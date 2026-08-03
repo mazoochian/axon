@@ -134,13 +134,14 @@ defmodule AxonRoom.RoomProcessTest do
   end
 
   describe "apply_remote_event/2 — auth rejection" do
-    test "a PDU that fails auth is rejected and not applied" do
+    test "a PDU that fails auth is rejected, not applied, but IS stored as rejected" do
       creator = new_user("alice")
       {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost")
       {last_event_id, depth} = RoomProcess.get_position(room_id)
 
       bogus_pdu = %{
-        "event_id" => "$bogus:remote.example",
+        "event_id" => "$bogus_#{System.unique_integer([:positive])}:remote.example",
+        "room_id" => room_id,
         "type" => "m.room.message",
         "sender" => "@intruder:remote.example",
         "content" => %{"body" => "hi"},
@@ -153,6 +154,133 @@ defmodule AxonRoom.RoomProcessTest do
 
       assert RoomProcess.apply_remote_event(room_id, bogus_pdu) == {:error, :not_joined}
       assert RoomProcess.get_position(room_id) == {last_event_id, depth}
+
+      # Per spec, a rejected event is still *stored*, just never applied —
+      # not "as if it was never sent".
+      assert {:ok, stored} = AxonCore.EventStore.get_event(bogus_pdu["event_id"])
+      assert stored.rejected == true
+
+      # And excluded from /sync's event stream.
+      events = AxonCore.EventStore.get_events_since(room_id, 0, 1000)
+      refute Enum.any?(events, &(&1.event_id == bogus_pdu["event_id"]))
+    end
+  end
+
+  describe "apply_remote_event/2 — unknown ancestor (unresolvable prev_events)" do
+    test "a PDU whose only prev_event is unfetchable is refused, stored rejected, and never applied" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      remote_user = "@ghost:federated.example"
+
+      # Join remote_user first so a plain AuthRules.check against *current*
+      # state would otherwise happily accept the next event from them —
+      # isolating this test to the ancestor-resolution refusal, not an
+      # unrelated auth failure.
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      join_pdu = %{
+        "event_id" => "$ghostjoin_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      {:ok, _} = RoomProcess.apply_remote_event(room_id, join_pdu)
+      {head_before, depth_before} = RoomProcess.get_position(room_id)
+
+      missing_ancestor_id = "$never-sent-this-#{System.unique_integer([:positive])}"
+
+      orphan_pdu = %{
+        "event_id" => "$orphan_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.custom.event",
+        "sender" => remote_user,
+        "content" => %{"whatever" => "goes"},
+        "depth" => depth_before + 1,
+        "prev_events" => [missing_ancestor_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, orphan_pdu) == {:error, :unknown_ancestor}
+
+      # Not applied: room position unchanged, event absent from current state.
+      assert RoomProcess.get_position(room_id) == {head_before, depth_before}
+
+      # But stored, marked rejected, per spec.
+      assert {:ok, stored} = AxonCore.EventStore.get_event(orphan_pdu["event_id"])
+      assert stored.rejected == true
+
+      events = AxonCore.EventStore.get_events_since(room_id, 0, 1000)
+      refute Enum.any?(events, &(&1.event_id == orphan_pdu["event_id"]))
+    end
+  end
+
+  describe "apply_remote_event/2 — transitive auth rejection" do
+    test "a PDU whose auth_events reference an already-rejected event is itself rejected" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      # First, get a genuinely rejected event on the books (an unjoined
+      # sender's event fails AuthRules.check outright).
+      rejected_id = "$rejected_ancestor_#{System.unique_integer([:positive])}"
+
+      rejected_pdu = %{
+        "event_id" => rejected_id,
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => "@intruder:remote.example",
+        "content" => %{"body" => "should not land"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "remote.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, rejected_pdu) == {:error, :not_joined}
+      assert {:ok, stored} = AxonCore.EventStore.get_event(rejected_id)
+      assert stored.rejected == true
+
+      # Now send a perfectly legitimate event from the (already-joined)
+      # creator, except it lists the rejected event as one of its
+      # auth_events. Per spec this must itself be rejected, regardless of
+      # what AuthRules.check would otherwise say.
+      dependent_pdu = %{
+        "event_id" => "$dependent_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => creator,
+        "content" => %{"body" => "hi"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [rejected_id],
+        "origin" => "localhost",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, dependent_pdu) ==
+               {:error, :auth_event_rejected}
+
+      assert RoomProcess.get_position(room_id) == {last_event_id, depth}
+
+      assert {:ok, dependent_stored} = AxonCore.EventStore.get_event(dependent_pdu["event_id"])
+      assert dependent_stored.rejected == true
     end
   end
 

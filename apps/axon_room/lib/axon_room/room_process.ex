@@ -229,73 +229,108 @@ defmodule AxonRoom.RoomProcess do
   @impl true
   def handle_call({:apply_remote_event, pdu, opts}, _from, state) do
     pdu = with_prev_content(pdu, pdu["state_key"], state.current_state)
+    auth_event_ids = pdu["auth_events"] || []
 
-    # When pdu forks away from our head, `resolved_state` isn't just a
-    # disposable auth-check scratch value (that's all it was before
-    # AxonRoom.StateResolver did real DAG replay) — it's the room's actual
-    # correctly-resolved state as of this event's ancestry, and becomes the
-    # new `current_state` going forward too (see the rebase below), not
-    # just what gates AuthRules.check. Without this, current_state after a
-    # fork was whatever the old event happened to blindly overlay onto —
-    # effectively last-write-wins by local insertion order, not state
-    # resolution.
-    {resolved_state, forked?} =
-      if StateResolver.needs_resolution?(pdu, state.last_event_id) do
-        {StateResolver.resolve_for_auth_check(
-           pdu,
-           state.current_state,
-           state.last_event_id,
-           state.room_version
-         ), true}
-      else
-        {state.current_state, false}
-      end
+    cond do
+      # Transitive rejection: per spec, an event whose auth_events list
+      # references an already-rejected event must itself be rejected,
+      # regardless of what AuthRules.check would otherwise say (it never
+      # looks at auth_events at all — see AuthRules.check/3 for why that's
+      # a separate, larger gap this doesn't attempt to close). Checked
+      # before state resolution since it's cheap and, when it fires, makes
+      # the resolution walk below entirely moot.
+      EventStore.any_rejected?(auth_event_ids) ->
+        reject_and_persist(pdu, state, :auth_event_rejected)
 
-    case AuthRules.check(pdu, resolved_state, state.room_version) do
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+      true ->
+        needs_resolution? = StateResolver.needs_resolution?(pdu, state.last_event_id)
 
-      :ok ->
-        case EventStore.insert_event(pdu, state.room_version) do
-          {:ok, persisted} ->
-            event_map = EventStore.event_to_map(persisted)
-            base_state = if forked?, do: %{state | current_state: resolved_state}, else: state
-            new_state = apply_and_advance(base_state, event_map, persisted.stream_ordering)
-            # Fan out to local /sync clients. Not re-broadcast to federation
-            # by default: for an ordinary /send transaction PDU, the origin
-            # server already pushed it to every other resident server
-            # itself (relaying it further here would just duplicate that).
-            # See apply_remote_event/3's doc for the send_join/leave/knock
-            # exception, opted into via opts[:relay_exclude].
-            broadcast(state.room_id, event_map)
-
-            case Keyword.get(opts, :relay_exclude, :no_relay) do
-              :no_relay ->
-                :ok
-
-              exclude ->
-                # PDU form, not client form — see the sibling call in
-                # handle_call({:send_event, ...}) above.
-                broadcast_for_federation(
-                  state.room_id,
-                  EventStore.event_to_pdu(persisted),
-                  new_state.current_state,
-                  exclude
-                )
-            end
-
-            AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
-
-            Phoenix.PubSub.broadcast(
-              @pubsub,
-              "all_events",
-              {:new_event, state.room_id, event_map}
+        # When pdu forks away from our head, `resolved_state` isn't just a
+        # disposable auth-check scratch value (that's all it was before
+        # AxonRoom.StateResolver did real DAG replay) — it's the room's actual
+        # correctly-resolved state as of this event's ancestry, and becomes the
+        # new `current_state` going forward too (see the rebase below), not
+        # just what gates AuthRules.check. Without this, current_state after a
+        # fork was whatever the old event happened to blindly overlay onto —
+        # effectively last-write-wins by local insertion order, not state
+        # resolution.
+        resolution =
+          if needs_resolution? do
+            StateResolver.resolve_for_auth_check(
+              pdu,
+              state.current_state,
+              state.last_event_id,
+              state.room_version
             )
+          else
+            {:ok, state.current_state}
+          end
 
-            {:reply, {:ok, event_map["event_id"]}, new_state}
+        case resolution do
+          # One of pdu's own prev_events couldn't be resolved (unknown
+          # locally, even after AxonFederation.Backfill had a chance to
+          # close the gap before this call). We cannot prove this event is
+          # authorized against its real ancestry, so refuse rather than
+          # guess by auth-checking against unrelated current state — see
+          # AxonRoom.StateResolver's moduledoc.
+          :unresolvable ->
+            reject_and_persist(pdu, state, :unknown_ancestor)
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
+          {:ok, resolved_state} ->
+            forked? = needs_resolution?
+
+            case AuthRules.check(pdu, resolved_state, state.room_version) do
+              {:error, reason} ->
+                reject_and_persist(pdu, state, reason)
+
+              :ok ->
+                case EventStore.insert_event(pdu, state.room_version) do
+                  {:ok, persisted} ->
+                    event_map = EventStore.event_to_map(persisted)
+
+                    base_state =
+                      if forked?, do: %{state | current_state: resolved_state}, else: state
+
+                    new_state =
+                      apply_and_advance(base_state, event_map, persisted.stream_ordering)
+
+                    # Fan out to local /sync clients. Not re-broadcast to federation
+                    # by default: for an ordinary /send transaction PDU, the origin
+                    # server already pushed it to every other resident server
+                    # itself (relaying it further here would just duplicate that).
+                    # See apply_remote_event/3's doc for the send_join/leave/knock
+                    # exception, opted into via opts[:relay_exclude].
+                    broadcast(state.room_id, event_map)
+
+                    case Keyword.get(opts, :relay_exclude, :no_relay) do
+                      :no_relay ->
+                        :ok
+
+                      exclude ->
+                        # PDU form, not client form — see the sibling call in
+                        # handle_call({:send_event, ...}) above.
+                        broadcast_for_federation(
+                          state.room_id,
+                          EventStore.event_to_pdu(persisted),
+                          new_state.current_state,
+                          exclude
+                        )
+                    end
+
+                    AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
+
+                    Phoenix.PubSub.broadcast(
+                      @pubsub,
+                      "all_events",
+                      {:new_event, state.room_id, event_map}
+                    )
+
+                    {:reply, {:ok, event_map["event_id"]}, new_state}
+
+                  {:error, reason} ->
+                    {:reply, {:error, reason}, state}
+                end
+            end
         end
     end
   end
@@ -333,6 +368,29 @@ defmodule AxonRoom.RoomProcess do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  # Persists `pdu` as **rejected**: stored (so GET /event/{id}, /event_auth,
+  # and a later "unreject" via EventStore.insert_event/2 all still work) but
+  # never applied — no current_state/current_room_state/room_memberships
+  # change, no advance of last_event_id/depth, no /sync broadcast, no push,
+  # no federation relay. Spec: a rejected event is not applied to room
+  # state, not returned by /state or /state_ids or state resolution, and
+  # not sent to clients. `state` (the GenServer state) is returned
+  # unchanged — this event never becomes part of this room's live view.
+  defp reject_and_persist(pdu, state, reason) do
+    case EventStore.insert_rejected_event(pdu, state.room_version) do
+      {:ok, _persisted} ->
+        Logger.debug("Rejected PDU #{pdu["event_id"]} in #{state.room_id}: #{inspect(reason)}")
+
+      {:error, insert_reason} ->
+        Logger.warning(
+          "Failed to persist rejected PDU #{pdu["event_id"]} in #{state.room_id}: " <>
+            "#{inspect(insert_reason)} (original rejection reason: #{inspect(reason)})"
+        )
+    end
+
+    {:reply, {:error, reason}, state}
+  end
 
   defp load_room(room_id) do
     case EventStore.get_room(room_id) do
