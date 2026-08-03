@@ -140,7 +140,20 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
     update_state(port, fn s -> put_in(s.overrides[{method, path_matcher}], {status, body}) end)
   end
 
-  @doc "All requests received so far: `%{method, path, headers, body}` maps, oldest first."
+  @doc """
+  Like `put_response/4`, but for a raw (non-JSON-encoded) response body with
+  an explicit Content-Type — needed for endpoints like the federation media
+  download/thumbnail routes, whose 200 response is `multipart/mixed`, not JSON.
+  """
+  def put_raw_response(port, {method, path_matcher}, status, content_type, body) do
+    method = String.upcase(to_string(method))
+
+    update_state(port, fn s ->
+      put_in(s.overrides[{method, path_matcher}], {:raw, status, content_type, body})
+    end)
+  end
+
+  @doc "All requests received so far: `%{method, path, query_string, headers, body}` maps, oldest first."
   def requests(port), do: Enum.reverse(state(port).requests)
 
   def clear_requests(port), do: update_state(port, fn s -> %{s | requests: []} end)
@@ -224,6 +237,7 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
     log_request(conn)
 
     case find_override(conn) do
+      {:raw, status, content_type, body} -> send_raw(conn, status, content_type, body)
       {status, body} -> send_json(conn, status, body)
       nil -> handle_builtin(conn)
     end
@@ -260,6 +274,7 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
     entry = %{
       method: conn.method,
       path: conn.request_path,
+      query_string: conn.query_string,
       headers: conn.req_headers,
       body: conn.body_params
     }
@@ -294,5 +309,11 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
     conn
     |> Plug.Conn.put_resp_content_type("application/json")
     |> Plug.Conn.send_resp(status, Jason.encode!(body))
+  end
+
+  defp send_raw(conn, status, content_type, body) do
+    conn
+    |> Plug.Conn.put_resp_header("content-type", content_type)
+    |> Plug.Conn.send_resp(status, body)
   end
 end

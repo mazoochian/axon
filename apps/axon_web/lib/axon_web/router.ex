@@ -265,6 +265,10 @@ defmodule AxonWeb.Router do
     # Knock — restricted/knock join rules (MSC2403)
     get("/v1/make_knock/:room_id/:user_id", FederationController, :make_knock)
     put("/v1/send_knock/:room_id/:event_id", FederationController, :send_knock)
+
+    # Authenticated media (MSC3916 / Matrix 1.11) — multipart/mixed response
+    get("/v1/media/download/:media_id", MediaController, :federation_download)
+    get("/v1/media/thumbnail/:media_id", MediaController, :federation_thumbnail)
   end
 
   scope "/_matrix/key", AxonWeb do

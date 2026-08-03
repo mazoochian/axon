@@ -165,48 +165,145 @@ defmodule AxonWeb.MediaController do
     end
   end
 
+  # Tries the authenticated MSC3916/Matrix-1.11 federation media endpoint
+  # first (AxonFederation.MediaFetch falls back to the deprecated
+  # unauthenticated one itself on an explicit M_UNRECOGNIZED 404) — this
+  # replaces a previous implementation that always spoke the deprecated
+  # endpoint directly to a hardcoded `https://origin_server/` (bypassing
+  # federation TLS port resolution and X-Matrix signing entirely, so it
+  # only ever worked against a server reachable on port 443 with no auth
+  # required — never true for another axon/Complement instance, and
+  # increasingly not true for any spec-compliant server as the deprecated
+  # endpoint is phased out).
   defp proxy_remote(conn, origin_server, media_id) do
-    url = "https://#{origin_server}/_matrix/media/v3/download/#{origin_server}/#{media_id}"
-    proxy_get(conn, url)
-  end
-
-  defp proxy_remote_thumbnail(conn, origin_server, media_id, params) do
-    query = URI.encode_query(Map.take(params, ["width", "height", "method", "animated"]))
-
-    url =
-      "https://#{origin_server}/_matrix/media/v3/thumbnail/#{origin_server}/#{media_id}?#{query}"
-
-    proxy_get(conn, url)
-  end
-
-  defp proxy_get(conn, url) do
-    req = Finch.build(:get, url)
-
-    case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do
-      {:ok, %Finch.Response{status: 200, body: body, headers: headers}} ->
-        content_type =
-          headers
-          |> Enum.find(fn {k, _} -> String.downcase(k) == "content-type" end)
-          |> case do
-            {_, v} -> v
-            nil -> "application/octet-stream"
-          end
-
+    case AxonFederation.MediaFetch.download(origin_server, media_id) do
+      {:ok, content_type, data} ->
         conn
         |> put_resp_content_type(content_type)
-        |> send_resp(200, body)
+        |> send_resp(200, data)
 
-      {:ok, %Finch.Response{status: status}} when status in [404, 403] ->
+      {:error, :not_found} ->
         conn
         |> put_status(404)
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Remote media not found"})
 
       {:error, reason} ->
-        Logger.warning("Remote media fetch failed for #{url}: #{inspect(reason)}")
+        Logger.warning("Remote media fetch failed for #{origin_server}/#{media_id}: #{inspect(reason)}")
 
         conn
         |> put_status(502)
         |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to fetch remote media"})
     end
+  end
+
+  defp proxy_remote_thumbnail(conn, origin_server, media_id, params) do
+    query = Map.take(params, ["width", "height", "method", "animated"])
+
+    case AxonFederation.MediaFetch.thumbnail(origin_server, media_id, query) do
+      {:ok, content_type, data} ->
+        conn
+        |> put_resp_content_type(content_type)
+        |> send_resp(200, data)
+
+      {:error, :not_found} ->
+        conn
+        |> put_status(404)
+        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Remote media not found"})
+
+      {:error, reason} ->
+        Logger.warning(
+          "Remote thumbnail fetch failed for #{origin_server}/#{media_id}: #{inspect(reason)}"
+        )
+
+        conn
+        |> put_status(502)
+        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to fetch remote media"})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Federation-facing (MSC3916/Matrix 1.11): GET /_matrix/federation/v1/media/{download,thumbnail}
+  # The 200 response is multipart/mixed: an application/json metadata part
+  # (always {} — axon has no per-media metadata beyond content-type today)
+  # followed by the media bytes.
+  # ---------------------------------------------------------------------------
+
+  def federation_download(conn, %{"media_id" => media_id}) do
+    case Store.download(media_id) do
+      {:ok, {content_type, data}} ->
+        send_multipart_media(conn, content_type, data)
+
+      {:error, :not_found} ->
+        media_not_found(conn)
+    end
+  end
+
+  def federation_thumbnail(conn, %{"media_id" => media_id} = params) do
+    case Store.get_meta(media_id) do
+      %{content_type: content_type, storage_path: path} when is_binary(path) ->
+        case Thumbnailer.generate(
+               media_id,
+               path,
+               content_type,
+               params["width"],
+               params["height"],
+               params["method"]
+             ) do
+          {:ok, {ct, data}} ->
+            send_multipart_media(conn, ct, data)
+
+          {:error, :unsupported_content_type} ->
+            case Store.download(media_id) do
+              {:ok, {ct, data}} -> send_multipart_media(conn, ct, data)
+              {:error, :not_found} -> media_not_found(conn)
+            end
+
+          {:error, reason} ->
+            Logger.error("Federation thumbnail generation failed for #{media_id}: #{inspect(reason)}")
+
+            conn
+            |> put_status(502)
+            |> json(%{"errcode" => "M_UNKNOWN", "error" => "Thumbnail generation failed"})
+        end
+
+      _ ->
+        media_not_found(conn)
+    end
+  end
+
+  defp media_not_found(conn) do
+    conn
+    |> put_status(404)
+    |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+  end
+
+  defp send_multipart_media(conn, content_type, data) do
+    boundary = "axonmedia" <> (16 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower))
+
+    body =
+      IO.iodata_to_binary([
+        "--",
+        boundary,
+        "\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "{}",
+        "\r\n",
+        "--",
+        boundary,
+        "\r\n",
+        "Content-Type: ",
+        content_type,
+        "\r\n",
+        "Content-Disposition: inline\r\n\r\n",
+        data,
+        "\r\n",
+        "--",
+        boundary,
+        "--\r\n"
+      ])
+
+    conn
+    |> put_resp_header("content-type", "multipart/mixed; boundary=#{boundary}")
+    |> send_resp(200, body)
   end
 end

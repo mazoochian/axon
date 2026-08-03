@@ -75,6 +75,34 @@ defmodule AxonFederation.HttpClient do
     execute(req)
   end
 
+  @doc """
+  GET request to a remote server's federation endpoint, returning the raw
+  response (status/headers/body) without JSON-decoding — for endpoints like
+  `/_matrix/federation/v1/media/{download,thumbnail}` whose 200 response is
+  `multipart/mixed`, not JSON. `path` should include any query string
+  verbatim: it's both the URL suffix and (per the federation request
+  signing spec) part of the signed request-target, exactly like `get/2`.
+  """
+  def get_raw(server_name, path) do
+    url = build_url(server_name, path)
+    auth = build_auth_header(server_name, "GET", path, nil)
+
+    req =
+      Finch.build(:get, url, [
+        {"authorization", auth},
+        {"user-agent", @user_agent}
+      ])
+
+    case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do
+      {:ok, %{status: status, headers: headers, body: body}} ->
+        {:ok, %{status: status, headers: headers, body: body}}
+
+      {:error, reason} ->
+        Logger.warning("Federation HTTP error: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # X-Matrix Authorization header
   # ---------------------------------------------------------------------------
