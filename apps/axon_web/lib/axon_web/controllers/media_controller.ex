@@ -26,12 +26,15 @@ defmodule AxonWeb.MediaController do
     # Strip any charset suffix (e.g. "image/png; charset=utf-8")
     content_type = content_type |> String.split(";") |> hd() |> String.trim()
 
-    filename = params["filename"]
-    _ = filename
+    # ?filename= is a query param per spec, not a body field — persisted so
+    # a later download can return it via Content-Disposition (spec: "If the
+    # upload was made with a filename, this header MUST contain the same
+    # filename"). Previously read into a local and immediately discarded.
+    filename = non_empty(params["filename"])
 
     case Plug.Conn.read_body(conn, length: 100_000_000) do
       {:ok, body, _conn} when byte_size(body) > 0 ->
-        case Store.upload(user_id, content_type, body, server_name) do
+        case Store.upload(user_id, content_type, body, server_name, filename) do
           {:ok, media_id} ->
             mxc_uri = "mxc://#{server_name}/#{media_id}"
             json(conn, %{"content_uri" => mxc_uri})
@@ -65,13 +68,14 @@ defmodule AxonWeb.MediaController do
 
   # GET /_matrix/media/v3/download/:server_name/:media_id
   # GET /_matrix/media/v3/download/:server_name/:media_id/:filename
-  def download(conn, %{"server_name" => origin_server, "media_id" => media_id} = _params) do
+  def download(conn, %{"server_name" => origin_server, "media_id" => media_id} = params) do
     local_server = Application.fetch_env!(:axon_web, :server_name)
+    override_filename = non_empty(params["filename"])
 
     if origin_server == local_server do
-      serve_local(conn, media_id)
+      serve_local(conn, media_id, override_filename)
     else
-      proxy_remote(conn, origin_server, media_id)
+      proxy_remote(conn, origin_server, media_id, override_filename)
     end
   end
 
@@ -114,12 +118,15 @@ defmodule AxonWeb.MediaController do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp serve_local(conn, media_id) do
+  defp serve_local(conn, media_id, override_filename \\ nil) do
     case Store.download(media_id) do
-      {:ok, {content_type, data}} ->
+      {:ok, %{content_type: content_type, data: data, filename: stored_filename}} ->
         conn
         |> put_resp_content_type(content_type)
-        |> put_resp_header("content-disposition", "inline")
+        |> put_resp_header(
+          "content-disposition",
+          content_disposition(content_type, override_filename || stored_filename)
+        )
         |> send_resp(200, data)
 
       {:error, :not_found} ->
@@ -175,11 +182,15 @@ defmodule AxonWeb.MediaController do
   # required — never true for another axon/Complement instance, and
   # increasingly not true for any spec-compliant server as the deprecated
   # endpoint is phased out).
-  defp proxy_remote(conn, origin_server, media_id) do
+  defp proxy_remote(conn, origin_server, media_id, override_filename) do
     case AxonFederation.MediaFetch.download(origin_server, media_id) do
-      {:ok, content_type, data} ->
+      {:ok, content_type, data, remote_filename} ->
         conn
         |> put_resp_content_type(content_type)
+        |> put_resp_header(
+          "content-disposition",
+          content_disposition(content_type, override_filename || remote_filename)
+        )
         |> send_resp(200, data)
 
       {:error, :not_found} ->
@@ -202,7 +213,7 @@ defmodule AxonWeb.MediaController do
     query = Map.take(params, ["width", "height", "method", "animated"])
 
     case AxonFederation.MediaFetch.thumbnail(origin_server, media_id, query) do
-      {:ok, content_type, data} ->
+      {:ok, content_type, data, _filename} ->
         conn
         |> put_resp_content_type(content_type)
         |> send_resp(200, data)
@@ -232,8 +243,8 @@ defmodule AxonWeb.MediaController do
 
   def federation_download(conn, %{"media_id" => media_id}) do
     case Store.download(media_id) do
-      {:ok, {content_type, data}} ->
-        send_multipart_media(conn, content_type, data)
+      {:ok, %{content_type: content_type, data: data, filename: filename}} ->
+        send_multipart_media(conn, content_type, data, filename)
 
       {:error, :not_found} ->
         media_not_found(conn)
@@ -252,12 +263,15 @@ defmodule AxonWeb.MediaController do
                params["method"]
              ) do
           {:ok, {ct, data}} ->
-            send_multipart_media(conn, ct, data)
+            send_multipart_media(conn, ct, data, nil)
 
           {:error, :unsupported_content_type} ->
             case Store.download(media_id) do
-              {:ok, {ct, data}} -> send_multipart_media(conn, ct, data)
-              {:error, :not_found} -> media_not_found(conn)
+              {:ok, %{content_type: ct, data: data, filename: filename}} ->
+                send_multipart_media(conn, ct, data, filename)
+
+              {:error, :not_found} ->
+                media_not_found(conn)
             end
 
           {:error, reason} ->
@@ -281,7 +295,7 @@ defmodule AxonWeb.MediaController do
     |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
   end
 
-  defp send_multipart_media(conn, content_type, data) do
+  defp send_multipart_media(conn, content_type, data, filename) do
     boundary = "axonmedia" <> (16 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower))
 
     body =
@@ -298,7 +312,9 @@ defmodule AxonWeb.MediaController do
         "Content-Type: ",
         content_type,
         "\r\n",
-        "Content-Disposition: inline\r\n\r\n",
+        "Content-Disposition: ",
+        content_disposition(content_type, filename),
+        "\r\n\r\n",
         data,
         "\r\n",
         "--",
@@ -310,4 +326,64 @@ defmodule AxonWeb.MediaController do
     |> put_resp_header("content-type", "multipart/mixed; boundary=#{boundary}")
     |> send_resp(200, body)
   end
+
+  # ---------------------------------------------------------------------------
+  # Content-Disposition (spec: "Serving inline content" + media download's
+  # 200-response headers)
+  # ---------------------------------------------------------------------------
+
+  # Content-Types the spec allows serving as `inline` without inviting XSS
+  # from a maliciously-uploaded HTML/SVG/etc. file being rendered as such —
+  # everything else gets `attachment` regardless of what the uploader
+  # claimed its type was.
+  @inline_safe_content_types ~w(
+    text/css text/plain text/csv application/json application/ld+json
+    image/jpeg image/gif image/png image/apng image/webp image/avif
+    video/mp4 video/webm video/ogg video/quicktime
+    audio/mp4 audio/webm audio/aac audio/mpeg audio/ogg
+    audio/wave audio/wav audio/x-wav audio/x-pn-wav audio/flac audio/x-flac
+  )
+
+  defp content_disposition(content_type, filename) do
+    disposition = if inline_safe?(content_type), do: "inline", else: "attachment"
+
+    case non_empty(filename) do
+      nil -> disposition
+      name -> "#{disposition}; #{filename_param(name)}"
+    end
+  end
+
+  defp inline_safe?(content_type) do
+    base_type =
+      content_type
+      |> to_string()
+      |> String.split(";")
+      |> hd()
+      |> String.trim()
+      |> String.downcase()
+
+    base_type in @inline_safe_content_types
+  end
+
+  # Plain quoted-string for an ASCII-safe name (handles embedded spaces/
+  # semicolons/etc. fine once quoted — just needs its own quotes/backslashes
+  # escaped); RFC 6266's filename*=UTF-8''<pct-encoded> extended form
+  # otherwise, since a raw non-ASCII byte isn't valid inside an HTTP header
+  # quoted-string.
+  defp filename_param(name) do
+    if ascii_only?(name) and not String.contains?(name, ["\r", "\n"]) do
+      ~s(filename="#{escape_quoted(name)}")
+    else
+      ~s(filename*=UTF-8''#{URI.encode(name, &URI.char_unreserved?/1)})
+    end
+  end
+
+  defp ascii_only?(name), do: name |> String.to_charlist() |> Enum.all?(&(&1 < 128))
+
+  defp escape_quoted(name),
+    do: name |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
+
+  defp non_empty(nil), do: nil
+  defp non_empty(""), do: nil
+  defp non_empty(str), do: str
 end

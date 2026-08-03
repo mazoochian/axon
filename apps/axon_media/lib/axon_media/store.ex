@@ -16,8 +16,15 @@ defmodule AxonMedia.Store do
     Application.get_env(:axon_media, :storage_path, Path.join(System.tmp_dir!(), "axon_media"))
   end
 
-  @doc "Upload binary data. Returns {:ok, media_id} or {:error, reason}."
-  def upload(user_id, content_type, data, server_name) do
+  @doc """
+  Upload binary data. `filename`, if given, is the client-supplied
+  `?filename=` upload param — persisted so a later download can return it
+  in `Content-Disposition` per spec ("If the upload was made with a
+  filename, this header MUST contain the same filename").
+
+  Returns {:ok, media_id} or {:error, reason}.
+  """
+  def upload(user_id, content_type, data, server_name, filename \\ nil) do
     media_id = :crypto.strong_rand_bytes(@id_bytes) |> Base.url_encode64(padding: false)
     dir = base_dir()
     File.mkdir_p!(dir)
@@ -32,6 +39,7 @@ defmodule AxonMedia.Store do
           file_size: byte_size(data),
           storage_path: path,
           uploader: user_id,
+          filename: filename,
           created_at: DateTime.utc_now(:microsecond)
         }
       ])
@@ -40,7 +48,10 @@ defmodule AxonMedia.Store do
     end
   end
 
-  @doc "Download local media. Returns {:ok, {content_type, binary}} or {:error, :not_found}."
+  @doc """
+  Download local media. Returns `{:ok, %{content_type:, data:, filename:}}`
+  (filename is `nil` when the upload didn't supply one) or `{:error, :not_found}`.
+  """
   def download(media_id) do
     case Repo.one(
            from(m in "media",
@@ -48,6 +59,7 @@ defmodule AxonMedia.Store do
              select: %{
                content_type: m.content_type,
                storage_path: m.storage_path,
+               filename: m.filename,
                quarantined: m.quarantined
              }
            )
@@ -64,9 +76,9 @@ defmodule AxonMedia.Store do
       %{storage_path: nil} ->
         {:error, :not_found}
 
-      %{content_type: ct, storage_path: path} ->
+      %{content_type: ct, storage_path: path, filename: filename} ->
         case File.read(path) do
-          {:ok, data} -> {:ok, {ct, data}}
+          {:ok, data} -> {:ok, %{content_type: ct, data: data, filename: filename}}
           {:error, _} -> {:error, :not_found}
         end
     end
@@ -80,7 +92,8 @@ defmodule AxonMedia.Store do
         select: %{
           content_type: m.content_type,
           origin_server: m.origin_server,
-          storage_path: m.storage_path
+          storage_path: m.storage_path,
+          filename: m.filename
         }
       )
     )

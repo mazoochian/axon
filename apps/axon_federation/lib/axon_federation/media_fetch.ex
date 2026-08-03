@@ -19,7 +19,11 @@ defmodule AxonFederation.MediaFetch do
 
   @user_agent "Axon/1.0"
 
-  @doc "Fetch the original media. Returns `{:ok, content_type, body}` or `{:error, reason}`."
+  @doc """
+  Fetch the original media. Returns `{:ok, content_type, body, filename}`
+  (filename is `nil` if the remote didn't supply one via
+  `Content-Disposition`) or `{:error, reason}`.
+  """
   def download(server_name, media_id) do
     fetch(
       server_name,
@@ -33,7 +37,7 @@ defmodule AxonFederation.MediaFetch do
     )
   end
 
-  @doc "Fetch a thumbnail. Returns `{:ok, content_type, body}` or `{:error, reason}`."
+  @doc "Fetch a thumbnail. Returns `{:ok, content_type, body, filename}` or `{:error, reason}`."
   def thumbnail(server_name, media_id, query) when is_map(query) do
     qs = URI.encode_query(query)
 
@@ -79,10 +83,11 @@ defmodule AxonFederation.MediaFetch do
     with {:ok, boundary} <- content_type_boundary(headers),
          [_json_part, {file_headers, file_body}] <- split_parts(body, boundary) do
       content_type = Map.get(file_headers, "content-type", "application/octet-stream")
+      filename = filename_from_content_disposition(file_headers["content-disposition"])
 
       case Map.get(file_headers, "location") do
-        nil -> {:ok, content_type, file_body}
-        location -> follow_location(location)
+        nil -> {:ok, content_type, file_body, filename}
+        location -> follow_location(location, filename)
       end
     else
       _ -> {:error, :bad_multipart}
@@ -155,10 +160,34 @@ defmodule AxonFederation.MediaFetch do
     end)
   end
 
+  # Per spec: "the remote server's filename in the Content-Disposition
+  # header is used as the filename instead" — extracts it from either the
+  # RFC 6266 extended form (filename*=UTF-8''<pct-encoded>, preferred,
+  # required for non-ASCII names) or the plain quoted-string form.
+  defp filename_from_content_disposition(nil), do: nil
+
+  defp filename_from_content_disposition(value) do
+    cond do
+      m = Regex.run(~r/filename\*\s*=\s*UTF-8''([^;]+)/i, value) ->
+        m |> Enum.at(1) |> URI.decode()
+
+      m = Regex.run(~r/filename\s*=\s*"((?:[^"\\]|\\.)*)"/i, value) ->
+        m |> Enum.at(1) |> String.replace(~r/\\(.)/, "\\1")
+
+      m = Regex.run(~r/filename\s*=\s*([^;]+)/i, value) ->
+        m |> Enum.at(1) |> String.trim()
+
+      true ->
+        nil
+    end
+  end
+
   # Per spec: "servers SHOULD NOT cache the URL" — always re-fetched, no
   # X-Matrix auth added (it's a plain URL the remote handed us, not one of
-  # its own federation endpoints).
-  defp follow_location(url) do
+  # its own federation endpoints). `filename` is the one already parsed
+  # from the multipart file part's own Content-Disposition — the redirect
+  # target's response isn't required to (and by spec, need not) repeat it.
+  defp follow_location(url, filename) do
     req = Finch.build(:get, url, [{"user-agent", @user_agent}])
 
     case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do
@@ -171,7 +200,7 @@ defmodule AxonFederation.MediaFetch do
             nil -> "application/octet-stream"
           end
 
-        {:ok, content_type, body}
+        {:ok, content_type, body, filename}
 
       {:ok, %{status: status}} ->
         {:error, {:http_error, status}}
@@ -199,7 +228,15 @@ defmodule AxonFederation.MediaFetch do
             nil -> "application/octet-stream"
           end
 
-        {:ok, content_type, body}
+        filename =
+          headers
+          |> Enum.find(fn {k, _} -> String.downcase(k) == "content-disposition" end)
+          |> case do
+            {_, v} -> filename_from_content_disposition(v)
+            nil -> nil
+          end
+
+        {:ok, content_type, body, filename}
 
       {:ok, %{status: status}} when status in [403, 404] ->
         {:error, :not_found}

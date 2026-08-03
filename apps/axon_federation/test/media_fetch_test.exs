@@ -64,7 +64,58 @@ defmodule AxonFederation.MediaFetchTest do
       body
     )
 
-    assert {:ok, "image/png", "fake-png-bytes"} =
+    assert {:ok, "image/png", "fake-png-bytes", nil} =
+             MediaFetch.download(server_name, "some-media-id")
+  end
+
+  test "download/2 extracts the filename from an ASCII Content-Disposition", %{
+    port: port,
+    server_name: server_name
+  } do
+    body =
+      multipart_body(
+        "abc123",
+        "image/png",
+        "fake-png-bytes",
+        ~s(Content-Disposition: attachment; filename="ascii.png"\r\n)
+      )
+
+    FakeRemoteMatrixServer.put_raw_response(
+      port,
+      {"GET", ~r{^/_matrix/federation/v1/media/download/}},
+      200,
+      "multipart/mixed; boundary=abc123",
+      body
+    )
+
+    assert {:ok, "image/png", "fake-png-bytes", "ascii.png"} =
+             MediaFetch.download(server_name, "some-media-id")
+  end
+
+  test "download/2 extracts a Unicode filename via the RFC 6266 extended form", %{
+    port: port,
+    server_name: server_name
+  } do
+    unicode_name = "☕.png"
+    encoded = URI.encode(unicode_name, &URI.char_unreserved?/1)
+
+    body =
+      multipart_body(
+        "abc123",
+        "image/png",
+        "fake-png-bytes",
+        "Content-Disposition: attachment; filename*=UTF-8''#{encoded}\r\n"
+      )
+
+    FakeRemoteMatrixServer.put_raw_response(
+      port,
+      {"GET", ~r{^/_matrix/federation/v1/media/download/}},
+      200,
+      "multipart/mixed; boundary=abc123",
+      body
+    )
+
+    assert {:ok, "image/png", "fake-png-bytes", ^unicode_name} =
              MediaFetch.download(server_name, "some-media-id")
   end
 
@@ -87,7 +138,7 @@ defmodule AxonFederation.MediaFetchTest do
       "legacy-bytes"
     )
 
-    assert {:ok, "text/plain", "legacy-bytes"} =
+    assert {:ok, "text/plain", "legacy-bytes", nil} =
              MediaFetch.download(server_name, "some-media-id")
 
     [req] =
@@ -148,7 +199,7 @@ defmodule AxonFederation.MediaFetchTest do
       body
     )
 
-    assert {:ok, "image/jpeg", "redirected-bytes"} =
+    assert {:ok, "image/jpeg", "redirected-bytes", nil} =
              MediaFetch.download(server_name, "some-media-id")
   end
 
@@ -169,7 +220,7 @@ defmodule AxonFederation.MediaFetchTest do
       "thumb-bytes"
     )
 
-    assert {:ok, "image/png", "thumb-bytes"} =
+    assert {:ok, "image/png", "thumb-bytes", nil} =
              MediaFetch.thumbnail(server_name, "some-media-id", %{
                "width" => "32",
                "height" => "32"

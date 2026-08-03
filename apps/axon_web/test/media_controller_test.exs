@@ -115,6 +115,111 @@ defmodule AxonWeb.MediaControllerTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Content-Disposition / filename (previously: ?filename= was read at
+  # upload time and immediately discarded, and download always hardcoded
+  # `Content-Disposition: inline` with no filename at all, regardless of
+  # what was uploaded or what content-type is being served)
+  # ---------------------------------------------------------------------------
+
+  describe "Content-Disposition / filename" do
+    defp upload_with_filename(alice, filename, content_type \\ "image/png") do
+      conn =
+        authed(alice.token)
+        |> put_req_header("content-type", content_type)
+        |> post("/_matrix/client/v3/media/upload?filename=#{URI.encode_www_form(filename)}", "x")
+
+      assert conn.status == 200
+      decode(conn)["content_uri"] |> String.split("/") |> List.last()
+    end
+
+    test "an uploaded filename round-trips via Content-Disposition on download" do
+      alice = register("mediafn_#{System.unique_integer([:positive])}")
+      media_id = upload_with_filename(alice, "ascii name.png")
+
+      conn = build_conn() |> get("/_matrix/media/v3/download/localhost/#{media_id}")
+
+      assert conn.status == 200
+      [cd] = get_resp_header(conn, "content-disposition")
+      assert cd == ~s(inline; filename="ascii name.png")
+    end
+
+    test "a filename with semicolons is properly quoted, not treated as a param separator" do
+      alice = register("mediafn_#{System.unique_integer([:positive])}")
+      media_id = upload_with_filename(alice, "name;with;semicolons")
+
+      conn = build_conn() |> get("/_matrix/media/v3/download/localhost/#{media_id}")
+
+      assert conn.status == 200
+      [cd] = get_resp_header(conn, "content-disposition")
+      assert cd == ~s(inline; filename="name;with;semicolons")
+    end
+
+    test "a Unicode filename is served via the RFC 6266 filename* form" do
+      alice = register("mediafn_#{System.unique_integer([:positive])}")
+      # duck emoji, matches Complement's media_filename_test.go unicodeFileName
+      unicode_name = "\u{1F994}"
+      media_id = upload_with_filename(alice, unicode_name)
+
+      conn = build_conn() |> get("/_matrix/media/v3/download/localhost/#{media_id}")
+
+      assert conn.status == 200
+      [cd] = get_resp_header(conn, "content-disposition")
+
+      expected_encoded = URI.encode(unicode_name, &URI.char_unreserved?/1)
+      assert cd == "inline; filename*=UTF-8''#{expected_encoded}"
+
+      # ...and it decodes back to the exact original string, round-tripping
+      # through the same percent-decoding a real client would do.
+      ["filename*=UTF-8''" <> encoded] = String.split(cd, "; ", parts: 2) |> tl()
+      assert URI.decode(encoded) == unicode_name
+    end
+
+    test "an override filename in the URL path wins over the stored one" do
+      alice = register("mediafn_#{System.unique_integer([:positive])}")
+      media_id = upload_with_filename(alice, "original.png")
+
+      conn = build_conn() |> get("/_matrix/media/v3/download/localhost/#{media_id}/renamed.png")
+
+      assert conn.status == 200
+      [cd] = get_resp_header(conn, "content-disposition")
+      assert cd == ~s(inline; filename="renamed.png")
+    end
+
+    test "no filename at all omits the filename param entirely" do
+      alice = register("mediafn_#{System.unique_integer([:positive])}")
+
+      upload_conn =
+        authed(alice.token)
+        |> put_req_header("content-type", "image/png")
+        |> post("/_matrix/client/v3/media/upload", "x")
+
+      media_id = decode(upload_conn)["content_uri"] |> String.split("/") |> List.last()
+      conn = build_conn() |> get("/_matrix/media/v3/download/localhost/#{media_id}")
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "content-disposition") == ["inline"]
+    end
+
+    test "an unsafe content-type is served as attachment, a safe one as inline" do
+      alice = register("mediafn_#{System.unique_integer([:positive])}")
+
+      safe_id = upload_with_filename(alice, "safe.png", "image/png")
+      unsafe_id = upload_with_filename(alice, "unsafe.svg", "image/svg+xml")
+
+      safe_conn = build_conn() |> get("/_matrix/media/v3/download/localhost/#{safe_id}")
+      unsafe_conn = build_conn() |> get("/_matrix/media/v3/download/localhost/#{unsafe_id}")
+
+      assert get_resp_header(safe_conn, "content-disposition") == [
+               ~s(inline; filename="safe.png")
+             ]
+
+      assert get_resp_header(unsafe_conn, "content-disposition") == [
+               ~s(attachment; filename="unsafe.svg")
+             ]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Federation media (MSC3916 / Matrix 1.11): authenticated, multipart/mixed
   # ---------------------------------------------------------------------------
 

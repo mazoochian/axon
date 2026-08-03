@@ -33,7 +33,16 @@ defmodule AxonMedia.StoreTest do
     assert {:ok, media_id} = Store.upload("@alice:localhost", "text/plain", data, "localhost")
     assert is_binary(media_id)
 
-    assert {:ok, {"text/plain", ^data}} = Store.download(media_id)
+    assert {:ok, %{content_type: "text/plain", data: ^data, filename: nil}} =
+             Store.download(media_id)
+  end
+
+  test "an upload with a filename persists and round-trips it through download and get_meta" do
+    {:ok, media_id} =
+      Store.upload("@alice:localhost", "text/plain", "content", "localhost", "notes.txt")
+
+    assert {:ok, %{filename: "notes.txt"}} = Store.download(media_id)
+    assert %{filename: "notes.txt"} = Store.get_meta(media_id)
   end
 
   test "the uploaded file actually lands on disk under base_dir", %{tmp: tmp} do
