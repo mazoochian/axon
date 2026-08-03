@@ -107,6 +107,36 @@ defmodule AxonWeb.FederationControllerTest do
     {:ok, _} = RoomProcess.apply_remote_event(room_id, pdu)
   end
 
+  # Complement's srv.MustJoinRoom does a *real* make_join -> send_join HTTP
+  # round trip (federation/server.go), not a direct RoomProcess injection —
+  # used here so the send_* validation cluster's setup matches Complement's
+  # exactly, in case the divergence turns out to be in that round trip
+  # itself rather than in the later junk-event rejections.
+  defp join_via_http(room_id, member_user_id) do
+    make_join_conn =
+      signed_get(
+        "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(member_user_id)}"
+      )
+
+    assert make_join_conn.status == 200
+    template = decode(make_join_conn)["event"]
+
+    join_event =
+      signed_remote_event(
+        Map.merge(template, %{
+          "event_id" => "$httpjoin_#{System.unique_integer([:positive])}",
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+      )
+
+    path =
+      "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+
+    conn = signed_put(path, join_event)
+    assert conn.status == 200, "join_via_http setup failed: #{conn.status} #{conn.resp_body}"
+    :ok
+  end
+
   defp remote_user(prefix), do: "@#{prefix}_#{System.unique_integer([:positive])}:#{@server_name}"
 
   defp signed_remote_event(fields) do
@@ -159,6 +189,69 @@ defmodule AxonWeb.FederationControllerTest do
 
   defp pdus_contain_event_id?(body, event_id) do
     (body["pdus"] || []) |> Enum.any?(&(&1["event_id"] == event_id))
+  end
+
+  # Mirrors Complement's testValidationForSendMembershipEndpoint
+  # (tests/federation_room_join_test.go): a joined remote member (charlie)
+  # tries to slip a range of non-conforming events through a send_join /
+  # send_leave / send_knock endpoint, and every single one of them must be
+  # rejected with 400 — a regular non-member event, a non-state
+  # m.room.member event, an otherwise-well-formed membership event of every
+  # *other* membership type, and a correctly-typed membership event whose
+  # state_key doesn't match its sender. Complement only asserts the status
+  # code (400), not an errcode, for this cluster.
+  defp assert_membership_endpoint_rejects_junk(base_path, room_id, charlie, expected_membership) do
+    assert_rejects = fn fields ->
+      event =
+        signed_remote_event(
+          Map.merge(
+            %{
+              "room_id" => room_id,
+              "event_id" => "$junk_#{System.unique_integer([:positive])}",
+              "origin_server_ts" => System.os_time(:millisecond)
+            },
+            fields
+          )
+        )
+
+      path = "#{base_path}/#{URI.encode(room_id)}/#{URI.encode(event["event_id"])}"
+      conn = signed_put(path, event)
+
+      assert conn.status == 400,
+             "expected 400 for #{inspect(fields)}, got #{conn.status}: #{conn.resp_body}"
+    end
+
+    # regular (non-membership) event
+    assert_rejects.(%{
+      "type" => "m.room.message",
+      "sender" => charlie,
+      "content" => %{"body" => "bzz"}
+    })
+
+    # non-state membership event (no state_key at all)
+    assert_rejects.(%{
+      "type" => "m.room.member",
+      "sender" => charlie,
+      "content" => %{"body" => "bzz"}
+    })
+
+    # every *other* membership type, correctly self-targeted
+    for membership <- ["join", "leave", "knock", "invite"], membership != expected_membership do
+      assert_rejects.(%{
+        "type" => "m.room.member",
+        "sender" => charlie,
+        "state_key" => charlie,
+        "content" => %{"membership" => membership}
+      })
+    end
+
+    # right membership, but mismatched state_key
+    assert_rejects.(%{
+      "type" => "m.room.member",
+      "sender" => charlie,
+      "state_key" => remote_user("doris"),
+      "content" => %{"membership" => expected_membership}
+    })
   end
 
   # ---------------------------------------------------------------------------
@@ -478,6 +571,176 @@ defmodule AxonWeb.FederationControllerTest do
       assert conn.status == 200
       assert is_list(decode(conn)["knock_room_state"])
       assert EventStore.get_membership(room_id, knocker) == {:ok, "knock"}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # send_join / send_leave / send_knock validation cluster
+  #
+  # Pins Complement's testValidationForSendMembershipEndpoint (shared by
+  # TestCannotSendNonJoinViaSendJoin{V1,V2}, TestCannotSendNonLeaveViaSendLeave{V1,V2},
+  # TestCannotSendNonKnockViaSendKnock, TestCannotSendKnockViaSendKnockInMSC3787Room)
+  # and TestBannedUserCannotSendJoin (federation_room_join_test.go).
+  # ---------------------------------------------------------------------------
+
+  describe "send_join/send_leave/send_knock validation cluster (Complement parity)" do
+    test "send_join v2 rejects anything but a self-targeted join" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      charlie = remote_user("charlie")
+      join_via_http(room_id, charlie)
+
+      assert_membership_endpoint_rejects_junk(
+        "/_matrix/federation/v2/send_join",
+        room_id,
+        charlie,
+        "join"
+      )
+    end
+
+    test "send_join v1 rejects anything but a self-targeted join" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      charlie = remote_user("charlie")
+      join_via_http(room_id, charlie)
+
+      assert_membership_endpoint_rejects_junk(
+        "/_matrix/federation/v1/send_join",
+        room_id,
+        charlie,
+        "join"
+      )
+    end
+
+    test "send_leave v2 rejects anything but a self-targeted leave" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      charlie = remote_user("charlie")
+      join_via_http(room_id, charlie)
+
+      assert_membership_endpoint_rejects_junk(
+        "/_matrix/federation/v2/send_leave",
+        room_id,
+        charlie,
+        "leave"
+      )
+    end
+
+    test "send_leave v1 rejects anything but a self-targeted leave" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      charlie = remote_user("charlie")
+      join_via_http(room_id, charlie)
+
+      assert_membership_endpoint_rejects_junk(
+        "/_matrix/federation/v1/send_leave",
+        room_id,
+        charlie,
+        "leave"
+      )
+    end
+
+    test "send_knock rejects anything but a self-targeted knock (room v7)" do
+      owner = new_local_user("owner")
+
+      {:ok, room_id} =
+        CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat", version: "7")
+
+      charlie = remote_user("charlie")
+      join_via_http(room_id, charlie)
+
+      assert_membership_endpoint_rejects_junk(
+        "/_matrix/federation/v1/send_knock",
+        room_id,
+        charlie,
+        "knock"
+      )
+    end
+
+    test "send_knock rejects anything but a self-targeted knock (MSC3787 room v10)" do
+      owner = new_local_user("owner")
+
+      {:ok, room_id} =
+        CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat", version: "10")
+
+      charlie = remote_user("charlie")
+      join_via_http(room_id, charlie)
+
+      assert_membership_endpoint_rejects_junk(
+        "/_matrix/federation/v1/send_knock",
+        room_id,
+        charlie,
+        "knock"
+      )
+    end
+
+    # TestBannedUserCannotSendJoin: charlie is banned from the room, then
+    # runs make_join for a *different*, unbanned user (charlie2), swaps the
+    # sender/state_key on the resulting event back to himself, and signs it
+    # with his own server key. The event's own auth_events reflect
+    # charlie2's (empty) prior membership, not charlie's ban — so this only
+    # works if the resident server trusts the submitted auth_events for the
+    # authorization decision instead of authorizing against the room's real,
+    # live state. Must still 403 M_FORBIDDEN, and the ban must survive.
+    test "send_join rejects a banned user's join even when auth_events are borrowed from an unbanned user's make_join" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      charlie = remote_user("charlie")
+      charlie2 = remote_user("charlie2")
+
+      {:ok, _} =
+        RoomProcess.send_event(room_id, owner, "m.room.member", %{"membership" => "ban"},
+          state_key: charlie
+        )
+
+      make_join_conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie2)}"
+        )
+
+      assert make_join_conn.status == 200
+      template = decode(make_join_conn)["event"]
+
+      switcheroo_event =
+        signed_remote_event(
+          Map.merge(template, %{
+            "sender" => charlie,
+            "state_key" => charlie,
+            "event_id" => "$switcheroo_#{System.unique_integer([:positive])}",
+            "origin_server_ts" => System.os_time(:millisecond)
+          })
+        )
+
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(switcheroo_event["event_id"])}"
+
+      conn = signed_put(path, switcheroo_event)
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+      assert EventStore.get_membership(room_id, charlie) == {:ok, "ban"}
+    end
+
+    # Companion coverage for the same scenario at make_join itself (the
+    # non-switcheroo case): a banned user directly requesting make_join for
+    # themselves must also be refused up front.
+    test "make_join rejects a banned user's own request" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      charlie = remote_user("charlie")
+
+      {:ok, _} =
+        RoomProcess.send_event(room_id, owner, "m.room.member", %{"membership" => "ban"},
+          state_key: charlie
+        )
+
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie)}"
+        )
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
     end
   end
 
