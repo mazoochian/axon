@@ -624,6 +624,46 @@ defmodule AxonWeb.FederationController do
   end
 
   # ---------------------------------------------------------------------------
+  # GET /_matrix/federation/v1/event_auth/:room_id/:event_id
+  #
+  # Previously entirely unimplemented (no route at all, so any request
+  # here 404'd generically) — one of the endpoints the Server-Server API's
+  # ACL section explicitly lists as MUST-protect. Returns the complete
+  # transitive auth chain for the given event (its auth_events plus theirs,
+  # recursively — NOT including the event itself), same computation
+  # get_state/get_state_ids already do per state event, just entered from
+  # a single event_id instead.
+  # ---------------------------------------------------------------------------
+
+  def event_auth(conn, %{"room_id" => room_id, "event_id" => event_id}) do
+    origin = conn.assigns[:origin_server]
+
+    if acl_allowed?(room_id, origin) do
+      case EventStore.get_event(event_id) do
+        {:ok, %{room_id: ^room_id} = event} ->
+          auth_chain =
+            event
+            |> get_auth_chain_ids()
+            |> Enum.flat_map(fn id ->
+              case EventStore.get_event(id) do
+                {:ok, e} -> [EventStore.event_to_map(e)]
+                _ -> []
+              end
+            end)
+
+          json(conn, %{"auth_chain" => auth_chain})
+
+        _ ->
+          conn
+          |> put_status(404)
+          |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Event not found"})
+      end
+    else
+      acl_forbidden(conn)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/backfill/:room_id
   # ---------------------------------------------------------------------------
 

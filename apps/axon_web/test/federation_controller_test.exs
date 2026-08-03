@@ -729,6 +729,27 @@ defmodule AxonWeb.FederationControllerTest do
       refute body["pdu_ids"] == []
     end
 
+    test "event_auth returns the requested event's transitive auth chain, not the event itself",
+         %{room_id: room_id} do
+      {:ok, name_event} = EventStore.get_state_event(room_id, "m.room.name", "")
+
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/event_auth/#{URI.encode(room_id)}/#{URI.encode(name_event.event_id)}"
+        )
+
+      assert conn.status == 200
+      auth_chain_ids = decode(conn)["auth_chain"] |> Enum.map(& &1["event_id"])
+
+      refute name_event.event_id in auth_chain_ids
+      assert Enum.sort(auth_chain_ids) == Enum.sort(name_event.auth_event_ids)
+    end
+
+    test "event_auth 404s for an unknown event", %{room_id: room_id} do
+      conn = signed_get("/_matrix/federation/v1/event_auth/#{URI.encode(room_id)}/%24nonexistent")
+      assert conn.status == 404
+    end
+
     test "backfill returns events older than the given ordering, respecting limit", %{
       room_id: room_id,
       owner: owner

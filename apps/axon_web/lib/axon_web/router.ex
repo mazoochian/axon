@@ -255,6 +255,7 @@ defmodule AxonWeb.Router do
     get("/v1/state/:room_id", FederationController, :get_state)
     get("/v1/state_ids/:room_id", FederationController, :get_state_ids)
     get("/v1/backfill/:room_id", FederationController, :backfill)
+    get("/v1/event_auth/:room_id/:event_id", FederationController, :event_auth)
     post("/v1/get_missing_events/:room_id", FederationController, :get_missing_events)
     get("/v1/query/directory", FederationController, :query_directory)
     get("/v1/query/profile", FederationController, :query_profile)
