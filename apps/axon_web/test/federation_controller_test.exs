@@ -1622,5 +1622,34 @@ defmodule AxonWeb.FederationControllerTest do
       assert server_key["server_name"] == "localhost"
       assert map_size(server_key["verify_keys"]) > 0
     end
+
+    # Regression: /_matrix/key/v2/query used to be routed through
+    # AxonWeb.Plug.FederationAuth (X-Matrix signature required), same as
+    # ordinary federation endpoints. Per spec it must be reachable with NO
+    # authentication at all — exactly like /_matrix/key/v2/server — because
+    # a server calls it precisely when it doesn't yet have (or can't yet
+    # trust) the origin's key, so requiring a verifiable signature to reach
+    # it is a chicken-and-egg deadlock. gomatrixserverlib's DirectKeyFetcher
+    # falls back to this endpoint whenever a direct /v2/server fetch fails
+    # its checks; with the old routing that fallback got a silent 401 (never
+    # even reaching FederationAuth's own rejection logging, since an
+    # unauthenticated caller is that plug's "missing header" branch, which
+    # doesn't log), which is exactly the failure mode that broke
+    # TestJoinViaRoomIDAndServerName end-to-end.
+    test "requires no authentication at all — no Authorization header is sent" do
+      conn =
+        build_conn()
+        |> put_req_header("content-type", "application/json")
+        |> post("/_matrix/key/v2/query", Jason.encode!(%{}))
+
+      assert conn.status == 200
+      [server_key] = decode(conn)["server_keys"]
+      assert server_key["server_name"] == "localhost"
+    end
+
+    test "GET /_matrix/key/v2/query/:server_name/:key_id also requires no authentication" do
+      conn = build_conn() |> get("/_matrix/key/v2/query/some-server.example/ed25519:abc")
+      assert conn.status == 200
+    end
   end
 end
