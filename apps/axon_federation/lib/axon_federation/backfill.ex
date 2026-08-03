@@ -35,6 +35,35 @@ defmodule AxonFederation.Backfill do
   @backfill_limit 100
 
   @doc """
+  Fetches a single event we don't hold at all (not one referenced as a gap
+  by a PDU we already trust — nothing vouches for this one yet), verifies
+  its signature, closes whatever ancestry gap *it* has via `catch_up/3`,
+  and applies it. Used by `AxonFederation.TimestampToEvent` when a remote
+  server's timestamp_to_event answer names an event id we've never seen:
+  per the Server-Server API, the requesting server "should try to backfill
+  this event" so a client can immediately paginate `/context` or
+  `/messages` around it, not just be handed a bare event id.
+
+  Returns `{:ok, event_id}` or `{:error, reason}` — unlike `catch_up/3`
+  (which soft-fails silently, matching /send's tolerance for junk from a
+  trusted live stream) failure here is reported, since the caller needs to
+  know whether the timestamp/event pair it's about to hand back to a
+  client actually landed.
+  """
+  def fetch_and_apply_event(room_id, origin, event_id) do
+    path = "/_matrix/federation/v1/event/#{URI.encode(event_id)}"
+
+    with {:ok, %{"pdus" => [pdu | _]}} <- HttpClient.get(origin, path),
+         :ok <- EventVerification.verify_signature(pdu) do
+      catch_up(room_id, origin, pdu)
+      RoomProcess.apply_remote_event(room_id, pdu)
+    else
+      {:ok, _} -> {:error, :malformed_event_response}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
   Given a PDU about to be applied and the `origin` server it arrived from,
   fetches and applies any of its `prev_events` we don't already have
   locally. A no-op (cheap: one batched local lookup) when there's no gap.

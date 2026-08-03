@@ -29,7 +29,9 @@ defmodule AxonWeb.E2EEDeliveryTest do
 
   import AxonWeb.TestHelpers
 
+  alias AxonCore.KeyStore
   alias AxonFederation.{FakeRemoteMatrixServer, KeyCache}
+  alias AxonRoom.RoomProcess
 
   @port 19_050
   @server_name "fake-e2ee-delivery.test"
@@ -264,6 +266,203 @@ defmodule AxonWeb.E2EEDeliveryTest do
       [event] = sync_body["to_device"]["events"]
       assert event["sender"] == remote_sender
       assert event["content"]["session_key"] == "fed3kr3t"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Device lists over federation (m.device_list_update EDU) — previously
+  # entirely unimplemented in both directions: the literal string
+  # "m.device_list_update" appeared nowhere in lib/, so a device change never
+  # left this server, and an inbound one from a peer was silently dropped by
+  # AxonWeb.FederationController's EDU catch-all. Outbound is
+  # AxonFederation.DeviceListFanout (polls device_list_updates, the same log
+  # this file's "device_lists.changed / left on room membership" tests read
+  # locally, and fans a changed local user's current device list out to
+  # every remote server sharing a room with them). Inbound is the
+  # `"m.device_list_update"` clause in
+  # AxonWeb.FederationController.process_inbound_edu/2, right next to
+  # `"m.direct_to_device"` above.
+  # ---------------------------------------------------------------------------
+
+  describe "device list updates over federation (m.device_list_update EDU)" do
+    setup do
+      start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
+      KeyCache.clear()
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{@port}"
+      })
+
+      on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
+      :ok
+    end
+
+    defp remote_user_id(prefix),
+      do: "@#{prefix}_#{System.unique_integer([:positive])}:#{@server_name}"
+
+    # Seeds a remote member as an already-joined resident of the room —
+    # mirrors AxonWeb.FederationControllerTest.join_remote_member/3. A local
+    # self-join can't target another user, so this goes through the same
+    # inbound path (RoomProcess.apply_remote_event/2) a federated join
+    # would take, which is also what makes
+    # AxonCore.EventStore.remote_servers_for_user/1 (what
+    # AxonFederation.DeviceListFanout asks to find fan-out targets) name
+    # this port's server as sharing the room afterwards.
+    defp join_remote_member(room_id, member_user_id) do
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      pdu =
+        FakeRemoteMatrixServer.sign_event(@port, %{
+          "hashes" => %{"sha256" => "x"},
+          "event_id" => "$seedjoin_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => member_user_id,
+          "sender" => member_user_id,
+          "content" => %{"membership" => "join"},
+          "depth" => depth + 1,
+          "prev_events" => if(last_event_id, do: [last_event_id], else: []),
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      {:ok, _} = RoomProcess.apply_remote_event(room_id, pdu)
+    end
+
+    test "a local user's device list change is fanned out as m.device_list_update to a remote room-mate's server" do
+      alice = register("alice_dlfed_out_#{System.unique_integer([:positive])}")
+      bob = remote_user_id("bob")
+
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+      join_remote_member(room_id, bob)
+
+      # Trigger the same signal every other device-list-changing code path
+      # (login, key upload, device rename/delete) already calls —
+      # AxonFederation.DeviceListFanout polls this log, it doesn't care
+      # which call site produced the row.
+      KeyStore.record_device_list_update(alice.user_id)
+
+      req =
+        wait_until(System.monotonic_time(:millisecond) + 3_000, fn ->
+          FakeRemoteMatrixServer.requests(@port)
+          |> Enum.filter(&String.starts_with?(&1.path, "/_matrix/federation/v1/send/"))
+          |> Enum.flat_map(&(&1.body["edus"] || []))
+          |> Enum.find(fn edu ->
+            edu["edu_type"] == "m.device_list_update" and
+              edu["content"]["user_id"] == alice.user_id
+          end)
+          |> case do
+            nil -> :error
+            edu -> {:ok, edu}
+          end
+        end)
+
+      assert req["content"]["device_id"] == alice.device_id
+      assert req["content"]["deleted"] == false
+      assert is_integer(req["content"]["stream_id"])
+    end
+
+    test "does not fan out a remote user's own device list back out to anyone" do
+      alice = register("alice_dlfed_noloop_#{System.unique_integer([:positive])}")
+      bob = remote_user_id("bob")
+
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+      join_remote_member(room_id, bob)
+
+      # The join itself legitimately queues a fan-out for *alice* (she's
+      # local and now shares the room with bob's server) — let that drain
+      # first so it isn't mistaken below for a leak of bob's own update.
+      Process.sleep(1_500)
+      FakeRemoteMatrixServer.clear_requests(@port)
+
+      # Simulates what the inbound m.device_list_update handler itself does
+      # on receipt — recording it locally must not cause this server to
+      # turn around and re-announce it as if it were the origin.
+      KeyStore.record_device_list_update(bob)
+
+      # Give AxonFederation.DeviceListFanout's poller (500ms interval)
+      # multiple chances to (incorrectly) act before asserting it didn't.
+      Process.sleep(1_500)
+
+      refute FakeRemoteMatrixServer.requests(@port)
+             |> Enum.flat_map(&(&1.body["edus"] || []))
+             |> Enum.any?(fn edu ->
+               edu["edu_type"] == "m.device_list_update" and edu["content"]["user_id"] == bob
+             end)
+    end
+
+    test "an inbound m.device_list_update EDU surfaces the remote sender in the local room-mate's device_lists.changed" do
+      alice = register("alice_dlfed_in_#{System.unique_integer([:positive])}")
+      bob = remote_user_id("bob")
+
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+      join_remote_member(room_id, bob)
+
+      alice_since = sync_once(alice.token)["next_batch"]
+
+      edu = %{
+        "edu_type" => "m.device_list_update",
+        "content" => %{
+          "user_id" => bob,
+          "device_id" => "BOBDEVICE",
+          "device_display_name" => "Bob's New Phone",
+          "stream_id" => 1,
+          "prev_id" => [],
+          "deleted" => false
+        }
+      }
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      path = "/_matrix/federation/v1/send/#{txn_id}"
+      body = %{"pdus" => [], "edus" => [edu]}
+      header = FakeRemoteMatrixServer.sign_request(@port, "PUT", path, body)
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", header)
+        |> put_req_header("content-type", "application/json")
+        |> put(path, Jason.encode!(body))
+
+      assert conn.status == 200
+
+      alice_next = sync_once(alice.token, alice_since)
+      assert bob in alice_next["device_lists"]["changed"]
+    end
+
+    test "an inbound m.device_list_update EDU claiming a user_id the sending server doesn't own is dropped" do
+      alice = register("alice_dlfed_forged_#{System.unique_integer([:positive])}")
+      not_bobs_server = "@impostor:some-other-server.test"
+
+      edu = %{
+        "edu_type" => "m.device_list_update",
+        "content" => %{
+          "user_id" => not_bobs_server,
+          "device_id" => "X",
+          "stream_id" => 1,
+          "prev_id" => [],
+          "deleted" => false
+        }
+      }
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      path = "/_matrix/federation/v1/send/#{txn_id}"
+      body = %{"pdus" => [], "edus" => [edu]}
+      header = FakeRemoteMatrixServer.sign_request(@port, "PUT", path, body)
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", header)
+        |> put_req_header("content-type", "application/json")
+        |> put(path, Jason.encode!(body))
+
+      # The transaction as a whole still 200s (per-EDU processing is
+      # best-effort, same as every other EDU type) -- what matters is that
+      # the forged update was never recorded.
+      assert conn.status == 200
+      refute alice.user_id == not_bobs_server
+
+      alice_since = sync_once(alice.token)["next_batch"]
+      alice_next = sync_once(alice.token, alice_since)
+      refute not_bobs_server in alice_next["device_lists"]["changed"]
     end
   end
 end
