@@ -766,7 +766,7 @@ defmodule AxonCore.EventStore do
         select: m.user_id
       )
     )
-    |> Enum.map(&(&1 |> String.split(":") |> List.last()))
+    |> Enum.map(&(&1 |> AxonCore.MatrixId.server_name()))
     |> Enum.reject(&(&1 == local_server))
     |> Enum.uniq()
   end
@@ -788,7 +788,7 @@ defmodule AxonCore.EventStore do
         distinct: true
       )
     )
-    |> Enum.map(&(&1 |> String.split(":") |> List.last()))
+    |> Enum.map(&(&1 |> AxonCore.MatrixId.server_name()))
     |> Enum.reject(&(&1 == local_server))
     |> Enum.uniq()
   end

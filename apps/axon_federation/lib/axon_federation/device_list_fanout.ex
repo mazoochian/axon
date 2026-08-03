@@ -98,7 +98,24 @@ defmodule AxonFederation.DeviceListFanout do
 
   @impl true
   def handle_info(:poll, state) do
-    new_state = poll(state)
+    # A failed poll must never crash this process. Under the Ecto sandbox
+    # every poll from *this* process has no ownership (the checkout belongs
+    # to whichever test process is running), so the query raises. Crashing
+    # here twice a second exhausts the supervisor's restart intensity and
+    # takes down the entire axon_federation application with it — including
+    # KeyCache's ETS table, which then fails every unrelated test in the
+    # suite with "the table identifier does not refer to an existing ETS
+    # table". A skipped poll is harmless: `last_id` is unchanged, so the
+    # next tick picks up exactly the same rows.
+    new_state =
+      try do
+        poll(state)
+      rescue
+        e in [DBConnection.OwnershipError, DBConnection.ConnectionError] ->
+          _ = e
+          state
+      end
+
     schedule_poll()
     {:noreply, new_state}
   end

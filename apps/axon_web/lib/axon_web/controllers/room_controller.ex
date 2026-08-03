@@ -91,7 +91,7 @@ defmodule AxonWeb.RoomController do
     if is_nil(room_id) do
       conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
     else
-      room_server = room_id |> String.split(":") |> List.last()
+      room_server = room_id |> AxonCore.MatrixId.server_name()
       is_local_room = room_server == local_server or EventStore.room_exists?(room_id)
 
       if is_local_room do
@@ -136,18 +136,15 @@ defmodule AxonWeb.RoomController do
 
   # A pre-v12 room's own id doubles as a routable server hint (the part
   # after the colon) when the caller gave none. A v12+ room_id has no
-  # domain component at all — String.split/2 on a colon-less string just
-  # returns the whole string, so `room_server == room_id` there — and
-  # federating to "that" as if it were a hostname would silently fail (bad
-  # DNS lookup / connection refused) instead of explaining what's missing.
+  # domain component at all, so `AxonCore.MatrixId.server_name/1` returns
+  # nil for one — and federating to a nil (or, before that helper existed,
+  # to the whole room_id string) as if it were a hostname would silently
+  # fail with a bad DNS lookup instead of explaining what's missing.
   defp resolve_via_servers(_room_id, _room_server, hint_servers) when hint_servers != [],
     do: {:ok, hint_servers}
 
-  defp resolve_via_servers(room_id, room_server, []) do
-    if room_server == room_id,
-      do: {:error, :missing_via_hint},
-      else: {:ok, [room_server]}
-  end
+  defp resolve_via_servers(_room_id, nil, []), do: {:error, :missing_via_hint}
+  defp resolve_via_servers(_room_id, room_server, []), do: {:ok, [room_server]}
 
   # POST /_matrix/client/v1/knock/:room_id_or_alias
   # POST /_matrix/client/v1/rooms/:room_id/knock
@@ -169,7 +166,7 @@ defmodule AxonWeb.RoomController do
     if is_nil(room_id) do
       conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
     else
-      room_server = room_id |> String.split(":") |> List.last()
+      room_server = room_id |> AxonCore.MatrixId.server_name()
       is_local_room = room_server == local_server or EventStore.room_exists?(room_id)
       reason = params["reason"]
 
@@ -265,7 +262,7 @@ defmodule AxonWeb.RoomController do
 
   defp invite_sender_server(room_id, user_id) do
     case EventStore.get_state_event(room_id, "m.room.member", user_id) do
-      {:ok, %{sender: sender}} -> {:ok, sender |> String.split(":") |> List.last()}
+      {:ok, %{sender: sender}} -> {:ok, sender |> AxonCore.MatrixId.server_name()}
       _ -> {:error, :no_invite_found}
     end
   end
@@ -447,7 +444,7 @@ defmodule AxonWeb.RoomController do
   # silently a no-op from the invitee's perspective.
   defp invite_user(room_id, sender, target_user_id) do
     local_server = AxonCrypto.KeyServer.server_name()
-    target_server = target_user_id |> String.split(":") |> List.last()
+    target_server = target_user_id |> AxonCore.MatrixId.server_name()
 
     if target_server == local_server do
       RoomProcess.send_event(room_id, sender, "m.room.member", %{"membership" => "invite"},
@@ -741,8 +738,10 @@ defmodule AxonWeb.RoomController do
           {local_id, []}
         else
           # Try federation alias lookup
-          alias_server = room_id_or_alias |> String.split(":") |> List.last()
-          via = if server_params != [], do: server_params, else: [alias_server]
+          alias_server = room_id_or_alias |> AxonCore.MatrixId.server_name()
+          # List.wrap so a malformed alias with no server part yields no via
+          # hint at all, rather than a [nil] we'd then try to connect to.
+          via = if server_params != [], do: server_params, else: List.wrap(alias_server)
           resolve_remote_alias(room_id_or_alias, via, local_server)
         end
 
