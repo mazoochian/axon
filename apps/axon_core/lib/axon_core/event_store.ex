@@ -141,6 +141,26 @@ defmodule AxonCore.EventStore do
     Repo.exists?(from(e in Event, where: e.event_id in ^event_ids and e.rejected))
   end
 
+  @doc """
+  The subset of `event_ids` that are not stored locally at all — neither
+  accepted nor rejected. Distinct from `any_rejected?/1`: that only catches
+  an `auth_events` reference to an event we've *seen and rejected*; this
+  catches a reference to one we've never seen, which per spec cannot be
+  authorized either (there's no auth chain to have verified). Used by
+  `AxonRoom.RoomProcess` to fail closed on an inbound PDU whose auth_events
+  point at something we have no record of at all, same as it already does
+  for a *known*-rejected one.
+  """
+  def unknown_ids([]), do: []
+
+  def unknown_ids(event_ids) do
+    known =
+      Repo.all(from(e in Event, where: e.event_id in ^event_ids, select: e.event_id))
+      |> MapSet.new()
+
+    Enum.reject(event_ids, &MapSet.member?(known, &1))
+  end
+
   defp update_current_state(_repo, %Event{state_key: nil}), do: {:ok, nil}
 
   defp update_current_state(repo, event) do

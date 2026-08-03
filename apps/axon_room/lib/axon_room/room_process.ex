@@ -242,6 +242,22 @@ defmodule AxonRoom.RoomProcess do
       EventStore.any_rejected?(auth_event_ids) ->
         reject_and_persist(pdu, state, :auth_event_rejected)
 
+      # Same fail-closed principle, one step earlier: an auth_events entry
+      # we have *no record of at all* (never fetched as an outlier, never
+      # applied, never rejected) cannot have been verified either — there's
+      # no auth chain here to have checked. Accepting the PDU anyway on the
+      # theory that an absent reference is presumptively fine would let an
+      # attacker forge a plausible-looking event around a made-up or
+      # deliberately-withheld auth_events id and have it sail through
+      # (Complement: TestInboundFederationRejectsEventsWithRejectedAuthEvents
+      # — "sentEvent1"/"sentEvent2", each listing an outlier event this
+      # server was never sent, among their auth_events). This does not
+      # attempt to fetch the missing auth event as an outlier and re-check
+      # it (a materially larger feature — see this module's file-ownership
+      # handoff notes); it only refuses to guess.
+      EventStore.unknown_ids(auth_event_ids) != [] ->
+        reject_and_persist(pdu, state, :unknown_auth_event)
+
       true ->
         needs_resolution? = StateResolver.needs_resolution?(pdu, state.last_event_id)
 
