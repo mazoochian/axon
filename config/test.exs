@@ -5,7 +5,10 @@ config :axon_core, AxonCore.Repo,
   password: "axon",
   hostname: System.get_env("DB_HOST", "localhost"),
   port: String.to_integer(System.get_env("DB_PORT", "5432")),
-  database: "axon_test",
+  # Overridable so several concurrent test runs (e.g. one per git worktree)
+  # can each own an isolated database instead of trampling the shared
+  # sandbox on this box's single local Postgres instance.
+  database: System.get_env("AXON_TEST_DB", "axon_test"),
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: 10
 
