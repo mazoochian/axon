@@ -27,6 +27,23 @@ defmodule AxonRoom.AuthRules do
   def can_invite?(user_id, current_state, version \\ "11"),
     do: has_power?(user_id, "invite", current_state, version)
 
+  @doc """
+  Whether `user_id` currently has enough power to send a state event of
+  `event_type` in this room. Exposed for callers outside the event-send
+  pipeline (e.g. directory alias management) that need the same authority
+  `check/3` uses for state events — including room-v12 creator infinite
+  power — rather than reimplementing power-level arithmetic themselves.
+  """
+  def can_send_state?(user_id, event_type, current_state, version \\ "11") do
+    pl = power_levels(current_state)
+
+    required =
+      get_in(pl, ["events", event_type]) ||
+        Map.get(pl, "state_default", 50)
+
+    effective_power(user_id, pl, current_state, version) >= required
+  end
+
   # ---------------------------------------------------------------------------
   # m.room.create — must be the first event
   # ---------------------------------------------------------------------------
@@ -166,7 +183,14 @@ defmodule AxonRoom.AuthRules do
             check_restricted_join(event, sender, sender_membership, current_state, version)
 
           join_rule == "knock" ->
-            if sender_membership in ["invite", "knock"], do: :ok, else: {:error, :not_invited}
+            # Spec rule 4.3.4: "If the join_rule is invite or knock then
+            # allow if membership state is invite or join." A prior
+            # "knock" state is *not* sufficient on its own — knocking only
+            # grants the right to be seen/invited/rejected, never a
+            # self-service join. (The `sender_membership == "join"` case
+            # above already short-circuits rejoin, so this really only
+            # matters for the "invite" branch here.)
+            if sender_membership == "invite", do: :ok, else: {:error, :not_invited}
 
           true ->
             {:error, :not_invited}
@@ -272,8 +296,10 @@ defmodule AxonRoom.AuthRules do
     target_membership = current_membership(target, current_state)
 
     if sender == target do
-      # Self-leave: OK if joined or invited
-      if sender_membership in ["join", "invite"],
+      # Self-leave: OK if joined, invited, or knocking (spec rule 4.5.1 —
+      # rescinding a knock is a plain self-leave from the "knock" state,
+      # same as declining an invite).
+      if sender_membership in ["join", "invite", "knock"],
         do: :ok,
         else: {:error, :not_joined}
     else
@@ -291,7 +317,10 @@ defmodule AxonRoom.AuthRules do
             do: :ok,
             else: {:error, :insufficient_power}
 
-        target_membership not in ["join", "invite"] ->
+        # A room member rejecting someone else's knock is also a plain
+        # leave event, gated by ordinary kick power below — "knock" must be
+        # accepted here as a valid target state alongside "join"/"invite".
+        target_membership not in ["join", "invite", "knock"] ->
           {:error, :target_not_in_room}
 
         not has_power_over?(sender, target, "kick", current_state, version) ->

@@ -58,7 +58,9 @@ defmodule AxonWeb.DirectoryController do
                 "m.room.topic",
                 "m.room.canonical_alias",
                 "m.room.history_visibility",
-                "m.room.guest_access"
+                "m.room.guest_access",
+                "m.room.join_rules",
+                "m.room.create"
               ],
           select: %{type: s.type, content: e.content}
         )
@@ -75,6 +77,15 @@ defmodule AxonWeb.DirectoryController do
 
     guest_access = get_in(state_map, ["m.room.guest_access", "guest_access"]) || "forbidden"
 
+    # PublicRoomsChunk.join_rule: "When not present, the room is assumed to
+    # be public" — but Complement's directory test asserts the key is
+    # actually present, so default explicitly rather than omitting it.
+    join_rule = get_in(state_map, ["m.room.join_rules", "join_rule"]) || "public"
+
+    # PublicRoomsChunk.room_type: "The `type` of room (from m.room.create),
+    # if any" — omitted entirely for ordinary (non-space) rooms.
+    room_type = get_in(state_map, ["m.room.create", "type"])
+
     # Apply search filter on name and topic
     if search do
       search_lower = String.downcase(search)
@@ -88,13 +99,41 @@ defmodule AxonWeb.DirectoryController do
 
       if not (name_match || topic_match || alias_match || id_match),
         do: nil,
-        else: build_entry(room_id, name, topic, canonical_alias, history_visibility, guest_access)
+        else:
+          build_entry(
+            room_id,
+            name,
+            topic,
+            canonical_alias,
+            history_visibility,
+            guest_access,
+            join_rule,
+            room_type
+          )
     else
-      build_entry(room_id, name, topic, canonical_alias, history_visibility, guest_access)
+      build_entry(
+        room_id,
+        name,
+        topic,
+        canonical_alias,
+        history_visibility,
+        guest_access,
+        join_rule,
+        room_type
+      )
     end
   end
 
-  defp build_entry(room_id, name, topic, canonical_alias, history_visibility, guest_access) do
+  defp build_entry(
+         room_id,
+         name,
+         topic,
+         canonical_alias,
+         history_visibility,
+         guest_access,
+         join_rule,
+         room_type
+       ) do
     num_joined =
       Repo.one(
         from(m in "room_memberships",
@@ -107,7 +146,8 @@ defmodule AxonWeb.DirectoryController do
       "room_id" => room_id,
       "world_readable" => history_visibility == "world_readable",
       "guest_can_join" => guest_access == "can_join",
-      "num_joined_members" => num_joined
+      "num_joined_members" => num_joined,
+      "join_rule" => join_rule
     }
 
     entry = if name, do: Map.put(entry, "name", name), else: entry
@@ -115,6 +155,8 @@ defmodule AxonWeb.DirectoryController do
 
     entry =
       if canonical_alias, do: Map.put(entry, "canonical_alias", canonical_alias), else: entry
+
+    entry = if room_type, do: Map.put(entry, "room_type", room_type), else: entry
 
     entry
   end
@@ -265,20 +307,28 @@ defmodule AxonWeb.DirectoryController do
     end
   end
 
+  # Delegates to AxonRoom.AuthRules — the single authority every other power
+  # check in this codebase goes through — rather than reimplementing
+  # power-level arithmetic here. That matters in particular for room v12,
+  # where the creator(s) hold implicit infinite power and are never listed
+  # in power_levels.users; a hand-rolled `users_default` fallback would
+  # wrongly refuse a v12 creator who manages an alias without ever having
+  # been granted an explicit power_levels entry.
   defp can_manage_aliases?(user_id, room_id) do
     alias AxonCore.EventStore
+    alias AxonRoom.AuthRules
 
     state_map = EventStore.get_current_state_map(room_id)
+    version = room_version(state_map)
 
-    pl =
-      case state_map[{"m.room.power_levels", ""}] do
-        nil -> %{}
-        ev -> ev["content"] || %{}
-      end
+    AuthRules.can_send_state?(user_id, "m.room.aliases", state_map, version)
+  end
 
-    required = get_in(pl, ["events", "m.room.aliases"]) || Map.get(pl, "state_default", 50)
-    user_pl = get_in(pl, ["users", user_id]) || Map.get(pl, "users_default", 0)
-    user_pl >= required
+  defp room_version(state_map) do
+    case state_map[{"m.room.create", ""}] do
+      %{"content" => %{"room_version" => v}} -> v
+      _ -> "11"
+    end
   end
 
   defp server_name, do: Application.fetch_env!(:axon_web, :server_name)

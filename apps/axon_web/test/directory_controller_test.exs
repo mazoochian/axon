@@ -101,6 +101,57 @@ defmodule AxonWeb.DirectoryControllerTest do
       entry = Enum.find(decode(conn)["chunk"], &(&1["room_id"] == room_id))
       assert entry["num_joined_members"] == 1
     end
+
+    # Regression: PublicRoomsChunk requires a "join_rule" key (spec:
+    # "When not present, the room is assumed to be public") — Axon used to
+    # omit it entirely for every room, public or otherwise.
+    test "a public room's entry carries join_rule \"public\"" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat", "visibility" => "public"})
+
+      conn = authed(alice.token) |> get("/_matrix/client/v3/publicRooms")
+      entry = Enum.find(decode(conn)["chunk"], &(&1["room_id"] == room_id))
+      assert entry["join_rule"] == "public"
+    end
+
+    test "a knock room's entry carries join_rule \"knock\"" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(alice.token, %{
+          "room_version" => "7",
+          "visibility" => "public",
+          "initial_state" => [
+            %{"type" => "m.room.join_rules", "content" => %{"join_rule" => "knock"}}
+          ]
+        })
+
+      conn = authed(alice.token) |> get("/_matrix/client/v3/publicRooms")
+      entry = Enum.find(decode(conn)["chunk"], &(&1["room_id"] == room_id))
+      assert entry["join_rule"] == "knock"
+    end
+
+    test "a restricted room's entry carries join_rule \"restricted\"" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+
+      room_id =
+        create_room(alice.token, %{
+          "preset" => "public_chat",
+          "room_version" => "9",
+          "visibility" => "public",
+          "initial_state" => [
+            %{
+              "type" => "m.room.join_rules",
+              "state_key" => "",
+              "content" => %{"join_rule" => "restricted", "allow" => []}
+            }
+          ]
+        })
+
+      conn = authed(alice.token) |> get("/_matrix/client/v3/publicRooms")
+      entry = Enum.find(decode(conn)["chunk"], &(&1["room_id"] == room_id))
+      assert entry["join_rule"] == "restricted"
+    end
   end
 
   describe "set_room_visibility" do
@@ -230,6 +281,42 @@ defmodule AxonWeb.DirectoryControllerTest do
         |> delete("/_matrix/client/v3/directory/room/%23doesnotexist:localhost")
 
       assert conn.status == 404
+    end
+
+    # Regression: a room v12 creator holds implicit, infinite power and is
+    # never listed in power_levels.users (rule 10.4) — `can_manage_aliases?/2`
+    # used to do its own power-level arithmetic (falling back to
+    # `users_default`, which is 0) instead of going through
+    # `AxonRoom.AuthRules`, so a v12 creator managing an alias they didn't
+    # personally create (the `creator == user_id` shortcut doesn't apply)
+    # was wrongly refused with 403.
+    test "a room v12 creator can delete another user's alias despite not being in power_levels.users" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      bob = register("bob_#{System.unique_integer([:positive])}")
+
+      room_id = create_room(alice.token, %{"preset" => "public_chat", "room_version" => "12"})
+      authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})
+
+      room_alias = "#v12creatoralias#{System.unique_integer([:positive])}:localhost"
+
+      bob_put =
+        authed(bob.token)
+        |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", %{
+          "room_id" => room_id
+        })
+
+      assert bob_put.status == 200
+
+      del_conn =
+        authed(alice.token)
+        |> delete("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+
+      assert del_conn.status == 200
+
+      get_conn =
+        build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}")
+
+      assert get_conn.status == 404
     end
   end
 end
