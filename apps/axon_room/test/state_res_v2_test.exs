@@ -459,4 +459,71 @@ defmodule AxonRoom.StateResV2Test do
       assert v12[{"m.room.power_levels", ""}]["event_id"] == "$ply2"
     end
   end
+
+  describe "v12 starts iterative auth checks from an empty set (MSC4297)" do
+    test "a genuinely unconflicted membership event is still visible during replay, via auth_events fallback" do
+      # This is what distinguishes v12 from v11 here: v11's check_state is
+      # `Map.merge(unconflicted, resolved_so_far)` at every step, so an
+      # unconflicted sender-membership event is trivially visible even with
+      # no fallback at all. v12 deliberately does NOT do that merge during
+      # replay (`check_state = resolved_so_far`, unconflicted only folds
+      # back in once, after the whole iteration finishes) — so the *only*
+      # thing that can make the creator's own (genuinely unconflicted, and
+      # therefore never itself part of the replay set) join event visible
+      # while checking a conflicting join_rules candidate is
+      # `with_auth_event_fallback/3` walking that candidate's own
+      # `auth_events`. Without it, `check_sender_joined` sees no member
+      # state at all, both conflicting candidates spuriously fail
+      # AuthRules.check, and m.room.join_rules would vanish from the
+      # resolved state entirely instead of correctly picking the newer
+      # candidate.
+      store = events_store()
+      creator = @creator
+
+      create = put_event(store, create_event())
+      creator_joined = put_event(store, member_event("$cj", creator, "join", 1, ["$create"]))
+
+      jr_older =
+        put_event(store, %{
+          "event_id" => "$jr_older",
+          "type" => "m.room.join_rules",
+          "state_key" => "",
+          "sender" => creator,
+          "depth" => 2,
+          "auth_events" => ["$create", "$cj"],
+          "content" => %{"join_rule" => "invite"}
+        })
+
+      jr_newer =
+        put_event(store, %{
+          "event_id" => "$jr_newer",
+          "type" => "m.room.join_rules",
+          "state_key" => "",
+          "sender" => creator,
+          "depth" => 3,
+          "auth_events" => ["$create", "$cj"],
+          "content" => %{"join_rule" => "public"}
+        })
+
+      unconflicted = %{
+        {"m.room.create", ""} => create,
+        {"m.room.member", creator} => creator_joined
+      }
+
+      set_a = Map.put(unconflicted, {"m.room.join_rules", ""}, jr_older)
+      set_b = Map.put(unconflicted, {"m.room.join_rules", ""}, jr_newer)
+
+      v12 = StateResV2.resolve([set_a, set_b], get_event_fn(store), "12")
+
+      # Both candidates need the fallback to pass AuthRules.check at all
+      # (no PL event exists, so the creator's authority to send
+      # m.room.join_rules comes entirely from v12's implicit
+      # infinite-power-for-creators rule, which still requires
+      # check_sender_joined to see the creator's own membership first) —
+      # if the key were simply missing, this would already demonstrate the
+      # bug. Asserting the *newer* event specifically also re-confirms the
+      # depth tie-break direction this module fixed elsewhere.
+      assert v12[{"m.room.join_rules", ""}]["event_id"] == "$jr_newer"
+    end
+  end
 end
