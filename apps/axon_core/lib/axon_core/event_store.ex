@@ -15,13 +15,102 @@ defmodule AxonCore.EventStore do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Atomically inserts an event and updates derived state tables.
+  Atomically inserts an *accepted* event and updates derived state tables.
 
   The event map should be a fully-signed, finalized Matrix event map
   (with event_id, signatures, hashes set).
+
+  If a row for this event_id already exists and was previously stored via
+  `insert_rejected_event/2` (`rejected: true`), calling this "unrejects"
+  it: the row is flipped to `rejected: false`/`soft_failed: false` *and*
+  given a fresh `stream_ordering`. The fresh ordering matters — without
+  it, the event would keep sorting at its original (rejected-era)
+  position, which is very likely already before any `since` token a
+  client captured in the meantime, so it would never appear as a new
+  event down `/sync` (see `TestUnrejectRejectedEvents`: event B is
+  rejected while its prev_event is missing, then resent once that gap is
+  closed and must appear as a new timeline event, not backdated).
+
+  An idempotent resend of an event that's already accepted (not
+  previously rejected) is unaffected: the ordering bump only fires on an
+  actual rejected -> accepted transition.
   """
   def insert_event(event_map, room_version) do
     params = Event.from_wire(event_map, room_version)
+
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:existing, fn repo, _ ->
+      {:ok, repo.get_by(Event, event_id: params.event_id)}
+    end)
+    |> Ecto.Multi.insert(:event_raw, Event.changeset(%Event{}, params),
+      on_conflict: [set: [rejected: false, soft_failed: false]],
+      conflict_target: :event_id
+    )
+    |> Ecto.Multi.run(:event, fn repo, %{event_raw: _raw} ->
+      # Reload to get DB-assigned stream_ordering (BIGSERIAL).
+      # Also handles the on_conflict case — we still need the persisted row.
+      case repo.get_by(Event, event_id: params.event_id) do
+        nil -> {:error, :event_not_found}
+        event -> {:ok, event}
+      end
+    end)
+    |> Ecto.Multi.run(:unreject, fn repo, %{existing: existing, event: event} ->
+      if existing && existing.rejected do
+        repo.update_all(
+          from(e in Event,
+            where: e.event_id == ^event.event_id,
+            update: [set: [stream_ordering: fragment("nextval('events_stream_ordering_seq')")]]
+          ),
+          []
+        )
+
+        case repo.get_by(Event, event_id: event.event_id) do
+          nil -> {:error, :event_not_found}
+          refreshed -> {:ok, refreshed}
+        end
+      else
+        {:ok, event}
+      end
+    end)
+    |> Ecto.Multi.run(:state, fn repo, %{unreject: event} ->
+      update_current_state(repo, event)
+    end)
+    |> Ecto.Multi.run(:membership, fn repo, %{unreject: event} ->
+      update_membership(repo, event)
+    end)
+    |> Ecto.Multi.run(:auth_edges, fn repo, %{unreject: event} ->
+      insert_auth_edges(repo, event)
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{unreject: event}} -> {:ok, event}
+      {:error, :event_raw, changeset, _} -> {:error, changeset}
+      {:error, step, reason, _} -> {:error, {step, reason}}
+    end
+  end
+
+  @doc """
+  Persists an event that failed auth-checking (or whose ancestry could not
+  be resolved) as **rejected**.
+
+  Per spec, a rejected event is still *stored* (so `GET /event/{id}` and
+  `/event_auth` chain walks can see it, and it can later be "unrejected" —
+  see `insert_event/2`) but it is never applied to derived state: no
+  `current_room_state`/`room_memberships` row is written, so it is
+  invisible to `/state`, `/state_ids`, state resolution, and — via the
+  `not e.rejected` filters throughout this module — `/sync`, `/messages`
+  and friends.
+
+  If the event_id already exists as a **non**-rejected (already-applied)
+  event, this is a no-op that leaves the existing row untouched —
+  rejection must never downgrade an event that was already correctly
+  applied.
+  """
+  def insert_rejected_event(event_map, room_version) do
+    params =
+      event_map
+      |> Event.from_wire(room_version)
+      |> Map.put(:rejected, true)
 
     Ecto.Multi.new()
     |> Ecto.Multi.insert(:event_raw, Event.changeset(%Event{}, params),
@@ -29,18 +118,10 @@ defmodule AxonCore.EventStore do
       conflict_target: :event_id
     )
     |> Ecto.Multi.run(:event, fn repo, %{event_raw: _raw} ->
-      # Reload to get DB-assigned stream_ordering (BIGSERIAL).
-      # Also handles the on_conflict: :nothing case — we still need the persisted row.
       case repo.get_by(Event, event_id: params.event_id) do
         nil -> {:error, :event_not_found}
         event -> {:ok, event}
       end
-    end)
-    |> Ecto.Multi.run(:state, fn repo, %{event: event} ->
-      update_current_state(repo, event)
-    end)
-    |> Ecto.Multi.run(:membership, fn repo, %{event: event} ->
-      update_membership(repo, event)
     end)
     |> Ecto.Multi.run(:auth_edges, fn repo, %{event: event} ->
       insert_auth_edges(repo, event)
@@ -51,6 +132,13 @@ defmodule AxonCore.EventStore do
       {:error, :event_raw, changeset, _} -> {:error, changeset}
       {:error, step, reason, _} -> {:error, {step, reason}}
     end
+  end
+
+  @doc "True if any of `event_ids` is a stored, rejected event."
+  def any_rejected?([]), do: false
+
+  def any_rejected?(event_ids) do
+    Repo.exists?(from(e in Event, where: e.event_id in ^event_ids and e.rejected))
   end
 
   defp update_current_state(_repo, %Event{state_key: nil}), do: {:ok, nil}

@@ -84,7 +84,7 @@ defmodule AxonRoom.StateResolverTest do
       pdu = event(%{"prev_events" => []})
 
       assert StateResolver.resolve_for_auth_check(pdu, current_state, "$head", "10") ==
-               current_state
+               {:ok, current_state}
     end
 
     test "walks a multi-generation prev_events chain, not just one hop" do
@@ -127,7 +127,8 @@ defmodule AxonRoom.StateResolverTest do
 
       pdu = event(%{"prev_events" => [power_levels["event_id"]]})
 
-      resolved = StateResolver.resolve_for_auth_check(pdu, %{}, "$our_head_not_in_chain", "10")
+      {:ok, resolved} =
+        StateResolver.resolve_for_auth_check(pdu, %{}, "$our_head_not_in_chain", "10")
 
       assert resolved[{"m.room.create", ""}]["event_id"] == create["event_id"]
       assert resolved[{"m.room.member", @creator}]["event_id"] == creator_join["event_id"]
@@ -143,20 +144,25 @@ defmodule AxonRoom.StateResolverTest do
       current_state = %{{"m.room.name", ""} => name_event}
 
       pdu = event(%{"prev_events" => []})
-      resolved = StateResolver.resolve_for_auth_check(pdu, current_state, "$head", "10")
+      {:ok, resolved} = StateResolver.resolve_for_auth_check(pdu, current_state, "$head", "10")
 
       assert resolved[{"m.room.name", ""}] == name_event
     end
 
-    test "a prev_event that doesn't exist locally contributes nothing (doesn't crash)" do
+    test "a PDU whose only prev_event doesn't exist locally is refused, not silently guessed" do
       pdu = event(%{"prev_events" => ["$never-seen-this-one"]})
 
       current_state = %{
         {"m.room.create", ""} => event(%{"type" => "m.room.create", "state_key" => ""})
       }
 
+      # Regression: this used to fall back to current_state (the room's
+      # unrelated top state) instead of refusing to authorize an event
+      # whose actual history we don't have. See RoomProcess's
+      # :unresolvable handling and TestUnrejectRejectedEvents /
+      # TestCorruptedAuthChain.
       assert StateResolver.resolve_for_auth_check(pdu, current_state, "$head", "10") ==
-               current_state
+               :unresolvable
     end
 
     test "an unknown ancestor drops its whole branch rather than injecting an empty state" do
@@ -197,15 +203,24 @@ defmodule AxonRoom.StateResolverTest do
       # unknown branch is dropped, not injected as an empty state map (an
       # empty phantom branch would make every key in the known branch look
       # conflicted and force it through StateResV2's replay machinery
-      # unnecessarily).
+      # unnecessarily). Note this is *not* the same as the "all branches
+      # unresolvable" case above — there's still a real, resolvable branch
+      # here, so this is a grounded partial merge, not a guess.
       assert resolved_with_unknown == resolved_known_only
-      assert resolved_with_unknown[{"m.room.topic", ""}]["event_id"] == topic["event_id"]
+      assert {:ok, resolved} = resolved_with_unknown
+      assert resolved[{"m.room.topic", ""}]["event_id"] == topic["event_id"]
     end
 
     test "a cycle between locally-stored events terminates instead of looping forever" do
       # Nothing validates on insert that prev_events resolve to
       # already-known events, so out-of-order federation delivery can
       # produce a genuine cycle in local storage — simulated directly here.
+      # Note this cycle doesn't hit the new `:unresolvable` path: each
+      # event is a non-state event, so once the cyclic reference bottoms
+      # out (via the internal "drop the branch" leniency) applying it to
+      # an empty state is still a well-defined %{}, not an :unknown — the
+      # assertion here is mainly that this returns at all instead of
+      # looping forever.
       a = event(%{"event_id" => "$cycle_a", "prev_events" => ["$cycle_b"]})
       b = event(%{"event_id" => "$cycle_b", "prev_events" => ["$cycle_a"]})
 
@@ -214,10 +229,8 @@ defmodule AxonRoom.StateResolverTest do
 
       pdu = event(%{"prev_events" => ["$cycle_a"]})
 
-      # The assertion here is that this returns at all (a hang would time
-      # out the test) — a pure cycle has no resolvable state, so it's
-      # correctly treated the same as any other unresolvable branch.
-      assert StateResolver.resolve_for_auth_check(pdu, %{}, "$unrelated_head", "10") == %{}
+      assert StateResolver.resolve_for_auth_check(pdu, %{}, "$unrelated_head", "10") ==
+               {:ok, %{}}
     end
 
     test "a non-state event in a prev_events chain doesn't contribute to resolved state" do
@@ -237,7 +250,7 @@ defmodule AxonRoom.StateResolverTest do
       {:ok, _} = EventStore.insert_event(message, "10")
 
       pdu = event(%{"prev_events" => [message["event_id"]]})
-      resolved = StateResolver.resolve_for_auth_check(pdu, %{}, "$unrelated_head", "10")
+      {:ok, resolved} = StateResolver.resolve_for_auth_check(pdu, %{}, "$unrelated_head", "10")
 
       assert Map.keys(resolved) == [{"m.room.create", ""}]
       refute Enum.any?(resolved, fn {_k, v} -> v["event_id"] == message["event_id"] end)
@@ -294,7 +307,7 @@ defmodule AxonRoom.StateResolverTest do
 
       pdu = event(%{"prev_events" => ["$our_head", name_a["event_id"]]})
 
-      resolved =
+      {:ok, resolved} =
         StateResolver.resolve_for_auth_check(pdu, current_state, "$our_head", "10")
 
       winner = resolved[{"m.room.name", ""}]["content"]["name"]
