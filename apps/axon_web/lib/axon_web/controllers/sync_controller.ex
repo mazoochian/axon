@@ -1,4 +1,27 @@
 defmodule AxonWeb.SyncController do
+  @moduledoc """
+  Classic `/sync` — `GET /_matrix/client/v3/sync`.
+
+  `unread_notifications` (`notification_count`/`highlight_count`) per
+  joined room is computed via `AxonWeb.SyncHelpers.unread_counts/2` — the
+  same on-the-fly, capped-scan function sliding sync uses (see its doc for
+  why on-the-fly was chosen over a maintained counter table), so the two
+  endpoints can't report different numbers for the same room. Only sent
+  for rooms already included in this response (gated by
+  `build_rooms_response/6`'s existing new-events-or-ephemeral-change
+  check) — a push-rule change with no accompanying event or receipt in a
+  room won't refresh its badge until something else touches that room,
+  same pre-existing incremental-diff limitation classic sync already has
+  for everything else it sends.
+
+  `unread_thread_notifications` (MSC in spec since Matrix 1.4, keyed by
+  thread root event ID) is deliberately not sent: axon has no per-thread
+  receipt or unread-tracking model anywhere (no `m.read` receipts scoped
+  to a thread), so there is nothing correct to compute — omitting the key
+  entirely is honest; a thread-aware client falls back to normal
+  behavior, and a non-thread-aware one never looks for the key at all.
+  """
+
   use Phoenix.Controller, formats: [:json]
 
   plug(AxonWeb.Plug.RateLimit, [bucket: :sync, key_by: :user] when action == :sync)
@@ -278,6 +301,8 @@ defmodule AxonWeb.SyncController do
     timeline_with_relations =
       EventStore.bundle_relations(room_id, timeline_with_membership, user_id: user_id)
 
+    unread = SyncHelpers.unread_counts(room_id, user_id)
+
     %{
       "timeline" => %{
         "events" => timeline_with_relations,
@@ -287,7 +312,11 @@ defmodule AxonWeb.SyncController do
       "state" => %{"events" => filtered_state},
       "account_data" => %{"events" => room_account_data},
       "ephemeral" => %{"events" => ephemeral},
-      "summary" => %{}
+      "summary" => %{},
+      "unread_notifications" => %{
+        "notification_count" => unread.notification_count,
+        "highlight_count" => unread.highlight_count
+      }
     }
   end
 

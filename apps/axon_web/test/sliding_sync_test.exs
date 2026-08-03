@@ -334,6 +334,35 @@ defmodule AxonWeb.SlidingSyncTest do
       body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
       assert body["rooms"][room_id]["notification_count"] == 0
     end
+
+    test "a muted room's push rule suppresses the count entirely" do
+      alice = register("ss_notif_mute_alice_#{System.unique_integer([:positive])}")
+      bob = register("ss_notif_mute_bob_#{System.unique_integer([:positive])}")
+      # A direct /join, not an invite — see the equivalent classic-sync test
+      # (sync_notifications_test.exs) for why: an invite notification fires
+      # via an "override"-kind rule that halts before a "room"-kind mute
+      # rule is ever reached, so muting afterward can't retroactively
+      # suppress it.
+      room_id = create_room(bob.token, %{"name" => "Mute", "preset" => "public_chat"})
+      join_room(alice.token, room_id)
+
+      mute_conn =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/pushrules/global/room/#{room_id}", %{
+          "actions" => ["dont_notify"]
+        })
+
+      assert mute_conn.status == 200
+
+      send_event(bob.token, room_id, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "should not bump the badge"
+      })
+
+      body = sliding_sync(alice.token, %{"lists" => %{"main" => basic_list()}})
+      assert body["rooms"][room_id]["notification_count"] == 0
+      assert body["rooms"][room_id]["highlight_count"] == 0
+    end
   end
 
   describe "long-poll wake-up" do

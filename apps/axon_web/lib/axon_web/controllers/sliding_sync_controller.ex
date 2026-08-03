@@ -35,18 +35,11 @@ defmodule AxonWeb.SlidingSyncController do
     * Extension params aren't sticky across requests — a client must resend
       `"enabled": true` (and any config) on every request, not just the first
       time it turns an extension on.
-    * `notification_count`/`highlight_count` are computed per room by
-      re-evaluating this user's push rules (`AxonPush.RuleEvaluator`)
-      against every event since their `m.read` receipt (room start if
-      they've never sent one), capped at #{inspect(500)} scanned events —
-      a room with more unread events than that undercounts rather than
-      doing unbounded work on every sync poll. Real homeservers avoid the
-      cap by maintaining a push-actions table incrementally as events
-      arrive instead of recomputing on read; that's a bigger lift than
-      this pass covers. Classic `/sync` doesn't get this (still always 0
-      there) — kept local to sliding sync rather than promoted to the
-      shared `SyncHelpers`, deliberately, to avoid claiming classic sync
-      also changed.
+    * `notification_count`/`highlight_count` are computed per room via
+      `AxonWeb.SyncHelpers.unread_counts/2` — see its doc for the on-the-fly-
+      vs-counter-table tradeoff. Classic `/sync` surfaces the exact same
+      numbers under `unread_notifications` now (both call the same shared
+      function, so the two can't drift apart on this either).
 
   Long-poll wake-up reuses `AxonSync.Manager.wait_for_events/3` exactly as
   classic sync does, so the Phase 8 wake-up fixes (to-device, device-list,
@@ -57,12 +50,9 @@ defmodule AxonWeb.SlidingSyncController do
 
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
-  alias AxonPush.{RuleEvaluator, UserRules}
   alias AxonSync.Manager, as: SyncManager
   alias AxonWeb.SlidingSync.ConnState
   alias AxonWeb.SyncHelpers
-
-  @notification_scan_cap 500
 
   # POST /_matrix/client/unstable/org.matrix.msc4186/sync
   def sync(conn, params) do
@@ -330,7 +320,7 @@ defmodule AxonWeb.SlidingSyncController do
       resolve_required_state(room_id, user_id, cfg["required_state"] || [], raw_timeline)
 
     counts = EventStore.member_counts(room_id)
-    unread = unread_counts(room_id, user_id)
+    unread = SyncHelpers.unread_counts(room_id, user_id)
 
     prev_batch =
       case raw_timeline do
@@ -361,54 +351,6 @@ defmodule AxonWeb.SlidingSyncController do
   # invite/knock state, name/avatar, is_dm) is real content, so plain map
   # equality is the whole comparison — no separate hashing needed.
   defp room_fingerprint(entry), do: Map.delete(entry, "initial")
-
-  # ---------------------------------------------------------------------------
-  # Notification/highlight counts
-  # ---------------------------------------------------------------------------
-
-  defp unread_counts(room_id, user_id) do
-    since_ordering = read_receipt_ordering(room_id, user_id)
-    rules = UserRules.effective_rules(user_id)
-
-    room_id
-    |> EventStore.get_events_since(since_ordering, @notification_scan_cap)
-    |> Enum.reject(&(&1.sender == user_id))
-    |> Enum.reduce(%{notification_count: 0, highlight_count: 0}, fn event, acc ->
-      case RuleEvaluator.should_notify?(EventStore.event_to_map(event), room_id, user_id, rules) do
-        {:notify, actions} ->
-          acc = %{acc | notification_count: acc.notification_count + 1}
-          if highlight?(actions), do: %{acc | highlight_count: acc.highlight_count + 1}, else: acc
-
-        :dont_notify ->
-          acc
-      end
-    end)
-  end
-
-  defp read_receipt_ordering(room_id, user_id) do
-    receipt_event_id =
-      Repo.one(
-        from(r in "receipts",
-          where: r.room_id == ^room_id and r.user_id == ^user_id and r.receipt_type == "m.read",
-          select: r.event_id
-        )
-      )
-
-    with event_id when not is_nil(event_id) <- receipt_event_id,
-         {:ok, event} <- EventStore.get_event(event_id) do
-      event.stream_ordering
-    else
-      _ -> 0
-    end
-  end
-
-  defp highlight?(actions) do
-    Enum.any?(actions, fn
-      %{"set_tweak" => "highlight", "value" => value} -> value != false
-      %{"set_tweak" => "highlight"} -> true
-      _ -> false
-    end)
-  end
 
   defp room_name(room_id) do
     case EventStore.get_state_event(room_id, "m.room.name", "") do

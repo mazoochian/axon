@@ -1,14 +1,19 @@
 defmodule AxonPush.Dispatcher do
   @moduledoc """
-  Dispatches push notifications to registered HTTP pushers after a room event.
-  Fire-and-forget: failures are logged but never propagate to the caller.
+  Dispatches push notifications to registered HTTP pushers after a room event,
+  and records a durable `AxonPush.Notifications` ledger row for every joined
+  recipient whose push rules say to notify — regardless of whether they have
+  a pusher registered, since `GET /_matrix/client/v3/notifications` and the
+  live unread badge both need that to exist even for a client that never set
+  up push. Fire-and-forget: failures are logged but never propagate to the
+  caller.
   """
 
   require Logger
 
   import Ecto.Query
   alias AxonCore.Repo
-  alias AxonPush.{RuleEvaluator, UserRules}
+  alias AxonPush.{Notifications, RuleEvaluator, UserRules}
 
   @doc "Called after an event is persisted. Runs in a Task so it never blocks RoomProcess."
   def dispatch_event(event, room_id) do
@@ -28,27 +33,28 @@ defmodule AxonPush.Dispatcher do
         )
       )
 
-    # Don't push to the sender
+    # Don't push to (or notify) the sender about their own event.
     sender = event["sender"]
     recipients = Enum.reject(members, &(&1 == sender))
 
     Enum.each(recipients, fn user_id ->
-      pushers = get_pushers(user_id)
+      rules = UserRules.effective_rules(user_id)
 
-      if pushers != [] do
-        rules = UserRules.effective_rules(user_id)
+      case RuleEvaluator.should_notify?(event, room_id, user_id, rules) do
+        {:notify, actions} ->
+          Notifications.record(user_id, room_id, event, actions)
 
-        case RuleEvaluator.should_notify?(event, room_id, user_id, rules) do
-          {:notify, actions} ->
-            tweaks = extract_tweaks(actions)
+          case get_pushers(user_id) do
+            [] ->
+              :ok
 
-            Enum.each(pushers, fn pusher ->
-              send_http_push(pusher, event, room_id, tweaks)
-            end)
+            pushers ->
+              tweaks = extract_tweaks(actions)
+              Enum.each(pushers, fn pusher -> send_http_push(pusher, event, room_id, tweaks) end)
+          end
 
-          :dont_notify ->
-            :ok
-        end
+        :dont_notify ->
+          :ok
       end
     end)
   end
