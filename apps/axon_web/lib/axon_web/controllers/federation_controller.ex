@@ -1203,4 +1203,241 @@ defmodule AxonWeb.FederationController do
        end))
     |> Enum.uniq()
   end
+
+  # ---------------------------------------------------------------------------
+  # GET /_matrix/federation/v1/hierarchy/:room_id
+  #
+  # Server-to-server counterpart of the CS API's /hierarchy. Called by
+  # AxonWeb.SpaceController.fetch_remote_entry/3 when a local hierarchy walk
+  # reaches a room this server isn't resident in. Contract expected by that
+  # caller (do not change field names without updating both sides):
+  #
+  #   200 {"room" => <summary-map, same field names as the CS API per-room
+  #                    entry: room_id, name?, topic?, avatar_url?,
+  #                    canonical_alias?, num_joined_members, world_readable,
+  #                    guest_can_join, join_rule, room_type?, room_version,
+  #                    encryption?, allowed_room_ids?, children_state>,
+  #        "children" => [<same-shaped summaries for this room's own
+  #                        immediate space-children, no further nesting>],
+  #        "inaccessible_children" => [<room_id, ...>]}
+  #   404 {"errcode" => "M_NOT_FOUND", ...} — room doesn't exist locally, or
+  #        isn't visible to this origin server at all (not public/world-
+  #        readable, and the origin has no user satisfying a restricted
+  #        room's allow-list).
+  #   403 — origin is ACL-denied (mirror the acl_allowed?/acl_forbidden
+  #        pattern used by event_auth/backfill/etc. in this same file).
+  #
+  # Unlike the CS API version, there's no specific requesting *user* — only
+  # a requesting *server* (the X-Matrix-authenticated `origin`). A
+  # restricted room's allow-list is satisfied here if origin has *any* user
+  # joined to one of the allow-listed rooms, checked against this server's
+  # own local room_memberships for that room (only meaningful if this
+  # server happens to be resident there — see TestRestrictedRoomsSpacesSummaryFederation's
+  # own comment: hs2 only learns hs1 has a member of the space once *some*
+  # hs2 user joins the space and hs2 becomes resident in it).
+  # ---------------------------------------------------------------------------
+
+  def hierarchy(conn, %{"room_id" => room_id} = params) do
+    origin = conn.assigns[:origin_server]
+    suggested_only = params["suggested_only"] in ["true", true]
+
+    cond do
+      not acl_allowed?(room_id, origin) ->
+        acl_forbidden(conn)
+
+      not room_exists?(room_id) ->
+        hierarchy_not_found(conn)
+
+      not server_may_see?(room_id, origin) ->
+        hierarchy_not_found(conn)
+
+      true ->
+        children = hierarchy_child_events(room_id, suggested_only)
+        room = hierarchy_build_entry(room_id, children)
+
+        child_summaries =
+          children
+          |> Enum.map(& &1["state_key"])
+          |> Enum.filter(&room_exists?/1)
+          |> Enum.filter(&server_may_see?(&1, origin))
+          |> Enum.map(fn child_id ->
+            hierarchy_build_entry(child_id, hierarchy_child_events(child_id, suggested_only))
+          end)
+
+        inaccessible =
+          children
+          |> Enum.map(& &1["state_key"])
+          |> Enum.reject(fn child_id ->
+            room_exists?(child_id) and server_may_see?(child_id, origin)
+          end)
+
+        json(conn, %{
+          "room" => room,
+          "children" => child_summaries,
+          "inaccessible_children" => inaccessible
+        })
+    end
+  end
+
+  defp hierarchy_not_found(conn) do
+    conn
+    |> put_status(404)
+    |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found or not accessible"})
+  end
+
+  # A room is visible to a requesting *server* if it's public/knock-joinable,
+  # world-readable, or — for a restricted room — origin has a locally-known
+  # member (per this server's own state) in one of the allow-listed rooms.
+  defp server_may_see?(room_id, origin) do
+    state = hierarchy_state_map(room_id, ["m.room.join_rules", "m.room.history_visibility"])
+    join_rule = get_in(state, ["m.room.join_rules", "join_rule"])
+    history_visibility = get_in(state, ["m.room.history_visibility", "history_visibility"])
+
+    join_rule in ["public", "knock"] or history_visibility == "world_readable" or
+      (join_rule in ["restricted", "knock_restricted"] and
+         restricted_allow_satisfied_by_server?(state, origin))
+  end
+
+  defp restricted_allow_satisfied_by_server?(state, origin) do
+    allow = get_in(state, ["m.room.join_rules", "allow"]) || []
+
+    allow
+    |> Enum.filter(&(&1["type"] == "m.room_membership"))
+    |> Enum.map(& &1["room_id"])
+    |> Enum.reject(&is_nil/1)
+    |> Enum.any?(&any_local_member_from_server?(&1, origin))
+  end
+
+  defp any_local_member_from_server?(room_id, origin) do
+    Repo.exists?(
+      from(m in "room_memberships",
+        where: m.room_id == ^room_id and m.membership == "join",
+        where: fragment("split_part(?, ':', 2)", m.user_id) == ^origin
+      )
+    )
+  end
+
+  defp room_exists?(room_id) do
+    Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: 1)) != nil
+  end
+
+  defp hierarchy_state_map(room_id, types) do
+    Repo.all(
+      from(s in "current_room_state",
+        join: e in "events",
+        on: e.event_id == s.event_id,
+        where: s.room_id == ^room_id and s.type in ^types,
+        select: %{type: s.type, content: e.content}
+      )
+    )
+    |> Enum.into(%{}, fn r -> {r.type, r.content} end)
+  end
+
+  defp hierarchy_child_events(room_id, suggested_only) do
+    rows =
+      Repo.all(
+        from(s in "current_room_state",
+          join: e in "events",
+          on: e.event_id == s.event_id,
+          where: s.room_id == ^room_id and s.type == "m.space.child",
+          select: %{
+            state_key: s.state_key,
+            content: e.content,
+            sender: e.sender,
+            origin_server_ts: e.origin_server_ts
+          }
+        )
+      )
+      |> Enum.reject(&(&1.content == %{} or &1.content == nil))
+
+    rows =
+      if suggested_only,
+        do: Enum.filter(rows, &(get_in(&1.content, ["suggested"]) == true)),
+        else: rows
+
+    Enum.map(rows, fn r ->
+      %{
+        "type" => "m.space.child",
+        "state_key" => r.state_key,
+        "content" => r.content,
+        "sender" => r.sender,
+        "origin_server_ts" => r.origin_server_ts
+      }
+    end)
+  end
+
+  defp hierarchy_build_entry(room_id, children) do
+    state =
+      hierarchy_state_map(room_id, [
+        "m.room.name",
+        "m.room.topic",
+        "m.room.avatar",
+        "m.room.canonical_alias",
+        "m.room.history_visibility",
+        "m.room.guest_access",
+        "m.room.join_rules",
+        "m.room.create",
+        "m.room.encryption"
+      ])
+
+    num_joined =
+      Repo.one(
+        from(m in "room_memberships",
+          where: m.room_id == ^room_id and m.membership == "join",
+          select: count(m.user_id)
+        )
+      ) || 0
+
+    room_type = get_in(state, ["m.room.create", "type"])
+    guest_access = get_in(state, ["m.room.guest_access", "guest_access"]) || "forbidden"
+
+    history_visibility =
+      get_in(state, ["m.room.history_visibility", "history_visibility"]) || "shared"
+
+    join_rule = get_in(state, ["m.room.join_rules", "join_rule"]) || "invite"
+
+    room_version =
+      Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.version)) || "1"
+
+    entry = %{
+      "room_id" => room_id,
+      "num_joined_members" => num_joined,
+      "world_readable" => history_visibility == "world_readable",
+      "guest_can_join" => guest_access == "can_join",
+      "join_rule" => join_rule,
+      "room_version" => room_version,
+      "children_state" => children
+    }
+
+    entry =
+      Enum.reduce(
+        [
+          {get_in(state, ["m.room.name", "name"]), "name"},
+          {get_in(state, ["m.room.topic", "topic"]), "topic"},
+          {get_in(state, ["m.room.avatar", "url"]), "avatar_url"},
+          {get_in(state, ["m.room.canonical_alias", "alias"]), "canonical_alias"},
+          {room_type, "room_type"},
+          {get_in(state, ["m.room.encryption", "algorithm"]), "encryption"}
+        ],
+        entry,
+        fn
+          {nil, _k}, acc -> acc
+          {v, k}, acc -> Map.put(acc, k, v)
+        end
+      )
+
+    if join_rule in ["restricted", "knock_restricted"] do
+      allow = get_in(state, ["m.room.join_rules", "allow"]) || []
+
+      ids =
+        allow
+        |> Enum.filter(&(&1["type"] == "m.room_membership"))
+        |> Enum.map(& &1["room_id"])
+        |> Enum.reject(&is_nil/1)
+
+      if ids == [], do: entry, else: Map.put(entry, "allowed_room_ids", ids)
+    else
+      entry
+    end
+  end
 end

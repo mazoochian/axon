@@ -302,4 +302,66 @@ defmodule AxonWeb.SpaceControllerTest do
     assert length(Enum.uniq(all_ids)) == length(all_ids)
     refute Map.has_key?(body2, "next_batch")
   end
+
+  # GET /_matrix/client/v1/room_summary/:room_id_or_alias — a different
+  # endpoint from /hierarchy, and the one TestRoomSummaryAllowedRoomIDs hits.
+  describe "room_summary" do
+    test "summarises a room by id, without children_state, and reports membership" do
+      alice = register("summary_alice_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat", "name" => "Summarised"})
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v1/room_summary/#{URI.encode(room_id)}")
+
+      assert conn.status == 200
+      body = decode(conn)
+
+      assert body["room_id"] == room_id
+      assert body["name"] == "Summarised"
+      assert body["join_rule"] == "public"
+      assert body["membership"] == "join"
+      refute Map.has_key?(body, "children_state")
+    end
+
+    test "surfaces allowed_room_ids for a restricted room" do
+      alice = register("summary_restricted_#{System.unique_integer([:positive])}")
+      space_id = space(alice.token, "Gate")
+
+      restricted_id =
+        create_room(alice.token, %{
+          "preset" => "private_chat",
+          "initial_state" => [
+            %{
+              "type" => "m.room.join_rules",
+              "state_key" => "",
+              "content" => %{
+                "join_rule" => "restricted",
+                "allow" => [%{"type" => "m.room_membership", "room_id" => space_id}]
+              }
+            }
+          ]
+        })
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v1/room_summary/#{URI.encode(restricted_id)}")
+
+      assert conn.status == 200
+      body = decode(conn)
+      assert body["join_rule"] == "restricted"
+      assert body["allowed_room_ids"] == [space_id]
+    end
+
+    test "404s for an unknown room" do
+      alice = register("summary_404_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v1/room_summary/#{URI.encode("!nope:localhost")}")
+
+      assert conn.status == 404
+      assert %{"errcode" => "M_NOT_FOUND"} = decode(conn)
+    end
+  end
 end

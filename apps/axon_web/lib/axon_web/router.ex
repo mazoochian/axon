@@ -271,6 +271,7 @@ defmodule AxonWeb.Router do
     get("/v1/state_ids/:room_id", FederationController, :get_state_ids)
     get("/v1/backfill/:room_id", FederationController, :backfill)
     get("/v1/event_auth/:room_id/:event_id", FederationController, :event_auth)
+    get("/v1/hierarchy/:room_id", FederationController, :hierarchy)
     post("/v1/get_missing_events/:room_id", FederationController, :get_missing_events)
     get("/v1/query/directory", FederationController, :query_directory)
     get("/v1/query/profile", FederationController, :query_profile)
@@ -383,6 +384,7 @@ defmodule AxonWeb.Router do
 
     # Spaces — Phase 5
     get("/v1/rooms/:room_id/hierarchy", SpaceController, :hierarchy)
+    get("/v1/room_summary/:room_id_or_alias", SpaceController, :room_summary)
 
     # Sync
     get("/v3/sync", SyncController, :sync)

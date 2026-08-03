@@ -1045,6 +1045,84 @@ defmodule AxonWeb.FederationControllerTest do
   # query/directory, query/profile
   # ---------------------------------------------------------------------------
 
+  describe "GET /_matrix/federation/v1/hierarchy/:room_id" do
+    setup do
+      owner = new_local_user("spaceowner")
+
+      {:ok, space_id} =
+        CreateRoom.execute(owner,
+          server_name: "localhost",
+          preset: "public_chat",
+          name: "The Space",
+          creation_content: %{"type" => "m.space"}
+        )
+
+      {:ok, child_id} =
+        CreateRoom.execute(owner,
+          server_name: "localhost",
+          preset: "public_chat",
+          name: "Public Child"
+        )
+
+      {:ok, private_child_id} =
+        CreateRoom.execute(owner, server_name: "localhost", preset: "private_chat")
+
+      for target <- [child_id, private_child_id] do
+        {:ok, _} =
+          RoomProcess.send_event(space_id, owner, "m.space.child", %{"via" => ["localhost"]},
+            state_key: target
+          )
+      end
+
+      %{owner: owner, space_id: space_id, child_id: child_id, private_child_id: private_child_id}
+    end
+
+    test "returns the space summary plus its accessible children", ctx do
+      conn = signed_get("/_matrix/federation/v1/hierarchy/#{URI.encode(ctx.space_id)}")
+      assert conn.status == 200
+      body = decode(conn)
+
+      assert body["room"]["room_id"] == ctx.space_id
+      assert body["room"]["name"] == "The Space"
+      assert body["room"]["room_type"] == "m.space"
+      assert body["room"]["join_rule"] == "public"
+      assert is_integer(body["room"]["num_joined_members"])
+
+      # children_state carries the m.space.child events themselves
+      child_keys = Enum.map(body["room"]["children_state"], & &1["state_key"])
+      assert ctx.child_id in child_keys
+
+      # the public child is summarised; the private one is not
+      summarised = Enum.map(body["children"], & &1["room_id"])
+      assert ctx.child_id in summarised
+      refute ctx.private_child_id in summarised
+      assert ctx.private_child_id in body["inaccessible_children"]
+    end
+
+    test "404s for a room this server doesn't have" do
+      conn = signed_get("/_matrix/federation/v1/hierarchy/#{URI.encode("!nope:localhost")}")
+      assert conn.status == 404
+      assert %{"errcode" => "M_NOT_FOUND"} = decode(conn)
+    end
+
+    test "404s for a room the requesting server may not see", ctx do
+      conn = signed_get("/_matrix/federation/v1/hierarchy/#{URI.encode(ctx.private_child_id)}")
+      assert conn.status == 404
+    end
+
+    test "suggested_only filters children_state down to suggested links", ctx do
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/hierarchy/#{URI.encode(ctx.space_id)}?suggested_only=true"
+        )
+
+      assert conn.status == 200
+      # No child was marked suggested, so nothing survives the filter.
+      assert decode(conn)["room"]["children_state"] == []
+      assert decode(conn)["children"] == []
+    end
+  end
+
   describe "query_directory / query_profile" do
     test "query_directory resolves a known alias to a room_id" do
       owner = new_local_user("owner")
