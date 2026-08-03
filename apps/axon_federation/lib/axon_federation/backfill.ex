@@ -73,7 +73,7 @@ defmodule AxonFederation.Backfill do
 
     case missing_ids(prev_events) do
       [] -> :ok
-      missing -> close_gap(room_id, origin, missing)
+      missing -> close_gap(room_id, origin, pdu, missing)
     end
   end
 
@@ -82,8 +82,12 @@ defmodule AxonFederation.Backfill do
     Enum.reject(event_ids, &Map.has_key?(known, &1))
   end
 
-  defp close_gap(room_id, origin, missing) do
-    case fetch_get_missing_events(room_id, origin, missing) do
+  # `pdu` (not just its missing `prev_events`) has to be threaded through to
+  # `fetch_get_missing_events/3` — see that function's doc for why passing
+  # the missing prev_event ids themselves as `latest_events` (the bug this
+  # replaced) made every well-formed `get_missing_events` request fail.
+  defp close_gap(room_id, origin, pdu, missing) do
+    case fetch_get_missing_events(room_id, origin, pdu) do
       {:ok, events} when events != [] ->
         apply_oldest_first(room_id, origin, events)
 
@@ -116,12 +120,22 @@ defmodule AxonFederation.Backfill do
     end
   end
 
-  defp fetch_get_missing_events(room_id, origin, latest_ids) do
+  # Per the Server-Server API, `latest_events` is the event(s) whose
+  # ancestry the *receiving* server wants walked backwards from — i.e. the
+  # PDU we just got that has a gap — and `earliest_events` is the boundary
+  # of what we already have, so the response doesn't walk further back
+  # than necessary. This previously passed the *missing prev_event ids*
+  # as `latest_events` instead of `pdu`'s own id, which asks the origin
+  # for the wrong thing entirely (walk back from an event we don't have,
+  # rather than from the one we do) and fails a well-formed-request check
+  # against any strict server (Complement's `TestGetMissingEventsGapFilling`
+  # and `TestCorruptedAuthChain` both assert on this request's shape).
+  defp fetch_get_missing_events(room_id, origin, pdu) do
     path = "/_matrix/federation/v1/get_missing_events/#{URI.encode(room_id)}"
 
     body = %{
-      "earliest_events" => [],
-      "latest_events" => latest_ids,
+      "earliest_events" => known_head_ids(room_id),
+      "latest_events" => [pdu["event_id"]],
       "limit" => @get_missing_events_limit,
       "min_depth" => 0
     }
@@ -139,6 +153,18 @@ defmodule AxonFederation.Backfill do
         )
 
         err
+    end
+  end
+
+  # Our own resident room process's current head, as a single-element
+  # `earliest_events` boundary — best-effort: an empty list here just means
+  # the origin walks back further than strictly necessary, not a correctness
+  # problem (unlike `latest_events`, which must be right for the request to
+  # ask for anything sensible at all).
+  defp known_head_ids(room_id) do
+    case RoomProcess.get_position(room_id) do
+      {last_event_id, _depth} when is_binary(last_event_id) -> [last_event_id]
+      _ -> []
     end
   end
 

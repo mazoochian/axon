@@ -227,6 +227,93 @@ defmodule AxonRoom.RoomProcessTest do
     end
   end
 
+  describe "apply_remote_event/2 — unreject on a later-arriving ancestor" do
+    test "an event rejected for an unresolvable prev_event is unrejected, with a fresh " <>
+           "stream_ordering, once that ancestor arrives (Complement: TestUnrejectRejectedEvents)" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      remote_user = "@bob:federated.example"
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      join_pdu = %{
+        "event_id" => "$bobjoin_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      {:ok, join_event_id} = RoomProcess.apply_remote_event(room_id, join_pdu)
+
+      event_a_id = "$event_a_#{System.unique_integer([:positive])}"
+
+      event_a_pdu = %{
+        "event_id" => event_a_id,
+        "room_id" => room_id,
+        "type" => "m.event.a",
+        "sender" => remote_user,
+        "content" => %{"event" => "A"},
+        "depth" => depth + 2,
+        "prev_events" => [join_event_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      event_b_pdu = %{
+        "event_id" => "$event_b_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.event.b",
+        "sender" => remote_user,
+        "content" => %{"event" => "B"},
+        "depth" => depth + 3,
+        "prev_events" => [event_a_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      # Send B first: A is unknown, so this must be refused and stored rejected.
+      assert RoomProcess.apply_remote_event(room_id, event_b_pdu) == {:error, :unknown_ancestor}
+      assert {:ok, stored_b} = AxonCore.EventStore.get_event(event_b_pdu["event_id"])
+      assert stored_b.rejected == true
+      rejected_ordering = stored_b.stream_ordering
+
+      # Now send A — it lands cleanly (its own prev_event is our current head).
+      assert {:ok, ^event_a_id} = RoomProcess.apply_remote_event(room_id, event_a_pdu)
+      assert {:ok, stored_a} = AxonCore.EventStore.get_event(event_a_id)
+
+      # A "since" token captured right after A arrives — B must appear as a
+      # genuinely *new* event after this point, not be missed because it
+      # already sorted before it back when it was (wrongly) inserted rejected.
+      since_ordering = stored_a.stream_ordering
+
+      # Resend B — A now exists, so this unrejects it.
+      assert RoomProcess.apply_remote_event(room_id, event_b_pdu) ==
+               {:ok, event_b_pdu["event_id"]}
+
+      assert {:ok, unrejected_b} = AxonCore.EventStore.get_event(event_b_pdu["event_id"])
+      assert unrejected_b.rejected == false
+      assert unrejected_b.stream_ordering > rejected_ordering
+      assert unrejected_b.stream_ordering > since_ordering
+
+      # And it shows up as a new event after the since token, per the
+      # Complement test's `MustSyncUntil(Since: since, ...eventB...)`.
+      events_after_since = AxonCore.EventStore.get_events_since(room_id, since_ordering, 1000)
+      assert Enum.any?(events_after_since, &(&1.event_id == event_b_pdu["event_id"]))
+    end
+  end
+
   describe "apply_remote_event/2 — transitive auth rejection" do
     test "a PDU whose auth_events reference an already-rejected event is itself rejected" do
       creator = new_user("alice")
@@ -281,6 +368,48 @@ defmodule AxonRoom.RoomProcessTest do
 
       assert {:ok, dependent_stored} = AxonCore.EventStore.get_event(dependent_pdu["event_id"])
       assert dependent_stored.rejected == true
+    end
+
+    test "a PDU whose auth_events reference an event we have no record of at all is " <>
+           "rejected too, not just one we know is rejected " <>
+           "(Complement: TestInboundFederationRejectsEventsWithRejectedAuthEvents)" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      # An id this server was never sent and never fetched — not stored as
+      # accepted, not stored as rejected, simply absent. Unlike the sibling
+      # "transitive auth rejection" test above (a *known*-rejected ancestor),
+      # this is the "outlier we don't have at all" case.
+      never_seen_id = "$never_seen_outlier_#{System.unique_integer([:positive])}"
+
+      dependent_pdu = %{
+        "event_id" => "$dependent_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => creator,
+        "content" => %{"body" => "hi"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [never_seen_id],
+        "origin" => "localhost",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, dependent_pdu) ==
+               {:error, :unknown_auth_event}
+
+      assert RoomProcess.get_position(room_id) == {last_event_id, depth}
+
+      assert {:ok, dependent_stored} = AxonCore.EventStore.get_event(dependent_pdu["event_id"])
+      assert dependent_stored.rejected == true
+
+      # The never-seen id itself must stay exactly that — absent — not get
+      # invented as a side effect of the check.
+      assert AxonCore.EventStore.get_event(never_seen_id) == {:error, :not_found}
     end
   end
 
