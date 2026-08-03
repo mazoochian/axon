@@ -555,6 +555,34 @@ defmodule AxonWeb.FederationController do
     end
   end
 
+  # Inbound half of AxonFederation.DeviceListFanout (the outbound sender —
+  # see its moduledoc for why gap detection on stream_id/prev_id is
+  # deliberately skipped): treated purely as a "go re-query this user's
+  # devices" signal, exactly like a local device_lists.changed entry
+  # already is. AxonWeb.KeyController's federation /keys/query path
+  # (fetch_remote_keys/2) always does a live round trip for a remote
+  # user's actual key material rather than trusting a cache, so there's
+  # nothing here to reconcile against a missed/reordered update — only
+  # local /sync clients who share a room with this user need to be told
+  # something changed, the same KeyStore.record_device_list_update/1 every
+  # other device-list-changing code path in this codebase already calls.
+  defp process_inbound_edu(
+         %{"edu_type" => "m.device_list_update", "content" => content},
+         origin
+       )
+       when is_map(content) do
+    user_id = content["user_id"]
+    sender_server = user_id |> to_string() |> String.split(":") |> List.last()
+
+    if is_binary(user_id) and sender_server == origin do
+      KeyStore.record_device_list_update(user_id)
+    else
+      Logger.warning(
+        "Dropping m.device_list_update EDU from #{origin} claiming user #{inspect(user_id)}"
+      )
+    end
+  end
+
   defp process_inbound_edu(_edu, _origin), do: :ok
 
   # ---------------------------------------------------------------------------
@@ -735,6 +763,64 @@ defmodule AxonWeb.FederationController do
       acl_forbidden(conn)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # GET /_matrix/federation/v1/timestamp_to_event/:room_id
+  #
+  # Server-server counterpart of the client "jump to date" endpoint (GET
+  # /_matrix/client/v1/rooms/:room_id/timestamp_to_event,
+  # AxonWeb.EventController.timestamp_to_event/2). A resident server that
+  # joined too late to hold history around a given timestamp asks a server
+  # that does — this is the side that answers. Same local search
+  # (EventStore.find_event_by_timestamp/3) the client endpoint uses, gated
+  # by ACL only: unlike the client endpoint there's no membership check,
+  # because what's being authorized here is the requesting *server*, same
+  # as get_state/get_event/backfill above.
+  # ---------------------------------------------------------------------------
+
+  def timestamp_to_event(conn, %{"room_id" => room_id} = params) do
+    origin = conn.assigns[:origin_server]
+
+    with {:ok, ts} <- parse_ts_param(params["ts"]),
+         {:ok, dir} <- parse_dir_param(params["dir"]) do
+      cond do
+        not acl_allowed?(room_id, origin) ->
+          acl_forbidden(conn)
+
+        event = EventStore.find_event_by_timestamp(room_id, ts, dir) ->
+          json(conn, %{
+            "event_id" => event.event_id,
+            "origin_server_ts" => event.origin_server_ts
+          })
+
+        true ->
+          conn
+          |> put_status(404)
+          |> json(%{
+            "errcode" => "M_NOT_FOUND",
+            "error" => "Unable to find event from #{ts} in direction #{dir}"
+          })
+      end
+    else
+      {:error, errcode, message} ->
+        conn |> put_status(400) |> json(%{"errcode" => errcode, "error" => message})
+    end
+  end
+
+  defp parse_ts_param(ts) when is_binary(ts) do
+    case Integer.parse(ts) do
+      {value, ""} when value >= 0 -> {:ok, value}
+      _ -> {:error, "M_INVALID_PARAM", "Query parameter ts must be a non-negative integer"}
+    end
+  end
+
+  defp parse_ts_param(_), do: {:error, "M_MISSING_PARAM", "Missing required parameter: ts"}
+
+  defp parse_dir_param(dir) when dir in ["f", "b"], do: {:ok, dir}
+  defp parse_dir_param(nil), do: {:ok, "f"}
+
+  defp parse_dir_param(_),
+    do: {:error, "M_INVALID_PARAM", "Query parameter dir must be one of \"f\" or \"b\""}
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/query/directory?room_alias=...
