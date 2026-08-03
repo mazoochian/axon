@@ -30,7 +30,10 @@ defmodule AxonWeb.FallbackControllerTest do
     {{:error, :target_not_in_room}, 403, "M_FORBIDDEN"},
     {{:error, :cannot_replace_default_rule}, 400, "M_INVALID_PARAM"},
     {{:error, :room_blocked}, 403, "M_FORBIDDEN"},
-    {{:error, :power_levels_may_not_list_creators}, 403, "M_FORBIDDEN"},
+    # 400, not 403: no sender in any room may list a creator here, so the
+    # event is malformed rather than the sender being unauthorized.
+    {{:error, :power_levels_may_not_list_creators}, 400, "M_BAD_JSON"},
+    {{:error, :power_level_value_out_of_range}, 400, "M_BAD_JSON"},
     {{:error, :invalid_additional_creators}, 400, "M_INVALID_PARAM"},
     {{:error, {:invalid_alias_format, "#bad"}}, 400, "M_INVALID_PARAM"},
     {{:error, {:bad_canonical_alias, "#nope:localhost"}}, 400, "M_BAD_ALIAS"},

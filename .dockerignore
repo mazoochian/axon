@@ -1,4 +1,9 @@
 _build/
+# ...except the built prod release, which the README's fast incremental
+# Complement rebuild copies straight into an existing image. Without this
+# exception that recipe fails with "/_build/prod/rel/axon: not found",
+# since the path is excluded from the build context before COPY sees it.
+!_build/prod/rel/axon/
 deps/
 .git/
 .github/
