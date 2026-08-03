@@ -62,6 +62,7 @@ defmodule AxonRoom.AuthRules do
 
   defp check_type_specific(%{"type" => "m.room.power_levels"} = event, current_state, version) do
     with :ok <- check_sender_joined(event, current_state),
+         :ok <- check_power_level_values_in_range(event),
          :ok <- check_power_level_for_state(event, current_state, version),
          :ok <- check_creators_excluded_from_power_levels(event, current_state, version) do
       :ok
@@ -108,12 +109,24 @@ defmodule AxonRoom.AuthRules do
 
   defp valid_user_id?(id) when is_binary(id) do
     case String.split(id, ":", parts: 2) do
-      ["@" <> localpart, domain] -> localpart != "" and domain != ""
+      ["@" <> localpart, domain] -> localpart != "" and valid_server_name?(domain)
       _ -> false
     end
   end
 
   defp valid_user_id?(_), do: false
+
+  # Server name grammar (hostname / IPv4 / bracketed IPv6, optional :port —
+  # see the Matrix spec's server name grammar). Deliberately conservative:
+  # this only needs to reject obviously-malformed domains (e.g. one
+  # containing "$") in additional_creators/user-ID validation, not fully
+  # implement DNS hostname rules.
+  @server_name_re ~r/^(\[[0-9a-fA-F:]+\]|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(:[0-9]{1,5})?$/
+
+  defp valid_server_name?(domain) when is_binary(domain) and domain != "",
+    do: Regex.match?(@server_name_re, domain)
+
+  defp valid_server_name?(_), do: false
 
   # ---------------------------------------------------------------------------
   # m.room.member detail
@@ -382,6 +395,35 @@ defmodule AxonRoom.AuthRules do
       else: {:error, :insufficient_power}
   end
 
+  # Every m.room.power_levels numeric value (users.*, ban/kick/redact/invite,
+  # events.*, events_default/state_default/users_default) must stay within
+  # the canonical-JSON-safe integer range, same as any other number in a
+  # signed Matrix event — a value outside it can't round-trip through
+  # canonical JSON (used for content hashing/signing) consistently across
+  # implementations. This also indirectly protects the room-v12 creator
+  # comparisons in `effective_power/4`: a legitimately-set power level can
+  # never be JSON-encoded any higher than this, so @infinite_power only
+  # needs to out-rank this ceiling, not an unbounded client-supplied number.
+  @max_canonical_json_int 9_007_199_254_740_991
+
+  defp check_power_level_values_in_range(event) do
+    content = event["content"] || %{}
+
+    if content |> collect_integers() |> Enum.all?(&(abs(&1) <= @max_canonical_json_int)),
+      do: :ok,
+      else: {:error, :power_level_value_out_of_range}
+  end
+
+  defp collect_integers(value) when is_integer(value), do: [value]
+
+  defp collect_integers(value) when is_map(value),
+    do: value |> Map.values() |> Enum.flat_map(&collect_integers/1)
+
+  defp collect_integers(value) when is_list(value),
+    do: Enum.flat_map(value, &collect_integers/1)
+
+  defp collect_integers(_value), do: []
+
   # Rule 10.4 (room v12): the users map in a new m.room.power_levels event
   # must not contain the sender of m.room.create or any of the
   # additional_creators — they're never listed there (implicit infinite
@@ -460,7 +502,19 @@ defmodule AxonRoom.AuthRules do
   # level"). Earlier versions: when no power_levels event exists yet, the
   # room creator has implicit level 100 (an empty PL event {} still counts
   # as existing → no implicit 100 in that case).
-  @infinite_power 1_000_000_000
+  #
+  # This must be strictly greater than the largest power level a client can
+  # actually set: power_levels.users values are JSON numbers, and Matrix
+  # requires them to stay within the canonical-JSON-safe integer range
+  # (±(2^53 - 1), see EventHash/canonical JSON validation) — 9007199254740991
+  # at the top end. A creator's "infinite" power must out-rank even that, or
+  # a non-creator admin promoted to the JSON-max power level would
+  # incorrectly out-rank (and be able to kick/ban) the room's own creator,
+  # while the creator would incorrectly fail to out-rank *them* — both
+  # directions of this bug are exercised by Complement's
+  # TestMSC4289PrivilegedRoomCreators subtests ("creator can kick admin at
+  # JSON max value" and "admin with >PL100 cannot kick creator").
+  @infinite_power 1_000_000_000_000_000_000
 
   defp effective_power(user_id, pl, current_state, version) do
     cond do
