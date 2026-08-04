@@ -112,7 +112,7 @@ defmodule AxonWeb.FederationControllerTest do
   # used here so the send_* validation cluster's setup matches Complement's
   # exactly, in case the divergence turns out to be in that round trip
   # itself rather than in the later junk-event rejections.
-  defp join_via_http(room_id, member_user_id) do
+  defp join_via_http(room_id, member_user_id, room_version \\ "11") do
     make_join_conn =
       signed_get(
         "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(member_user_id)}"
@@ -126,7 +126,8 @@ defmodule AxonWeb.FederationControllerTest do
         Map.merge(template, %{
           "event_id" => "$httpjoin_#{System.unique_integer([:positive])}",
           "origin_server_ts" => System.os_time(:millisecond)
-        })
+        }),
+        room_version
       )
 
     path =
@@ -139,8 +140,17 @@ defmodule AxonWeb.FederationControllerTest do
 
   defp remote_user(prefix), do: "@#{prefix}_#{System.unique_integer([:positive])}:#{@server_name}"
 
-  defp signed_remote_event(fields) do
-    FakeRemoteMatrixServer.sign_event(@port, Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
+  # room_version matters: the signature is computed over the *redacted* event
+  # and the redaction algorithm differs by version (v11 dropped origin,
+  # membership and prev_state from the surviving top-level keys), so signing a
+  # v7 room's event as if it were v11 produces a signature axon correctly
+  # refuses.
+  defp signed_remote_event(fields, room_version \\ "11") do
+    FakeRemoteMatrixServer.sign_event(
+      @port,
+      Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields),
+      room_version
+    )
   end
 
   # ---- port-parameterized variants (multi-server relay tests only, which
@@ -643,11 +653,17 @@ defmodule AxonWeb.FederationControllerTest do
     test "send_knock rejects anything but a self-targeted knock (room v7)" do
       owner = new_local_user("owner")
 
+      room_version = "7"
+
       {:ok, room_id} =
-        CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat", version: "7")
+        CreateRoom.execute(owner,
+          server_name: "localhost",
+          preset: "public_chat",
+          version: room_version
+        )
 
       charlie = remote_user("charlie")
-      join_via_http(room_id, charlie)
+      join_via_http(room_id, charlie, room_version)
 
       assert_membership_endpoint_rejects_junk(
         "/_matrix/federation/v1/send_knock",
@@ -660,11 +676,17 @@ defmodule AxonWeb.FederationControllerTest do
     test "send_knock rejects anything but a self-targeted knock (MSC3787 room v10)" do
       owner = new_local_user("owner")
 
+      room_version = "10"
+
       {:ok, room_id} =
-        CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat", version: "10")
+        CreateRoom.execute(owner,
+          server_name: "localhost",
+          preset: "public_chat",
+          version: room_version
+        )
 
       charlie = remote_user("charlie")
-      join_via_http(room_id, charlie)
+      join_via_http(room_id, charlie, room_version)
 
       assert_membership_endpoint_rejects_junk(
         "/_matrix/federation/v1/send_knock",

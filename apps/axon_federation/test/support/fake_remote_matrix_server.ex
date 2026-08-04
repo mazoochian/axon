@@ -96,10 +96,16 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
   def key_id(port), do: state(port).key_id
   def public_key_b64(port), do: Base.encode64(state(port).public_key, padding: false)
 
-  @doc "Signs an event map as this fake server, the same way `AxonCrypto.KeyServer.sign_event/1` does."
-  def sign_event(port, event) when is_map(event) do
+  @doc """
+  Signs an event map as this fake server, the same way
+  `AxonCrypto.KeyServer.sign_event/2` does — i.e. over the *redacted* event,
+  which is what a real homeserver signs. Defaults to room version 11; pass
+  `room_version` explicitly when a test's room is on another version, since
+  the redaction algorithm (and therefore the signature) differs.
+  """
+  def sign_event(port, event, room_version \\ "11") when is_map(event) do
     s = state(port)
-    EventHash.sign_event(event, s.server_name, s.key_id, s.private_key)
+    EventHash.sign_event(event, s.server_name, s.key_id, s.private_key, room_version)
   end
 
   @doc """

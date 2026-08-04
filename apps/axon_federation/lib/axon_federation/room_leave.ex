@@ -42,7 +42,7 @@ defmodule AxonFederation.RoomLeave do
 
     with {:ok, %{"event" => template} = resp} <- HttpClient.get(server, path) do
       room_version = resp["room_version"] || "11"
-      signed_event = build_and_sign_leave(template, user_id)
+      signed_event = build_and_sign_leave(template, user_id, room_version)
 
       with {:ok, _} <- send_leave(server, room_id, signed_event) do
         # Direct insert, not RoomProcess — mirrors RoomJoin.import_room_state/4:
@@ -57,7 +57,7 @@ defmodule AxonFederation.RoomLeave do
     end
   end
 
-  defp build_and_sign_leave(template, user_id) do
+  defp build_and_sign_leave(template, user_id, room_version) do
     leave_event =
       template
       |> Map.put("sender", user_id)
@@ -68,8 +68,8 @@ defmodule AxonFederation.RoomLeave do
 
     content_hash = EventHash.content_hash(leave_event)
     leave_event = Map.put(leave_event, "hashes", %{"sha256" => content_hash})
-    signed = KeyServer.sign_event(leave_event)
-    event_id = EventHash.reference_hash(signed)
+    signed = KeyServer.sign_event(leave_event, room_version)
+    event_id = EventHash.reference_hash(signed, room_version)
     Map.put(signed, "event_id", event_id)
   end
 

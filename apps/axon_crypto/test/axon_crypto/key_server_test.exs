@@ -135,23 +135,23 @@ defmodule AxonCrypto.KeyServerTest do
     end
   end
 
-  describe "sign_event/1 (via handle_call)" do
-    test "signs an event map such that EventHash.verify_signature/4 accepts it", %{
+  describe "sign_event/2 (via handle_call)" do
+    test "signs an event map such that EventHash.verify_signature/5 accepts it", %{
       pid: pid,
       server_name: server_name
     } do
       event = %{"type" => "m.room.message", "content" => %{"body" => "hello"}}
-      signed = GenServer.call(pid, {:sign_event, event})
+      signed = GenServer.call(pid, {:sign_event, event, "11"})
 
       info = GenServer.call(pid, :server_key_info)
       {:ok, pub_key} = Base.decode64(info.public_key_b64, padding: false)
 
-      assert :ok = EventHash.verify_signature(signed, server_name, info.key_id, pub_key)
+      assert :ok = EventHash.verify_signature(signed, server_name, info.key_id, pub_key, "11")
     end
 
     test "the signed event's non-signature fields are unchanged", %{pid: pid} do
       event = %{"type" => "m.room.message", "content" => %{"body" => "hello"}, "depth" => 3}
-      signed = GenServer.call(pid, {:sign_event, event})
+      signed = GenServer.call(pid, {:sign_event, event, "11"})
 
       assert signed["type"] == "m.room.message"
       assert signed["content"] == %{"body" => "hello"}

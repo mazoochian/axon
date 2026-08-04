@@ -43,7 +43,7 @@ defmodule AxonFederation.RoomJoin do
 
     with {:ok, make_join_resp} <- HttpClient.get(server, path),
          {:ok, template, room_version} <- extract_template(make_join_resp),
-         {:ok, join_event} <- build_and_sign_join(template, user_id),
+         {:ok, join_event} <- build_and_sign_join(template, user_id, room_version),
          {:ok, send_join_resp} <- send_join(server, room_id, join_event),
          :ok <- import_room_state(send_join_resp, room_id, user_id, room_version, join_event) do
       {:ok, room_id}
@@ -57,7 +57,7 @@ defmodule AxonFederation.RoomJoin do
   defp extract_template(%{"event" => template}), do: {:ok, template, "11"}
   defp extract_template(_), do: {:error, :invalid_make_join_response}
 
-  defp build_and_sign_join(template, user_id) do
+  defp build_and_sign_join(template, user_id, room_version) do
     # Fill in required fields that we control. The resident server's
     # make_join response may already carry extra content — e.g.
     # join_authorised_via_users_server for a restricted-room join it
@@ -73,8 +73,8 @@ defmodule AxonFederation.RoomJoin do
     # Compute content hash + reference hash (event_id) + sign
     content_hash = EventHash.content_hash(join_event)
     join_event = Map.put(join_event, "hashes", %{"sha256" => content_hash})
-    signed = KeyServer.sign_event(join_event)
-    event_id = EventHash.reference_hash(signed)
+    signed = KeyServer.sign_event(join_event, room_version)
+    event_id = EventHash.reference_hash(signed, room_version)
     {:ok, Map.put(signed, "event_id", event_id)}
   end
 
@@ -121,7 +121,7 @@ defmodule AxonFederation.RoomJoin do
       (auth_chain ++ state_events)
       |> Enum.map(fn event ->
         case event["event_id"] do
-          nil -> Map.put(event, "event_id", EventHash.reference_hash(event))
+          nil -> Map.put(event, "event_id", EventHash.reference_hash(event, room_version))
           _ -> event
         end
       end)

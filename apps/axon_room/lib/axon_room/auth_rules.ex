@@ -241,7 +241,7 @@ defmodule AxonRoom.AuthRules do
         Enum.any?(keys, fn pubkey_b64 ->
           case Base.decode64(pubkey_b64, padding: false) do
             {:ok, pubkey_bytes} ->
-              AxonCrypto.EventHash.verify_signature(to_verify, issuer, key_id, pubkey_bytes) ==
+              AxonCrypto.EventHash.verify_json_signature(to_verify, issuer, key_id, pubkey_bytes) ==
                 :ok
 
             :error ->

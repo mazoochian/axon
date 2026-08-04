@@ -138,7 +138,7 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
     [{key_id, %{"key" => key_b64}}] = Map.to_list(axon_key_doc["verify_keys"])
     pub_key = Base.decode64!(key_b64, padding: false)
     [sent_pdu] = fanned_out.body["pdus"]
-    assert AxonCrypto.EventHash.verify_signature(sent_pdu, "localhost", key_id, pub_key) == :ok
+    assert AxonCrypto.EventHash.verify_signature(sent_pdu, "localhost", key_id, pub_key, "11") == :ok
 
     # --- An inbound message from the remote member arrives via send_transaction ---
     {last_event_id, depth} = RoomProcess.get_position(room_id)

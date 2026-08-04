@@ -316,6 +316,21 @@ defmodule AxonCore.EventStore do
     end
   end
 
+  @doc """
+  A room's version, or `default` when the room isn't known locally.
+
+  Needed wherever a signature must be verified or an event ID computed for a
+  room this server may only be learning about (backfill, an inbound PDU for a
+  room we're joining) — both are redaction-dependent, and the redaction
+  algorithm is version-specific.
+  """
+  def get_room_version(room_id, default \\ "11") do
+    case Repo.one(from(r in Room, where: r.room_id == ^room_id, select: r.version)) do
+      nil -> default
+      version -> version
+    end
+  end
+
   @doc "Whether room_id has been purged/blocked by a server admin (AdminController.purge_room/2)."
   def room_blocked?(room_id) do
     Repo.one(from(r in Room, where: r.room_id == ^room_id, select: r.blocked)) || false

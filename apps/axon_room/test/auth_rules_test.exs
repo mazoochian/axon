@@ -958,7 +958,10 @@ defmodule AxonRoom.AuthRulesTest do
     end
 
     defp sign_3pid_proof(mxid, token, issuer, key_id, private_key) do
-      AxonCrypto.EventHash.sign_event(
+      # A 3pid proof is a plain signed JSON object, not a room event — no
+      # room version, no redaction (redacting it would strip the very fields
+      # being attested).
+      AxonCrypto.EventHash.sign_json(
         %{"mxid" => mxid, "token" => token},
         issuer,
         key_id,
