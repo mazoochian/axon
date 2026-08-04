@@ -316,6 +316,13 @@ defmodule AxonWeb.SpaceController do
           join: e in "events",
           on: e.event_id == s.event_id,
           where: s.room_id == ^room_id and s.type == "m.space.child",
+          # Deterministic, oldest-link-first order. The query is otherwise
+          # unordered, so Postgres was free to return these in any order and
+          # in practice returned them newest-first — which made children_state
+          # non-reproducible between runs. Clients (and Complement's hierarchy
+          # matcher) compare children_state as an ordered sequence, so an
+          # arbitrary order is both untestable and unhelpful to render.
+          order_by: [asc: e.origin_server_ts, asc: s.state_key],
           select: %{
             state_key: s.state_key,
             content: e.content,

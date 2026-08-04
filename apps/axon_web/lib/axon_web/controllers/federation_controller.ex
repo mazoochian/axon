@@ -1426,6 +1426,10 @@ defmodule AxonWeb.FederationController do
           join: e in "events",
           on: e.event_id == s.event_id,
           where: s.room_id == ^room_id and s.type == "m.space.child",
+          # Same deterministic ordering as the CS API's child_events/2 —
+          # an unordered query left children_state in whatever order
+          # Postgres happened to return, which is not reproducible.
+          order_by: [asc: e.origin_server_ts, asc: s.state_key],
           select: %{
             state_key: s.state_key,
             content: e.content,
