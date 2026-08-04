@@ -1,6 +1,8 @@
 defmodule AxonWeb.FallbackController do
   use Phoenix.Controller, formats: [:json]
 
+  require Logger
+
   def call(conn, {:error, :not_found}) do
     conn
     |> put_status(404)
@@ -203,7 +205,17 @@ defmodule AxonWeb.FallbackController do
     |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to deliver leave to remote server"})
   end
 
-  def call(conn, {:error, _reason}) do
+  # Catch-all. Every error atom reaching here is one no clause above maps, so
+  # it becomes an opaque 500 the client can't act on — log the actual reason
+  # and the route, or these are undiagnosable from the outside (a 500 with no
+  # accompanying log line reads like an unhandled exception and sends you
+  # hunting for a stacktrace that was never produced).
+  def call(conn, {:error, reason}) do
+    Logger.error(
+      "Unmapped error #{inspect(reason)} from #{conn.method} #{conn.request_path} " <>
+        "— returning 500. Add a FallbackController clause for it."
+    )
+
     conn
     |> put_status(500)
     |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal server error"})

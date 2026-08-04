@@ -484,6 +484,18 @@ defmodule AxonWeb.RoomController do
 
       case AxonFederation.HttpClient.put(target_server, path, body) do
         {:ok, %{"event" => signed_event}} when is_map(signed_event) ->
+          # Room versions 3+ carry no event_id on the wire — it's the event's
+          # own reference hash — so the countersigned event we get back has no
+          # event_id field even though the one we sent did. Inserting it as-is
+          # failed the events table's NOT NULL event_id and surfaced as an
+          # opaque 500 on the *inviter's* /invite call. Adding the remote's
+          # signature doesn't change the reference hash (signatures are
+          # excluded from it), so recomputing yields the same id we sent.
+          signed_event =
+            Map.put_new_lazy(signed_event, "event_id", fn ->
+              AxonCrypto.EventHash.reference_hash(signed_event)
+            end)
+
           RoomProcess.apply_remote_event(room_id, signed_event)
 
         {:ok, _malformed} ->
