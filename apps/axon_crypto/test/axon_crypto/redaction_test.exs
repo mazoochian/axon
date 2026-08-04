@@ -54,16 +54,68 @@ defmodule AxonCrypto.RedactionTest do
            }
   end
 
-  test "m.room.member keeps only the signed part of a third_party_invite" do
+  test "m.room.member does NOT keep third_party_invite" do
+    # The spec text for recent room versions mentions preserving
+    # `third_party_invite.signed`, but gomatrixserverlib — the de-facto
+    # interop target, and what Complement signs with — does not implement it
+    # in any of its five content keep-lists. Matching the reference here is
+    # what makes signatures agree with real peers; diverging would reintroduce
+    # exactly the class of self-consistent-but-incompatible bug this module
+    # exists to fix. Deliberate divergence from the spec text, recorded here
+    # rather than silently.
     content = %{
       "membership" => "invite",
       "third_party_invite" => %{"display_name" => "bob", "signed" => %{"token" => "t"}}
     }
 
     assert Redaction.redact(event("m.room.member", content), "11")["content"] == %{
-             "membership" => "invite",
-             "third_party_invite" => %{"signed" => %{"token" => "t"}}
+             "membership" => "invite"
            }
+  end
+
+  test "join_authorised_via_users_server is protected only from v9" do
+    content = %{"membership" => "join", "join_authorised_via_users_server" => "@auth:other"}
+
+    assert Redaction.redact(event("m.room.member", content), "9")["content"] == content
+    assert Redaction.redact(event("m.room.member", content), "8")["content"] == %{
+             "membership" => "join"
+           }
+  end
+
+  test "join_rules allow is protected only from v8" do
+    content = %{"join_rule" => "restricted", "allow" => [%{"type" => "m.room_membership"}]}
+
+    assert Redaction.redact(event("m.room.join_rules", content), "8")["content"] == content
+    assert Redaction.redact(event("m.room.join_rules", content), "7")["content"] == %{
+             "join_rule" => "restricted"
+           }
+  end
+
+  test "power_levels invite is protected only from v11" do
+    content = %{"invite" => 50, "kick" => 50}
+
+    assert Redaction.redact(event("m.room.power_levels", content), "11")["content"] == content
+    assert Redaction.redact(event("m.room.power_levels", content), "10")["content"] == %{
+             "kick" => 50
+           }
+  end
+
+  test "origin, prev_state and membership survive through v10, not v11" do
+    extra = %{"origin" => "localhost", "prev_state" => [], "membership" => "join"}
+    ev = event("m.room.member", %{"membership" => "join"}, extra)
+
+    v10 = Redaction.redact(ev, "10")
+    assert v10["origin"] == "localhost"
+    assert v10["prev_state"] == []
+
+    v11 = Redaction.redact(ev, "11")
+    refute Map.has_key?(v11, "origin")
+    refute Map.has_key?(v11, "prev_state")
+  end
+
+  test "content is always present, even when the event had none" do
+    ev = event("m.room.message", %{}) |> Map.delete("content")
+    assert Redaction.redact(ev, "11")["content"] == %{}
   end
 
   test "m.room.power_levels keeps its numeric rules" do
@@ -93,19 +145,7 @@ defmodule AxonCrypto.RedactionTest do
       assert Redaction.redact(event("m.room.create", content), "10")["content"] == %{"creator" => "@a:x"}
     end
 
-    test "origin/membership/prev_state survive only before v11" do
-      extra = %{"origin" => "localhost", "membership" => "join", "prev_state" => []}
-      ev = event("m.room.member", %{"membership" => "join"}, extra)
 
-      old = Redaction.redact(ev, "10")
-      assert old["origin"] == "localhost"
-      assert old["membership"] == "join"
-
-      new = Redaction.redact(ev, "11")
-      refute Map.has_key?(new, "origin")
-      refute Map.has_key?(new, "membership")
-      refute Map.has_key?(new, "prev_state")
-    end
 
     test "m.room.redaction keeps content.redacts from v11 only" do
       content = %{"redacts" => "$target", "reason" => "spam"}
@@ -117,11 +157,15 @@ defmodule AxonCrypto.RedactionTest do
       assert Redaction.redact(event("m.room.redaction", content), "10")["content"] == %{}
     end
 
-    test "m.room.server_acl keeps its rules from v9 onwards" do
-      content = %{"deny" => ["evil.com"], "allow" => ["*"], "allow_ip_literals" => false}
+    test "m.room.server_acl content is fully stripped in every version" do
+      # No keep-list in the reference implementation protects server ACL
+      # content, in any room version — an earlier guess here that v9+ kept it
+      # was wrong.
+      content = %{"deny" => ["evil.com"], "allow" => ["*"]}
 
-      assert Redaction.redact(event("m.room.server_acl", content), "9")["content"] == content
-      assert Redaction.redact(event("m.room.server_acl", content), "8")["content"] == %{}
+      for v <- ~w(6 8 9 10 11 12) do
+        assert Redaction.redact(event("m.room.server_acl", content), v)["content"] == %{}
+      end
     end
   end
 

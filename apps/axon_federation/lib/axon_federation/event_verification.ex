@@ -27,7 +27,9 @@ defmodule AxonFederation.EventVerification do
         {:error, :key_not_found}
       else
         case EventHash.verify_signature(event, origin, key_id, pub_key, room_version) do
-          :ok -> :ok
+          :ok ->
+            :ok
+
           {:error, _} -> {:error, :bad_signature}
         end
       end

@@ -140,11 +140,16 @@ defmodule AxonWeb.FederationController do
         |> put_status(400)
         |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid join event"})
 
+      # Distinct messages per reason: these three fail for completely
+      # different operational causes (bad crypto vs an unsigned event vs not
+      # being able to fetch the origin's keys at all) and collapsing them
+      # into one string makes a signature problem indistinguishable from a
+      # key-fetch problem when debugging against a real peer.
       {:error, sig_error}
       when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
         conn
         |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Bad event signature"})
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => sig_error_message(sig_error)})
 
       {:error, :auth_failed} ->
         conn
@@ -212,11 +217,16 @@ defmodule AxonWeb.FederationController do
         |> put_status(400)
         |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid leave event"})
 
+      # Distinct messages per reason: these three fail for completely
+      # different operational causes (bad crypto vs an unsigned event vs not
+      # being able to fetch the origin's keys at all) and collapsing them
+      # into one string makes a signature problem indistinguishable from a
+      # key-fetch problem when debugging against a real peer.
       {:error, sig_error}
       when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
         conn
         |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Bad event signature"})
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => sig_error_message(sig_error)})
 
       {:error, :auth_failed} ->
         conn
@@ -398,11 +408,16 @@ defmodule AxonWeb.FederationController do
         |> put_status(400)
         |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid knock event"})
 
+      # Distinct messages per reason: these three fail for completely
+      # different operational causes (bad crypto vs an unsigned event vs not
+      # being able to fetch the origin's keys at all) and collapsing them
+      # into one string makes a signature problem indistinguishable from a
+      # key-fetch problem when debugging against a real peer.
       {:error, sig_error}
       when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
         conn
         |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Bad event signature"})
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => sig_error_message(sig_error)})
 
       {:error, :auth_failed} ->
         conn
@@ -1171,6 +1186,10 @@ defmodule AxonWeb.FederationController do
         :ok
     end
   end
+
+  defp sig_error_message(:bad_signature), do: "Bad event signature"
+  defp sig_error_message(:missing_signature), do: "Event has no signature from its origin server"
+  defp sig_error_message(:key_not_found), do: "Could not fetch the origin server's signing key"
 
   defp compute_event_id(pdu) do
     EventHash.reference_hash(pdu, EventStore.get_room_version(pdu["room_id"]))

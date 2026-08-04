@@ -17,24 +17,41 @@ defmodule AxonCrypto.Redaction do
   if it never covered the stripped fields to begin with.
 
   Signing or hashing the *unredacted* event is self-consistent — two servers
-  that both do it agree with each other — so it can pass every same-implementation
-  test while making federation with any spec-compliant homeserver impossible in
-  both directions: their signatures fail to verify here, and every event ID
-  computed here disagrees with theirs for the same event.
+  that both do it agree with each other — so it can pass every
+  same-implementation test while making federation with any spec-compliant
+  homeserver impossible in both directions.
 
-  The keep-lists below are the union across the room versions axon supports
-  (2–12), with the version-specific differences called out inline.
+  The version cutoffs below are transcribed from `gomatrixserverlib`'s
+  `eventversion.go`/`redactevent.go` rather than inferred, because they are
+  easy to get subtly wrong and a wrong cutoff is invisible until a real peer
+  rejects a signature. Two independent axes:
+
+  **Top-level keys** — `origin`, `prev_state` and `membership` survive for
+  room versions 1–10 and are dropped from v11 (`unredactableEventFieldsV1`
+  vs `...V2`; only `redactEventJSONV5`, used by v11+, takes the latter).
+
+  **Content keys** — five variants, keyed by version:
+
+  | versions | `m.room.member`            | `m.room.create` | `join_rules`      | `power_levels` extra | other                  |
+  |----------|----------------------------|-----------------|-------------------|----------------------|------------------------|
+  | 1–5      | membership                 | creator         | join_rule         | —                    | `m.room.aliases`       |
+  | 6–7      | membership                 | creator         | join_rule         | —                    | —                      |
+  | 8        | membership                 | creator         | join_rule, allow  | —                    | —                      |
+  | 9–10     | + join_authorised_via_...  | creator         | join_rule, allow  | —                    | —                      |
+  | 11+      | + join_authorised_via_...  | *all fields*    | join_rule, allow  | invite               | `m.room.redaction`     |
   """
 
-  # Top-level keys that survive redaction. `origin`, `membership` and
-  # `prev_state` were dropped from this list in room version 11 (MSC2176 /
-  # MSC3989); keeping them for older rooms is what those versions specify.
-  @top_level_keys ~w(
+  @v1_top_level ~w(
+    event_id type room_id sender state_key content hashes signatures
+    depth prev_events prev_state auth_events origin origin_server_ts membership
+  )
+
+  @v2_top_level ~w(
     event_id type room_id sender state_key content hashes signatures
     depth prev_events auth_events origin_server_ts
   )
 
-  @pre_v11_extra_top_level ~w(origin membership prev_state)
+  @base_power_levels ~w(ban events events_default kick redact state_default users users_default)
 
   @doc """
   Redacts `event` according to `room_version`'s redaction algorithm.
@@ -42,76 +59,58 @@ defmodule AxonCrypto.Redaction do
   Both arguments are wire-format maps with string keys.
   """
   def redact(event, room_version) when is_map(event) do
-    allowed_top =
-      if pre_v11?(room_version),
-        do: @top_level_keys ++ @pre_v11_extra_top_level,
-        else: @top_level_keys
+    v = to_string(room_version)
+
+    allowed_top = if v in ~w(1 2 3 4 5 6 7 8 9 10), do: @v1_top_level, else: @v2_top_level
 
     redacted = Map.take(event, allowed_top)
 
-    case Map.fetch(event, "content") do
-      {:ok, content} when is_map(content) ->
-        Map.put(redacted, "content", redact_content(event["type"], content, room_version))
-
-      _ ->
-        redacted
-    end
+    # `content` is always present in the redacted form, even when the original
+    # had none — the reference struct marshals it without `omitempty`, so
+    # omitting the key here would produce different canonical JSON (and so a
+    # different signature and event ID) for an event with no content.
+    content = if is_map(event["content"]), do: event["content"], else: %{}
+    Map.put(redacted, "content", redact_content(event["type"], content, v))
   end
 
-  defp pre_v11?(version), do: to_string(version) in ~w(1 2 3 4 5 6 7 8 9 10)
+  defp redact_content("m.room.member", content, v) do
+    keep =
+      if v in ~w(1 2 3 4 5 6 7 8),
+        do: ["membership"],
+        else: ["membership", "join_authorised_via_users_server"]
 
-  # m.room.create keeps its whole content from room version 11 onwards
-  # (MSC2176); before that only `creator` survived.
-  defp redact_content("m.room.create", content, room_version) do
-    if pre_v11?(room_version), do: Map.take(content, ["creator"]), else: content
+    Map.take(content, keep)
   end
 
-  defp redact_content("m.room.member", content, _room_version) do
-    kept = Map.take(content, ["membership", "join_authorised_via_users_server"])
-
-    # third_party_invite survives, but only its `signed` member.
-    case content do
-      %{"third_party_invite" => %{"signed" => signed}} ->
-        Map.put(kept, "third_party_invite", %{"signed" => signed})
-
-      _ ->
-        kept
-    end
+  # From v11 the create event keeps its entire content (MSC2176).
+  defp redact_content("m.room.create", content, v) do
+    if v in ~w(1 2 3 4 5 6 7 8 9 10), do: Map.take(content, ["creator"]), else: content
   end
 
-  defp redact_content("m.room.join_rules", content, _),
-    do: Map.take(content, ["join_rule", "allow"])
-
-  defp redact_content("m.room.power_levels", content, _) do
-    Map.take(content, ~w(
-      ban events events_default invite kick redact state_default users users_default
-    ))
+  # `allow` (restricted rooms) is protected from v8 onwards.
+  defp redact_content("m.room.join_rules", content, v) do
+    keep = if v in ~w(1 2 3 4 5 6 7), do: ["join_rule"], else: ["join_rule", "allow"]
+    Map.take(content, keep)
   end
 
-  defp redact_content("m.room.history_visibility", content, _),
+  defp redact_content("m.room.power_levels", content, v) do
+    keep = if v in ~w(1 2 3 4 5 6 7 8 9 10), do: @base_power_levels, else: @base_power_levels ++ ["invite"]
+    Map.take(content, keep)
+  end
+
+  defp redact_content("m.room.history_visibility", content, _v),
     do: Map.take(content, ["history_visibility"])
 
-  # `redacts` moved into content in room version 11 (MSC2174); in older
-  # versions it is a top-level key and content keeps nothing.
-  defp redact_content("m.room.redaction", content, room_version) do
-    if pre_v11?(room_version), do: %{}, else: Map.take(content, ["redacts"])
+  # m.room.aliases lost its special meaning in v6.
+  defp redact_content("m.room.aliases", content, v) do
+    if v in ~w(1 2 3 4 5), do: Map.take(content, ["aliases"]), else: %{}
   end
 
-  defp redact_content("m.room.aliases", content, room_version) do
-    # Only room versions before 6 kept aliases; the event type itself was
-    # removed from the protocol later.
-    if to_string(room_version) in ~w(1 2 3 4 5),
-      do: Map.take(content, ["aliases"]),
-      else: %{}
+  # `redacts` moved into content in v11 (MSC2174); before that it is a
+  # top-level key and content keeps nothing.
+  defp redact_content("m.room.redaction", content, v) do
+    if v in ~w(1 2 3 4 5 6 7 8 9 10), do: %{}, else: Map.take(content, ["redacts"])
   end
 
-  defp redact_content("m.room.server_acl", content, room_version) do
-    # MSC2870: server ACLs keep their rules from room version 9 onwards, so a
-    # redaction can't silently disable a room's ACL.
-    if to_string(room_version) in ~w(1 2 3 4 5 6 7 8),
-      do: %{},
-      else: Map.take(content, ["allow", "deny", "allow_ip_literals"])
-  end
-
-  defp redact_content(_type, _content, _room_version), do: %{}
+  defp redact_content(_type, _content, _v), do: %{}
 end
