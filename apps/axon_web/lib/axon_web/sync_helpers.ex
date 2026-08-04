@@ -270,6 +270,44 @@ defmodule AxonWeb.SyncHelpers do
   end
 
   @doc """
+  `EventStore.stripped_state_events/1`'s preview shape, except the
+  `m.room.create` event — when present — is swapped for its *full*
+  representation (all PDU fields: `event_id`, `origin_server_ts`,
+  `hashes`, `signatures`, ...) instead of the usual
+  type/state_key/sender/content-only stripped shape.
+
+  Per MSC4311 ("Full create event in invite/knock stripped state"), a
+  client previewing a room it hasn't joined needs more than the create
+  event's bare content — most concretely, a room-v12 room ID is the
+  create event's own reference hash (MSC4291), so a client can't even
+  confirm the room ID it was invited to without the full event to hash.
+  Every other preview-state event type is unaffected and stays stripped.
+
+  Used for both directions of a room preview: what we hand to a client
+  via `build_invite_state/2` below (and the local-knock-preview /
+  federated-invite-`invite_room_state` call sites in
+  `AxonWeb.RoomController`), and — for a *federated* invite — the
+  receiving side never re-derives this at all, it just stores and replays
+  whatever the inviting server already sent (see `build_invite_state/2`'s
+  fallback below), so getting the outbound side right here is what makes
+  the receiving side correct too.
+  """
+  def preview_state_events(room_id) do
+    room_id
+    |> EventStore.stripped_state_events()
+    |> Enum.map(fn
+      %{"type" => "m.room.create"} = stripped ->
+        case EventStore.get_state_event(room_id, "m.room.create", "") do
+          {:ok, full_event} -> EventStore.event_to_map(full_event)
+          _ -> stripped
+        end
+
+      other ->
+        other
+    end)
+  end
+
+  @doc """
   Stripped preview state for an invited room, plus `user_id`'s own invite
   `m.room.member` event — the shape both classic `/sync`'s `invite_state`
   and sliding sync's `invite_state` use, so the two can't drift on what an
@@ -280,9 +318,11 @@ defmodule AxonWeb.SyncHelpers do
     # invite (the inviting server is resident with full state) or a room
     # we used to be joined to. Falls back to the invite_room_state preview
     # the *inviting* server handed us for a purely federated invite, where
-    # this is the only state we have ever seen for the room at all.
+    # this is the only state we have ever seen for the room at all — see
+    # preview_state_events/1's doc for why that fallback doesn't need its
+    # own m.room.create fixup.
     stripped =
-      case EventStore.stripped_state_events(room_id) do
+      case preview_state_events(room_id) do
         [] -> EventStore.get_invite_preview_state(room_id, user_id)
         events -> events
       end
