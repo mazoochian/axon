@@ -297,3 +297,60 @@ Known and unresolved at the end of this phase:
 - **`TestEventAuth` remains genuinely un-root-caused.** The endpoint exists and returns a correct transitive chain; the field name matches the Go client's struct; the selection algorithm was traced and looked right. Recorded as UNKNOWN rather than given a plausible-sounding cause.
 - The per-room summary field building is duplicated between `SpaceController` (per-user visibility) and `FederationController` (per-server visibility). The visibility rules genuinely differ; the field assembly does not, and belongs in a shared module.
 - The `msc*` packages remain expected failures, unchanged since Phase 16.
+
+## Phase 19 — Signatures over the redacted event: 35/89 → 46/89
+
+Phase 18 ended at 35/89 with two systemic federation bugs open. Both are now closed, and closing the second one turned out to be the largest single correctness fix in the project's history. **46/89 (~52%)**, measured; `mix test` at **1137 tests, 0 failures**.
+
+### The federation 401, in three parts
+
+Outbound `make_join` was answered `401` by the peer, and — impossibly, given that every rejection path in `AxonWeb.Plug.FederationAuth` logs a warning — the *answering* server logged nothing at all. Three independent bugs:
+
+- **`KeyServer` signed a `/_matrix/key/v2/server` document that didn't match what the controller serves.** The signature covered a document without `old_verify_keys`; the response includes it. Canonical-JSON signing is field-exact, so axon's own key self-signature failed verification for every real peer.
+- **`/_matrix/key/v2/query` required X-Matrix auth.** It is the notary endpoint a server falls back to precisely when a direct key fetch fails validation — being unauthenticated is the entire point of it. And `FederationAuth`'s missing-header branch is the one path that *doesn't* log, which is why the answering side looked silent.
+- **`RoomJoin` deduplicated imported state by `event_id`.** Room versions 3+ carry no `event_id` on the wire, so every such event keyed on `nil` and only the first survived — silently dropping `join_rules` and `power_levels` while still reporting a successful join.
+
+### Signatures and event IDs were computed over the wrong thing
+
+Axon signed events, verified signatures, and computed reference hashes over the **unredacted** event. The spec does all three over the **redacted** event. Verified against the reference implementation rather than inferred from spec prose (`gomatrixserverlib/eventcrypto.go`): signing at line 362 — *"Redact the event before signing so signature that will remain valid even if the event is redacted"* — verification at line 125, and `ReferenceSha256HashOfEvent` at line 297, *"the SHA-256 hash of the redacted event content"*.
+
+The design reason is decisive: redaction must *preserve* signature validity, which is only possible if the signature never covered the stripped fields.
+
+**Why nothing caught it for the project's entire history**: the mistake is self-consistent. Two axon servers both making it agree with each other perfectly. Axon↔axon federation worked, and all 1100+ local tests passed — including tests specifically written to exercise signature verification, because the test double (`FakeRemoteMatrixServer`) signed the same wrong way. It is only observable against a spec-compliant homeserver, where it breaks in both directions at once: their signatures fail here, and every event ID computed here disagrees with theirs for the same event.
+
+There was no redaction algorithm anywhere in the codebase — only the `/redact` endpoint, which is a different thing.
+
+Implemented as `AxonCrypto.Redaction`, with `room_version` threaded through `EventHash`, `KeyServer`, `EventBuilder`, `RoomJoin`, `RoomLeave`, `RoomKnock`, `Backfill`, `EventVerification` and both controllers (~30 call sites). The version parameter is **required, not defaulted** — a silently-wrong default is exactly the failure mode being removed. New `EventStore.get_room_version/2` serves the sites that only hold a `room_id`.
+
+Cross-signing keys and third-party invite proofs are *not* room events: they get `EventHash.{sign_json,verify_json_signature}`, with no room version and no redaction, since redacting them would strip the very fields being attested. Kept as separate functions so the two can never be confused at a call site.
+
+**The version cutoffs were wrong on the first attempt**, in four places, and every one of them was invisible locally because axon agreed with itself. Transcribed properly from `eventversion.go` (which maps each room version to one of five redaction algorithms) and `redactevent.go`: `join_rules.allow` is protected only from v8, `member.join_authorised_via_users_server` only from v9, `power_levels.invite` only from v11 — and an `m.room.server_acl` rule that had been *invented* and exists in no version at all. Top-level `origin`/`prev_state`/`membership` survive through v10 and are dropped at v11.
+
+One deliberate, documented divergence: the spec text says `third_party_invite.signed` survives redaction of an `m.room.member` event, but it is absent from all five of the reference's keep-lists. Axon matches the reference, because matching it is what makes signatures agree with real peers — recorded in code rather than left as a silent difference.
+
+Two existing tests asserted the old behaviour and were rewritten to pin the real property: a message body is redacted away *before* signing, so tampering with it cannot invalidate a signature — the old test asserted the exact opposite of the spec's intent. New tests pin both invariants directly: redaction preserves the event ID, and a signature still verifies after its event is redacted.
+
+### What that one fix moved
+
+Ten tests flipped to passing, most of them never targeted by anyone:
+
+`TestEventAuth` (marked genuinely UNKNOWN by two separate investigations — the endpoint was correct all along, its *signatures* weren't), the whole `TestCannotSendNon{Join,Leave}Via…{V1,V2}` validation family, `TestClientSpacesSummary`, `TestClientSpacesSummaryJoinRules`, `TestContentMediaV1`, `TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms`, and `TestMSC4311FullCreateEventOnStrippedState`.
+
+That vindicates an earlier worker's negative result, which is worth recording as a method note. Told to fix the `send_*` validation cluster, it traced every assertion to code that already satisfied it, found no bug, said so plainly, and reported that if those tests were still red the cause had to lie outside the file it owned. It was right. Overruling it would have meant rewriting correct validation code while the real bug sat in the signing layer.
+
+### Other fixes this phase
+
+- **Server names with an explicit port were parsed as the port.** 26 call sites across 8 files derived a Matrix ID's server with `id |> String.split(":") |> List.last()`, which returns `"8448"` for `@user:example.com:8448`. Every federation endpoint comparing that against the requesting origin rejected the request. Replaced by `AxonCore.MatrixId.server_name/1`, which splits on the *first* colon and returns `nil` for a room-v12 ID that has no server part by design.
+- **Federated invites 500'd on the inviter's own request.** The countersigned event a remote returns has no `event_id` (v3+ wire format), and inserting it violated the events table's NOT NULL constraint. Same class as the `RoomJoin` dedup bug above.
+- **`children_state` had no `ORDER BY`.** Postgres was free to return a space's child links in any order; clients and Complement both compare that array as an ordered sequence. Caught as a real regression between two Complement runs.
+- **Room v12 could not be federation-joined at all** — the outbound `make_join ?ver=` list still advertised versions 2–11. And a v12 room's creator was refused their own upgrade, because `ensure_can_tombstone/2` read `power_levels.users` directly, where a v12 creator never appears by design.
+- **Unmapped errors produced a 500 with no log line**, which reads like an unhandled exception and sends you hunting for a stacktrace that was never produced. `FallbackController`'s catch-all now logs the reason and route; that is what made the invite bug diagnosable. `send_join` likewise now distinguishes `bad_signature` / `missing_signature` / `key_not_found` instead of collapsing all three into "Bad event signature".
+
+### Known gaps and honest caveats
+
+- **`send_join` from Complement is still rejected with a genuine signature mismatch** — confirmed *not* a key-fetch failure via the new distinct error messages. The redaction now follows the reference algorithm key-for-key, so the remaining divergence is elsewhere in the signable bytes. Undiagnosed. This is what still gates `TestKnocking` and much of the restricted-rooms cluster.
+- **Two tests regressed under memory pressure, not code**: `TestRestrictedRoomsRemoteJoinFailOver` and its MSC3787 variant, both 3-homeserver tests, failed with `pg_ctl: database system initialization failed` inside the container while the host had 8 of 9 GB of swap in use. This is the same environmental failure mode Phase 16 documented. Recorded as environmental with evidence rather than assumed either way.
+- **`soft_failed` is still never set.** Rejection persistence landed; soft-failure needs a second auth check against current state that axon does not have.
+- **`AuthRules` rule 2 remains unimplemented** — an event's `auth_events` are never checked against what the selection algorithm would have chosen.
+- **The umbrella `mix test` cannot be run as one command reliably.** `FakeRemoteMatrixServer` binds fixed host ports, so cross-app runs collide and take down the `axon_web` application, producing a 528-of-529 failure cascade that looks catastrophic and is not. Per-app runs are green: 68 / 145 / 33 / 38 / 78 / 192 / 54 / 529.
+- The host's PostgreSQL service remains down (PG18 binaries against a v16 data directory); all work this phase ran against a disposable pg16 container. Unresolved by choice — that data directory is shared with unrelated projects.
