@@ -359,10 +359,14 @@ defmodule AxonWeb.MediaControllerTest do
 
       assert conn.status == 200
       assert conn.resp_body == "remote-png-bytes"
-      # put_resp_content_type/2 (used consistently for every download path
-      # in this controller, local or proxied) appends "; charset=utf-8" per
-      # Plug's MIME database defaults — not specific to this new path.
-      assert get_resp_header(conn, "content-type") == ["image/png; charset=utf-8"]
+      # put_resp_content_type/2 is called with an explicit `nil` charset
+      # (used consistently for every download path in this controller,
+      # local or proxied) so the remote's exact Content-Type comes back
+      # unmutated — see media_controller.ex's comment above serve_local/2
+      # for why: Plug's 1-arity default silently appends "; charset=utf-8"
+      # to *any* content type, which TestContentMediaV1 (Complement)
+      # caught by uploading the deliberately non-standard "img/png".
+      assert get_resp_header(conn, "content-type") == ["image/png"]
     end
   end
 end

@@ -147,15 +147,35 @@ defmodule AxonWeb.SyncController do
     end
   end
 
-  defp filter_timeline_types(filter), do: get_in(filter, ["room", "timeline", "types"])
-  defp filter_state_types(filter), do: get_in(filter, ["room", "state", "types"])
+  # The "timeline"/"state" sub-object of a RoomEventFilter (spec §Filtering)
+  # — kept as the raw map rather than pre-plucking `types` alone, since
+  # `not_types`/`senders`/`not_senders` all need to survive the same trip
+  # through `build_room_data/8` to `apply_event_filter/2` below.
+  defp filter_timeline(filter), do: get_in(filter, ["room", "timeline"]) || %{}
+  defp filter_state(filter), do: get_in(filter, ["room", "state"]) || %{}
 
   defp filter_timeline_limit(filter) do
     get_in(filter, ["room", "timeline", "limit"]) || @default_timeline_limit
   end
 
-  defp apply_type_filter(events, nil), do: events
-  defp apply_type_filter(events, types), do: Enum.filter(events, &(&1["type"] in types))
+  # `types`/`senders` are allow-lists (only a match passes); `not_types`/
+  # `not_senders` are deny-lists (a match is excluded) and win over the
+  # corresponding allow-list per spec. Absent keys impose no constraint.
+  defp apply_event_filter(events, filter) when is_map(filter) do
+    types = filter["types"]
+    not_types = filter["not_types"]
+    senders = filter["senders"]
+    not_senders = filter["not_senders"]
+
+    Enum.filter(events, fn e ->
+      (is_nil(types) or e["type"] in types) and
+        (is_nil(not_types) or e["type"] not in not_types) and
+        (is_nil(senders) or e["sender"] in senders) and
+        (is_nil(not_senders) or e["sender"] not in not_senders)
+    end)
+  end
+
+  defp apply_event_filter(events, _), do: events
 
   # ---------------------------------------------------------------------------
   # Sync response builder
@@ -172,8 +192,8 @@ defmodule AxonWeb.SyncController do
     joined_rooms = EventStore.get_joined_rooms(user_id)
     invited_rooms = EventStore.get_invited_rooms(user_id)
     tl_limit = filter_timeline_limit(filter)
-    tl_types = filter_timeline_types(filter)
-    state_types = filter_state_types(filter)
+    tl_filter = filter_timeline(filter)
+    state_filter = filter_state(filter)
 
     join_response =
       joined_rooms
@@ -194,8 +214,8 @@ defmodule AxonWeb.SyncController do
               is_initial_sync,
               since_ordering,
               tl_limit,
-              tl_types,
-              state_types
+              tl_filter,
+              state_filter
             )
 
           Map.put(acc, room_id, room_data)
@@ -253,8 +273,8 @@ defmodule AxonWeb.SyncController do
          is_initial_sync,
          since_ordering,
          tl_limit,
-         tl_types,
-         state_types
+         tl_filter,
+         state_filter
        ) do
     # Did this user newly join this room in this sync window?
     newly_joined =
@@ -276,7 +296,7 @@ defmodule AxonWeb.SyncController do
             user_id,
             room_events,
             tl_limit,
-            tl_types,
+            tl_filter,
             since_ordering
           )
 
@@ -284,10 +304,14 @@ defmodule AxonWeb.SyncController do
           build_incremental_room_data(room_events, tl_limit, since_ordering)
       end
 
-    # Apply type filter to state section
-    filtered_state = apply_type_filter(state_events, state_types)
-    # Apply type filter to timeline
-    filtered_timeline = apply_type_filter(timeline_events, tl_types)
+    # Apply the event filter to the state section (independently of the
+    # timeline filter below — a type excluded from the timeline is not
+    # implicitly excluded from state, and vice versa; see moduledoc note
+    # on `build_incremental_room_data/3` for why the state/timeline split
+    # itself happens *before* either filter is applied).
+    filtered_state = apply_event_filter(state_events, state_filter)
+    # Apply the event filter to the timeline
+    filtered_timeline = apply_event_filter(timeline_events, tl_filter)
 
     ephemeral =
       SyncHelpers.build_receipt_events(room_id) ++
@@ -347,7 +371,7 @@ defmodule AxonWeb.SyncController do
          user_id,
          room_events,
          tl_limit,
-         _tl_types,
+         _tl_filter,
          since_ordering
        ) do
     full_state = EventStore.get_current_state(room_id) |> Enum.map(&EventStore.event_to_map/1)
