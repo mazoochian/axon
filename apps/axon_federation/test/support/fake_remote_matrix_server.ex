@@ -237,9 +237,22 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
     log_request(conn)
 
     case find_override(conn) do
-      {:raw, status, content_type, body} -> send_raw(conn, status, content_type, body)
-      {status, body} -> send_json(conn, status, body)
-      nil -> handle_builtin(conn)
+      {:raw, status, content_type, body} ->
+        send_raw(conn, status, content_type, body)
+
+      # A 1-arity body is called with the request's parsed body, so a response
+      # can depend on what was sent — needed wherever the real counterparty
+      # echoes back something derived from the request (e.g. the federation
+      # invite handshake, where the remote signs the very event it was given
+      # and returns it).
+      {status, body} when is_function(body, 1) ->
+        send_json(conn, status, body.(conn.body_params))
+
+      {status, body} ->
+        send_json(conn, status, body)
+
+      nil ->
+        handle_builtin(conn)
     end
   end
 
