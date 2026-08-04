@@ -383,7 +383,7 @@ defmodule AxonWeb.KeyController do
   defp signed_by_master?(user_id, master_key_json, key_json) do
     with {master_key_id, master_pubkey_b64} <- sole_key(master_key_json),
          {:ok, master_pubkey} <- Base.decode64(master_pubkey_b64, padding: false) do
-      EventHash.verify_signature(key_json, user_id, master_key_id, master_pubkey) == :ok
+      EventHash.verify_json_signature(key_json, user_id, master_key_id, master_pubkey) == :ok
     else
       _ -> false
     end

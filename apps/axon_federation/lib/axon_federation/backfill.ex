@@ -53,8 +53,10 @@ defmodule AxonFederation.Backfill do
   def fetch_and_apply_event(room_id, origin, event_id) do
     path = "/_matrix/federation/v1/event/#{URI.encode(event_id)}"
 
+    room_version = AxonCore.EventStore.get_room_version(room_id)
+
     with {:ok, %{"pdus" => [pdu | _]}} <- HttpClient.get(origin, path),
-         :ok <- EventVerification.verify_signature(pdu) do
+         :ok <- EventVerification.verify_signature(pdu, room_version) do
       catch_up(room_id, origin, pdu)
       RoomProcess.apply_remote_event(room_id, pdu)
     else
@@ -199,7 +201,9 @@ defmodule AxonFederation.Backfill do
   end
 
   defp verify_and_apply(room_id, origin, event) do
-    with :ok <- EventVerification.verify_signature(event),
+    room_version = AxonCore.EventStore.get_room_version(room_id)
+
+    with :ok <- EventVerification.verify_signature(event, room_version),
          {:ok, _event_id} <- RoomProcess.apply_remote_event(room_id, event) do
       :ok
     else

@@ -37,9 +37,23 @@ defmodule AxonCrypto.KeyServer do
     GenServer.call(__MODULE__, {:sign, payload})
   end
 
-  @doc "Signs an event map. Returns the event with signatures field populated."
-  def sign_event(event) when is_map(event) do
-    GenServer.call(__MODULE__, {:sign_event, event})
+  @doc """
+  Signs an event map. Returns the event with signatures field populated.
+
+  `room_version` is required because the signature is computed over the
+  *redacted* event, and the redaction algorithm is version-specific.
+  """
+  def sign_event(event, room_version) when is_map(event) do
+    GenServer.call(__MODULE__, {:sign_event, event, room_version})
+  end
+
+  @doc """
+  Signs a plain JSON object that is not a room event (e.g. a third-party
+  invite proof). No room version, and no redaction — see
+  `AxonCrypto.EventHash.sign_json/4`.
+  """
+  def sign_json(object) when is_map(object) do
+    GenServer.call(__MODULE__, {:sign_json, object})
   end
 
   @doc "Returns the server name this key belongs to."
@@ -120,13 +134,21 @@ defmodule AxonCrypto.KeyServer do
     {:reply, {state.key_id, sig_b64}, state}
   end
 
-  def handle_call({:sign_event, event}, _from, state) do
+  def handle_call({:sign_json, object}, _from, state) do
+    signed =
+      AxonCrypto.EventHash.sign_json(object, state.server_name, state.key_id, state.private_key)
+
+    {:reply, signed, state}
+  end
+
+  def handle_call({:sign_event, event, room_version}, _from, state) do
     signed =
       AxonCrypto.EventHash.sign_event(
         event,
         state.server_name,
         state.key_id,
-        state.private_key
+        state.private_key,
+        room_version
       )
 
     {:reply, signed, state}

@@ -12,7 +12,7 @@ defmodule AxonFederation.EventVerification do
   alias AxonFederation.KeyCache
 
   @doc "Verifies `event`'s signature from its claimed origin. Returns :ok or {:error, reason}."
-  def verify_signature(event) do
+  def verify_signature(event, room_version) do
     sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
     origin = event["origin"] || sender_server
 
@@ -26,7 +26,7 @@ defmodule AxonFederation.EventVerification do
       if is_nil(pub_key) do
         {:error, :key_not_found}
       else
-        case EventHash.verify_signature(event, origin, key_id, pub_key) do
+        case EventHash.verify_signature(event, origin, key_id, pub_key, room_version) do
           :ok -> :ok
           {:error, _} -> {:error, :bad_signature}
         end

@@ -493,7 +493,7 @@ defmodule AxonWeb.RoomController do
           # excluded from it), so recomputing yields the same id we sent.
           signed_event =
             Map.put_new_lazy(signed_event, "event_id", fn ->
-              AxonCrypto.EventHash.reference_hash(signed_event)
+              AxonCrypto.EventHash.reference_hash(signed_event, room_ctx.room_version)
             end)
 
           RoomProcess.apply_remote_event(room_id, signed_event)

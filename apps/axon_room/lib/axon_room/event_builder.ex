@@ -56,10 +56,10 @@ defmodule AxonRoom.EventBuilder do
     skeleton = Map.put(skeleton, "hashes", %{"sha256" => content_hash})
 
     # Sign
-    signed = KeyServer.sign_event(skeleton)
+    signed = KeyServer.sign_event(skeleton, room_ctx.room_version)
 
     # Compute event_id (reference hash — room v3+ format)
-    event_id = EventHash.reference_hash(signed)
+    event_id = EventHash.reference_hash(signed, room_ctx.room_version)
     Map.put(signed, "event_id", event_id)
   end
 

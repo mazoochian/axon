@@ -285,7 +285,7 @@ defmodule AxonWeb.FederationController do
   defp validate_invite_event(_event, _room_id, _origin), do: {:error, :invalid_invite}
 
   defp accept_invite(room_id, room_version, event, invite_room_state) do
-    signed_event = KeyServer.sign_event(event)
+    signed_event = KeyServer.sign_event(event, room_version)
     now = DateTime.utc_now(:microsecond)
 
     Repo.insert_all(
@@ -1094,7 +1094,14 @@ defmodule AxonWeb.FederationController do
     end
   end
 
-  defp verify_event_signature(event), do: EventVerification.verify_signature(event)
+  # The room version drives redaction, which drives what was actually signed.
+  # Falls back to the room's stored version when the caller doesn't already
+  # know it (an inbound PDU for a room we're resident in).
+  defp verify_event_signature(event),
+    do: verify_event_signature(event, EventStore.get_room_version(event["room_id"]))
+
+  defp verify_event_signature(event, room_version),
+    do: EventVerification.verify_signature(event, room_version)
 
   # See apply_knock_event/3 — must go through RoomProcess.apply_remote_event/3,
   # not a direct EventStore.insert_event, or the room's live GenServer never
@@ -1166,7 +1173,7 @@ defmodule AxonWeb.FederationController do
   end
 
   defp compute_event_id(pdu) do
-    EventHash.reference_hash(pdu)
+    EventHash.reference_hash(pdu, EventStore.get_room_version(pdu["room_id"]))
   end
 
   # ---------------------------------------------------------------------------

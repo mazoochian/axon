@@ -5,7 +5,7 @@ defmodule AxonCrypto.EventHash do
   Spec: https://spec.matrix.org/latest/server-server-api/#calculating-the-content-hash-for-an-event
   """
 
-  alias AxonCrypto.CanonicalJSON
+  alias AxonCrypto.{CanonicalJSON, Redaction}
 
   # "event_id" is never part of any of these hashable/signable computations:
   # for room versions 3+ it isn't a real event field at all (it's derived —
@@ -35,13 +35,24 @@ defmodule AxonCrypto.EventHash do
   @doc """
   Computes the reference hash used as the event_id in room versions 3+.
 
-  Format: "$" <> unpadded_base64url(SHA256(canonical_json_without_unsigned))
+  Format: "$" <> unpadded_base64url(SHA256(canonical_json(redacted_event)))
+
+  The hash is over the **redacted** event (reference implementation:
+  `ReferenceSha256HashOfEvent` — "returns the SHA-256 hash of the redacted
+  event content"). Hashing the unredacted event instead yields a different
+  event ID than every other homeserver computes for the same event, which is
+  self-consistent between two servers doing it and wrong against all others.
+
+  `room_version` selects the redaction algorithm; it is required rather than
+  defaulted, since a silently-wrong default is exactly the failure mode this
+  replaces.
   """
-  @spec reference_hash(map()) :: binary()
-  def reference_hash(event) do
+  @spec reference_hash(map(), binary()) :: binary()
+  def reference_hash(event, room_version) do
     hash =
       event
-      |> Map.drop(["unsigned", "event_id"])
+      |> Redaction.redact(room_version)
+      |> Map.drop(["unsigned", "signatures", "event_id"])
       |> CanonicalJSON.encode_to_binary()
       |> sha256_b64url()
 
@@ -54,10 +65,11 @@ defmodule AxonCrypto.EventHash do
   Returns the event with signatures[server_name][key_id] set.
   The key_id format is "ed25519:KEY_ID".
   """
-  @spec sign_event(map(), binary(), binary(), binary()) :: map()
-  def sign_event(event, server_name, key_id, private_key) do
+  @spec sign_event(map(), binary(), binary(), binary(), binary()) :: map()
+  def sign_event(event, server_name, key_id, private_key, room_version) do
     signable =
       event
+      |> Redaction.redact(room_version)
       |> Map.drop(@non_content_fields)
       |> CanonicalJSON.encode_to_binary()
 
@@ -77,14 +89,64 @@ defmodule AxonCrypto.EventHash do
 
   Returns :ok or {:error, reason}.
   """
-  @spec verify_signature(map(), binary(), binary(), binary()) ::
+  @spec verify_signature(map(), binary(), binary(), binary(), binary()) ::
           :ok | {:error, :invalid_signature | :missing_signature}
-  def verify_signature(event, server_name, key_id, public_key) do
+  def verify_signature(event, server_name, key_id, public_key, room_version) do
     with {:ok, sig_b64} <- get_signature(event, server_name, key_id),
          {:ok, sig_bytes} <- Base.decode64(sig_b64, padding: false) do
       signable =
         event
+        |> Redaction.redact(room_version)
         |> Map.drop(@non_content_fields)
+        |> CanonicalJSON.encode_to_binary()
+
+      if :crypto.verify(:eddsa, :none, signable, sig_bytes, [public_key, :ed25519]) do
+        :ok
+      else
+        {:error, :invalid_signature}
+      end
+    end
+  end
+
+  @doc """
+  Signs a plain JSON object that is **not** a room event — the counterpart of
+  `verify_json_signature/4`. No redaction step, for the same reason.
+  """
+  @spec sign_json(map(), binary(), binary(), binary()) :: map()
+  def sign_json(object, signer, key_id, private_key) do
+    signable =
+      object
+      |> Map.drop(["signatures", "unsigned"])
+      |> CanonicalJSON.encode_to_binary()
+
+    sig_bytes = :crypto.sign(:eddsa, :none, signable, [private_key, :ed25519])
+    sig_b64 = Base.encode64(sig_bytes, padding: false)
+
+    signatures =
+      object
+      |> Map.get("signatures", %{})
+      |> Map.update(signer, %{key_id => sig_b64}, &Map.put(&1, key_id, sig_b64))
+
+    Map.put(object, "signatures", signatures)
+  end
+
+  @doc """
+  Verifies a signature on a plain signed JSON object that is **not** a room
+  event — a cross-signing key, or the `signed` block of a third-party invite.
+
+  These are signed with the same JSON signing algorithm but have no room
+  version and no redaction step: there is nothing to redact, and redacting
+  would strip the very fields being attested. Kept separate from
+  `verify_signature/5` so the two can't be confused at a call site.
+  """
+  @spec verify_json_signature(map(), binary(), binary(), binary()) ::
+          :ok | {:error, :invalid_signature | :missing_signature}
+  def verify_json_signature(object, signer, key_id, public_key) do
+    with {:ok, sig_b64} <- get_signature(object, signer, key_id),
+         {:ok, sig_bytes} <- Base.decode64(sig_b64, padding: false) do
+      signable =
+        object
+        |> Map.drop(["signatures", "unsigned"])
         |> CanonicalJSON.encode_to_binary()
 
       if :crypto.verify(:eddsa, :none, signable, sig_bytes, [public_key, :ed25519]) do

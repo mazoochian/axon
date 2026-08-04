@@ -111,9 +111,12 @@ defmodule AxonFederation.DeviceListFanout do
       try do
         poll(state)
       rescue
-        e in [DBConnection.OwnershipError, DBConnection.ConnectionError] ->
-          _ = e
-          state
+        # A raised DB error (no sandbox ownership for this process).
+        _ in [DBConnection.OwnershipError, DBConnection.ConnectionError] -> state
+      catch
+        # And an *exit* — a checkout whose owning test process has already
+        # finished exits rather than raising, so `rescue` alone never saw it.
+        :exit, _ -> state
       end
 
     schedule_poll()

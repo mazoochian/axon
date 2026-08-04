@@ -41,7 +41,7 @@ defmodule AxonFederation.RoomKnock do
 
     with {:ok, make_knock_resp} <- HttpClient.get(server, path),
          {:ok, template, room_version} <- extract_template(make_knock_resp),
-         {:ok, knock_event} <- build_and_sign_knock(template, user_id, reason),
+         {:ok, knock_event} <- build_and_sign_knock(template, user_id, reason, room_version),
          {:ok, send_knock_resp} <- send_knock(server, room_id, knock_event),
          :ok <- import_knock(send_knock_resp, room_id, room_version, knock_event) do
       {:ok, room_id}
@@ -54,7 +54,7 @@ defmodule AxonFederation.RoomKnock do
   defp extract_template(%{"event" => template}), do: {:ok, template, "11"}
   defp extract_template(_), do: {:error, :invalid_make_knock_response}
 
-  defp build_and_sign_knock(template, user_id, reason) do
+  defp build_and_sign_knock(template, user_id, reason, room_version) do
     extra_content =
       if reason,
         do: %{"membership" => "knock", "reason" => reason},
@@ -70,8 +70,8 @@ defmodule AxonFederation.RoomKnock do
 
     content_hash = EventHash.content_hash(knock_event)
     knock_event = Map.put(knock_event, "hashes", %{"sha256" => content_hash})
-    signed = KeyServer.sign_event(knock_event)
-    event_id = EventHash.reference_hash(signed)
+    signed = KeyServer.sign_event(knock_event, room_version)
+    event_id = EventHash.reference_hash(signed, room_version)
     {:ok, Map.put(signed, "event_id", event_id)}
   end
 

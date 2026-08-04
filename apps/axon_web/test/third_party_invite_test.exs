@@ -19,7 +19,7 @@ defmodule AxonWeb.ThirdPartyInviteTest do
   alias AxonCrypto.KeyServer
 
   defp signed_3pid_proof(mxid, token) do
-    KeyServer.sign_event(%{"mxid" => mxid, "token" => token})
+    KeyServer.sign_json(%{"mxid" => mxid, "token" => token})
   end
 
   defp get_state(token, room_id, type, state_key) do
