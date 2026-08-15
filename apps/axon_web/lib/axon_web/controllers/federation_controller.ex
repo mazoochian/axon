@@ -759,23 +759,61 @@ defmodule AxonWeb.FederationController do
     origin = conn.assigns[:origin_server]
 
     if acl_allowed?(room_id, origin) do
-      known_ids = MapSet.new(params["known_ids"] || [])
+      earliest_events = MapSet.new(params["earliest_events"] || [])
+      latest_events = params["latest_events"] || []
       limit = params["limit"] || 10
 
-      events =
-        Repo.all(
-          from(e in Event,
-            where: e.room_id == ^room_id and e.event_id not in ^MapSet.to_list(known_ids),
-            order_by: [desc: e.stream_ordering],
-            limit: ^limit
-          )
-        )
+      events = walk_missing_events(room_id, latest_events, earliest_events, limit)
 
       json(conn, %{
         "events" => Enum.map(events, &EventStore.event_to_pdu/1)
       })
     else
       acl_forbidden(conn)
+    end
+  end
+
+  # Per spec: walk backward from latest_events via prev_events, collecting
+  # up to `limit` events, without stepping past earliest_events (the
+  # requester's own fork point — excluded from the result, and its
+  # ancestors are never visited, since the requester already has those
+  # too). Not a stream_ordering range scan: the caller's earliest/latest
+  # boundaries name a specific slice of the DAG, and an unrelated event
+  # from elsewhere in the room's history — even one that happens to sort
+  # between them by ordering — must never be returned.
+  #
+  # `acc` is built by prepending each event as it's visited, so the
+  # *last*-visited event (the one deepest in the walk, i.e. chronologically
+  # earliest) ends up first in the list — which is exactly the order the
+  # spec wants back: earliest to latest, without an explicit reverse.
+  defp walk_missing_events(room_id, queue, earliest_events, limit, seen \\ MapSet.new(), acc \\ [])
+
+  defp walk_missing_events(_room_id, [], _earliest, _limit, _seen, acc), do: acc
+
+  defp walk_missing_events(_room_id, _queue, _earliest, limit, _seen, acc)
+       when length(acc) >= limit,
+       do: acc
+
+  defp walk_missing_events(room_id, [event_id | rest], earliest_events, limit, seen, acc) do
+    cond do
+      MapSet.member?(seen, event_id) or MapSet.member?(earliest_events, event_id) ->
+        walk_missing_events(room_id, rest, earliest_events, limit, seen, acc)
+
+      true ->
+        case Repo.get_by(Event, event_id: event_id, room_id: room_id) do
+          nil ->
+            walk_missing_events(room_id, rest, earliest_events, limit, seen, acc)
+
+          event ->
+            walk_missing_events(
+              room_id,
+              rest ++ event.prev_event_ids,
+              earliest_events,
+              limit,
+              MapSet.put(seen, event_id),
+              [event | acc]
+            )
+        end
     end
   end
 
