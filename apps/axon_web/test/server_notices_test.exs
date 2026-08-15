@@ -1,8 +1,8 @@
 defmodule AxonWeb.ServerNoticesTest do
   @moduledoc """
   Regression tests for Phase 14's server notices: an admin-triggered
-  message from a lazily-provisioned system account (`@server-notices:...`)
-  into an auto-created, reused-per-recipient room tagged `m.server_notice`.
+  message from a lazily-provisioned system account (`@_server:...`) into
+  an auto-created, reused-per-recipient room tagged `m.server_notice`.
   """
 
   use AxonWeb.ConnCase, async: false
@@ -165,5 +165,27 @@ defmodule AxonWeb.ServerNoticesTest do
       })
 
     assert conn.status == 404
+  end
+
+  test "after leaving the room, the next notice re-invites into the same reused room" do
+    admin = register("notice_reinvite_admin_#{System.unique_integer([:positive])}")
+    make_admin(admin.user_id)
+    erin = register("notice_reinvite_erin_#{System.unique_integer([:positive])}")
+
+    body = %{"user_id" => erin.user_id, "content" => %{"msgtype" => "m.text", "body" => "first"}}
+    authed(admin.token) |> jp("/_synapse/admin/v1/send_server_notice", body)
+
+    invite = decode(authed(erin.token) |> get("/_matrix/client/v3/sync"))["rooms"]["invite"]
+    [{room_id, _}] = Map.to_list(invite)
+
+    authed(erin.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+    authed(erin.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
+
+    body2 = %{"user_id" => erin.user_id, "content" => %{"msgtype" => "m.text", "body" => "second"}}
+    conn = authed(admin.token) |> jp("/_synapse/admin/v1/send_server_notice", body2)
+    assert conn.status == 200
+
+    invite2 = decode(authed(erin.token) |> get("/_matrix/client/v3/sync"))["rooms"]["invite"]
+    assert Map.has_key?(invite2, room_id)
   end
 end

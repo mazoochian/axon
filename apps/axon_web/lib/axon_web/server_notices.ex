@@ -13,7 +13,7 @@ defmodule AxonWeb.ServerNotices do
 
   import Ecto.Query, only: [from: 2]
 
-  alias AxonCore.{Repo, UserStore}
+  alias AxonCore.{EventStore, Repo, UserStore}
   alias AxonRoom.{CreateRoom, RoomProcess}
 
   # Matches Complement's hardcoded expectation (TestServerNotices'
@@ -64,8 +64,24 @@ defmodule AxonWeb.ServerNotices do
            from(r in "server_notice_rooms", where: r.user_id == ^user_id, select: r.room_id)
          ) do
       nil -> create_room(user_id)
-      room_id -> {:ok, room_id}
+      room_id -> {:ok, reinvite_if_needed(room_id, user_id)}
     end
+  end
+
+  # The room is reused across every notice ever sent to this user, but a
+  # recipient can leave it (they're always free to leave once actually
+  # joined — only *rejecting the invite* is blocked) — re-invite them if
+  # they have, same as Synapse does, so a later notice doesn't silently
+  # land in a room they've since left with no invite to bring them back.
+  defp reinvite_if_needed(room_id, user_id) do
+    with {:ok, membership} <- EventStore.get_membership(room_id, user_id),
+         true <- membership not in ["join", "invite"] do
+      RoomProcess.send_event(room_id, system_user_id(), "m.room.member", %{"membership" => "invite"},
+        state_key: user_id
+      )
+    end
+
+    room_id
   end
 
   defp create_room(user_id) do
