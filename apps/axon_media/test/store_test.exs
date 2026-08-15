@@ -83,14 +83,14 @@ defmodule AxonMedia.StoreTest do
       assert Store.download(media_id) == {:error, :not_found}
     end
 
-    test "a media row with no storage_path is not_found" do
+    test "a media row with no storage_path is not_yet_uploaded (an async-upload reservation, MSC2246)" do
       now = DateTime.utc_now(:microsecond)
 
       Repo.insert_all("media", [
         %{
           media_id: "no_path_media",
           origin_server: "localhost",
-          content_type: "text/plain",
+          content_type: nil,
           file_size: 0,
           storage_path: nil,
           uploader: "@alice:localhost",
@@ -98,7 +98,7 @@ defmodule AxonMedia.StoreTest do
         }
       ])
 
-      assert Store.download("no_path_media") == {:error, :not_found}
+      assert Store.download("no_path_media") == {:error, :not_yet_uploaded}
     end
 
     test "a media row whose file was removed from disk is not_found, not a crash" do
@@ -115,6 +115,39 @@ defmodule AxonMedia.StoreTest do
       File.rm!(path)
 
       assert Store.download(media_id) == {:error, :not_found}
+    end
+  end
+
+  describe "async upload (MSC2246): create_pending/2 + complete_upload/5" do
+    test "a pending reservation can be filled in by its creator and then downloaded" do
+      {:ok, media_id} = Store.create_pending("@alice:localhost", "localhost")
+      assert Store.download(media_id) == {:error, :not_yet_uploaded}
+
+      assert {:ok, ^media_id} =
+               Store.complete_upload(media_id, "@alice:localhost", "text/plain", "hi", "f.txt")
+
+      assert {:ok, %{content_type: "text/plain", data: "hi", filename: "f.txt"}} =
+               Store.download(media_id)
+    end
+
+    test "complete_upload rejects a user other than the one who reserved it" do
+      {:ok, media_id} = Store.create_pending("@alice:localhost", "localhost")
+
+      assert Store.complete_upload(media_id, "@mallory:localhost", "text/plain", "hi") ==
+               {:error, :forbidden}
+    end
+
+    test "complete_upload rejects a second fill-in of an already-uploaded media ID" do
+      {:ok, media_id} = Store.create_pending("@alice:localhost", "localhost")
+      {:ok, _} = Store.complete_upload(media_id, "@alice:localhost", "text/plain", "first")
+
+      assert Store.complete_upload(media_id, "@alice:localhost", "text/plain", "second") ==
+               {:error, :already_uploaded}
+    end
+
+    test "complete_upload_precheck reports :not_found for an unknown media_id" do
+      assert Store.complete_upload_precheck("nonexistent", "@alice:localhost") ==
+               {:error, :not_found}
     end
   end
 end

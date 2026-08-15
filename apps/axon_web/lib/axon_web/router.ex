@@ -183,6 +183,7 @@ defmodule AxonWeb.Router do
     get("/event_reports", AdminController, :list_reports)
 
     post("/send_server_notice", AdminController, :send_server_notice)
+    put("/send_server_notice/:txn_id", AdminController, :send_server_notice)
   end
 
   # -------------------------------------------------------------------------
@@ -226,6 +227,8 @@ defmodule AxonWeb.Router do
     pipe_through(:authenticated)
     post("/v3/upload", MediaController, :upload)
     post("/r0/upload", MediaController, :upload)
+    post("/v1/create", MediaController, :create)
+    put("/v3/upload/:server_name/:media_id", MediaController, :upload_to_id)
   end
 
   # -------------------------------------------------------------------------

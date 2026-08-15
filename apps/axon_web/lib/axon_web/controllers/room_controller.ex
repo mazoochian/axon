@@ -239,21 +239,49 @@ defmodule AxonWeb.RoomController do
   def leave(conn, %{"room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
 
-    if resident_room?(room_id) do
-      with {:ok, _event_id} <-
-             RoomProcess.send_event(room_id, user_id, "m.room.member", %{"membership" => "leave"},
-               state_key: user_id
-             ) do
-        json(conn, %{})
-      end
-    else
-      with {:ok, via_server} <- invite_sender_server(room_id, user_id),
-           :ok <- AxonFederation.RoomLeave.leave_via_federation(room_id, user_id, [via_server]) do
-        json(conn, %{})
-      else
-        _ -> {:error, :remote_leave_failed}
-      end
+    cond do
+      still_invited_to_server_notice_room?(room_id, user_id) ->
+        conn
+        |> put_status(403)
+        |> json(%{
+          "errcode" => "M_CANNOT_LEAVE_SERVER_NOTICE_ROOM",
+          "error" => "You cannot reject this invite"
+        })
+
+      resident_room?(room_id) ->
+        with {:ok, _event_id} <-
+               RoomProcess.send_event(
+                 room_id,
+                 user_id,
+                 "m.room.member",
+                 %{"membership" => "leave"},
+                 state_key: user_id
+               ) do
+          json(conn, %{})
+        end
+
+      true ->
+        with {:ok, via_server} <- invite_sender_server(room_id, user_id),
+             :ok <- AxonFederation.RoomLeave.leave_via_federation(room_id, user_id, [via_server]) do
+          json(conn, %{})
+        else
+          _ -> {:error, :remote_leave_failed}
+        end
     end
+  end
+
+  defp still_invited_to_server_notice_room?(room_id, user_id) do
+    Repo.exists?(
+      from(r in "server_notice_rooms",
+        where: r.room_id == ^room_id and r.user_id == ^user_id
+      )
+    ) and
+      Repo.one(
+        from(m in "room_memberships",
+          where: m.room_id == ^room_id and m.user_id == ^user_id,
+          select: m.membership
+        )
+      ) == "invite"
   end
 
   defp resident_room?(room_id) do

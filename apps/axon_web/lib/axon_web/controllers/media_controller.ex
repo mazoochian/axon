@@ -66,6 +66,86 @@ defmodule AxonWeb.MediaController do
     end
   end
 
+  # POST /_matrix/media/v1/create (MSC2246 async uploads)
+  #
+  # Reserves an mxc:// URI without content — the client fills it in with a
+  # later `PUT .../media/v3/upload/:server_name/:media_id`, which is what
+  # lets a client attach media to an event before the (possibly slow)
+  # upload finishes.
+  def create(conn, _params) do
+    user_id = conn.assigns[:current_user_id]
+    server_name = Application.fetch_env!(:axon_web, :server_name)
+
+    {:ok, media_id} = Store.create_pending(user_id, server_name)
+    json(conn, %{"content_uri" => "mxc://#{server_name}/#{media_id}"})
+  end
+
+  # PUT /_matrix/media/v3/upload/:server_name/:media_id (MSC2246 async uploads)
+  #
+  # Fills in a media ID previously reserved via `create/2`. Whether the
+  # media ID is already-uploaded/forbidden/missing is checked *before*
+  # reading the request body, since a client probing for the resulting
+  # error (e.g. Complement's "cannot overwrite" test) may send no body at
+  # all.
+  def upload_to_id(conn, %{"server_name" => server_name, "media_id" => media_id} = params) do
+    user_id = conn.assigns[:current_user_id]
+    local_server = Application.fetch_env!(:axon_web, :server_name)
+
+    if server_name != local_server do
+      conn
+      |> put_status(404)
+      |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+    else
+      content_type =
+        case Plug.Conn.get_req_header(conn, "content-type") do
+          [ct | _] -> ct |> String.split(";") |> hd() |> String.trim()
+          [] -> "application/octet-stream"
+        end
+
+      filename = non_empty(params["filename"])
+
+      case Store.complete_upload_precheck(media_id, user_id) do
+        :ok ->
+          case Plug.Conn.read_body(conn, length: 100_000_000) do
+            {:ok, body, _conn} ->
+              case Store.complete_upload(media_id, user_id, content_type, body, filename) do
+                {:ok, _media_id} ->
+                  json(conn, %{})
+
+                {:error, reason} ->
+                  media_upload_error(conn, reason)
+              end
+
+            {:error, :too_large} ->
+              conn |> put_status(413) |> json(%{"errcode" => "M_TOO_LARGE", "error" => "Upload too large"})
+
+            {:error, reason} ->
+              Logger.error("Body read error: #{inspect(reason)}")
+              conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to read body"})
+          end
+
+        {:error, reason} ->
+          media_upload_error(conn, reason)
+      end
+    end
+  end
+
+  defp media_upload_error(conn, :not_found) do
+    conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+  end
+
+  defp media_upload_error(conn, :forbidden) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not the user who reserved this media ID"})
+  end
+
+  defp media_upload_error(conn, :already_uploaded) do
+    conn
+    |> put_status(409)
+    |> json(%{"errcode" => "M_CANNOT_OVERWRITE_MEDIA", "error" => "Media has already been uploaded"})
+  end
+
   # GET /_matrix/media/v3/download/:server_name/:media_id
   # GET /_matrix/media/v3/download/:server_name/:media_id/:filename
   def download(conn, %{"server_name" => origin_server, "media_id" => media_id} = params) do
@@ -142,6 +222,11 @@ defmodule AxonWeb.MediaController do
         conn
         |> put_status(404)
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+
+      {:error, :not_yet_uploaded} ->
+        conn
+        |> put_status(504)
+        |> json(%{"errcode" => "M_NOT_YET_UPLOADED", "error" => "Media has not been uploaded yet"})
     end
   end
 

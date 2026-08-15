@@ -369,4 +369,83 @@ defmodule AxonWeb.MediaControllerTest do
       assert get_resp_header(conn, "content-type") == ["image/png"]
     end
   end
+
+  describe "async media upload (MSC2246)" do
+    defp create_media(token) do
+      conn = authed(token) |> jp("/_matrix/media/v1/create", %{})
+      assert conn.status == 200
+      mxc_uri = decode(conn)["content_uri"]
+      ["mxc:", "", server, media_id] = String.split(mxc_uri, "/")
+      {server, media_id}
+    end
+
+    test "downloading a not-yet-uploaded media ID returns 504 M_NOT_YET_UPLOADED" do
+      alice = register("asyncmedia_pending_#{System.unique_integer([:positive])}")
+      {server, media_id} = create_media(alice.token)
+
+      conn = build_conn() |> get("/_matrix/media/v3/download/#{server}/#{media_id}")
+      assert conn.status == 504
+      assert decode(conn)["errcode"] == "M_NOT_YET_UPLOADED"
+    end
+
+    test "PUT fills in a reserved media ID, which can then be downloaded" do
+      alice = register("asyncmedia_fill_#{System.unique_integer([:positive])}")
+      {server, media_id} = create_media(alice.token)
+
+      upload_conn =
+        authed(alice.token)
+        |> put_req_header("content-type", "image/png")
+        |> put("/_matrix/media/v3/upload/#{server}/#{media_id}", <<1, 2, 3>>)
+
+      assert upload_conn.status == 200
+
+      dl_conn = build_conn() |> get("/_matrix/media/v3/download/#{server}/#{media_id}")
+      assert dl_conn.status == 200
+      assert dl_conn.resp_body == <<1, 2, 3>>
+      assert hd(get_resp_header(dl_conn, "content-type")) =~ "image/png"
+    end
+
+    test "PUT to an already-uploaded media ID is rejected with 409 M_CANNOT_OVERWRITE_MEDIA" do
+      alice = register("asyncmedia_conflict_#{System.unique_integer([:positive])}")
+      {server, media_id} = create_media(alice.token)
+
+      authed(alice.token)
+      |> put_req_header("content-type", "text/plain")
+      |> put("/_matrix/media/v3/upload/#{server}/#{media_id}", "first")
+
+      conn =
+        authed(alice.token)
+        |> put_req_header("content-type", "text/plain")
+        |> put("/_matrix/media/v3/upload/#{server}/#{media_id}", "second")
+
+      assert conn.status == 409
+      assert decode(conn)["errcode"] == "M_CANNOT_OVERWRITE_MEDIA"
+    end
+
+    test "PUT by a user other than the one who reserved the media ID is forbidden" do
+      alice = register("asyncmedia_owner_#{System.unique_integer([:positive])}")
+      mallory = register("asyncmedia_intruder_#{System.unique_integer([:positive])}")
+      {server, media_id} = create_media(alice.token)
+
+      conn =
+        authed(mallory.token)
+        |> put_req_header("content-type", "text/plain")
+        |> put("/_matrix/media/v3/upload/#{server}/#{media_id}", "not yours")
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+
+    test "PUT to an unknown media ID 404s" do
+      alice = register("asyncmedia_unknown_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> put_req_header("content-type", "text/plain")
+        |> put("/_matrix/media/v3/upload/localhost/nonexistent_media_id", "hi")
+
+      assert conn.status == 404
+      assert decode(conn)["errcode"] == "M_NOT_FOUND"
+    end
+  end
 end

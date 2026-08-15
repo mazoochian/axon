@@ -29,6 +29,7 @@ defmodule AxonWeb.SyncController do
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
   alias AxonSync.Manager, as: SyncManager
+  alias AxonSync.Presence
   alias AxonWeb.SyncHelpers
 
   @default_timeline_limit 100
@@ -39,6 +40,10 @@ defmodule AxonWeb.SyncController do
     device_id = conn.assigns.current_device_id
     since = params["since"]
     timeout = min(String.to_integer(params["timeout"] || "0"), 30_000)
+
+    if params["set_presence"] in ["online", "unavailable", "offline"] do
+      Presence.set_presence(user_id, params["set_presence"])
+    end
 
     # nil means initial sync; a string (even "0") means incremental
     is_initial_sync = is_nil(since)

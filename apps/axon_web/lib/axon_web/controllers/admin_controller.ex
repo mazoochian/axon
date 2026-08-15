@@ -238,6 +238,28 @@ defmodule AxonWeb.AdminController do
   # ---------------------------------------------------------------------------
 
   # POST /_synapse/admin/v1/send_server_notice
+  # PUT .../send_server_notice/:txn_id — idempotent per (admin, device, txn_id),
+  # same pattern as ordinary PUT /send/{eventType}/{txnId}: a replayed txn_id
+  # returns the event_id from the first attempt instead of sending a duplicate.
+  def send_server_notice(
+        conn,
+        %{"txn_id" => txn_id, "user_id" => user_id, "content" => content}
+      ) do
+    admin_id = conn.assigns.current_user_id
+    device_id = conn.assigns.current_device_id
+
+    case admin_txn_idempotency(admin_id, device_id, txn_id) do
+      {:already_sent, event_id} ->
+        json(conn, %{"event_id" => event_id})
+
+      :new ->
+        with {:ok, event_id} <- AxonWeb.ServerNotices.send_notice(user_id, content) do
+          record_admin_txn(admin_id, device_id, txn_id, event_id)
+          json(conn, %{"event_id" => event_id})
+        end
+    end
+  end
+
   def send_server_notice(conn, %{"user_id" => user_id, "content" => content}) do
     with {:ok, event_id} <- AxonWeb.ServerNotices.send_notice(user_id, content) do
       json(conn, %{"event_id" => event_id})
@@ -248,5 +270,33 @@ defmodule AxonWeb.AdminController do
     conn
     |> put_status(400)
     |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user_id and content are required"})
+  end
+
+  defp admin_txn_idempotency(user_id, device_id, txn_id) do
+    case Repo.one(
+           from(t in "client_txns",
+             where: t.user_id == ^user_id and t.device_id == ^device_id and t.txn_id == ^txn_id,
+             select: t.event_id
+           )
+         ) do
+      nil -> :new
+      event_id -> {:already_sent, event_id}
+    end
+  end
+
+  defp record_admin_txn(user_id, device_id, txn_id, event_id) do
+    Repo.insert_all(
+      "client_txns",
+      [
+        %{
+          user_id: user_id,
+          device_id: device_id,
+          txn_id: txn_id,
+          event_id: event_id,
+          inserted_at: DateTime.utc_now(:microsecond)
+        }
+      ],
+      on_conflict: :nothing
+    )
   end
 end

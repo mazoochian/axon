@@ -16,7 +16,7 @@ defmodule AxonWeb.ServerNoticesTest do
     Repo.update_all(from(u in "users", where: u.user_id == ^user_id), set: [admin: true])
   end
 
-  test "sends a message that creates the system account and a tagged room on first use" do
+  test "sends a message that creates the system account and a tagged, invite-only room on first use" do
     admin = register("notice_admin_#{System.unique_integer([:positive])}")
     make_admin(admin.user_id)
     alice = register("notice_alice_#{System.unique_integer([:positive])}")
@@ -32,12 +32,19 @@ defmodule AxonWeb.ServerNoticesTest do
     event_id = decode(conn)["event_id"]
     assert is_binary(event_id)
 
+    # The recipient is invited, not auto-joined — matches Synapse/Complement
+    # (TestServerNotices): they can't see timeline content yet, and can't
+    # reject the invite either (see the leave-guard test below), but they
+    # must actively join like any other invite.
     sync_conn = authed(alice.token) |> get("/_matrix/client/v3/sync")
-    body = decode(sync_conn)
-    join = body["rooms"]["join"]
-    assert map_size(join) == 1
-    [{room_id, room_data}] = Map.to_list(join)
+    invite = decode(sync_conn)["rooms"]["invite"]
+    assert map_size(invite) == 1
+    [{room_id, _}] = Map.to_list(invite)
 
+    authed(alice.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+
+    joined_sync = authed(alice.token) |> get("/_matrix/client/v3/sync")
+    room_data = decode(joined_sync)["rooms"]["join"][room_id]
     events = room_data["timeline"]["events"]
 
     assert Enum.any?(
@@ -66,6 +73,12 @@ defmodule AxonWeb.ServerNoticesTest do
         "content" => %{"msgtype" => "m.text", "body" => "first notice"}
       })
 
+    assert conn1.status == 200
+    room_id = decode(authed(bob.token) |> get("/_matrix/client/v3/sync"))["rooms"]["invite"]
+    [{room_id, _}] = Map.to_list(room_id)
+
+    authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+
     conn2 =
       authed(admin.token)
       |> jp("/_synapse/admin/v1/send_server_notice", %{
@@ -73,17 +86,57 @@ defmodule AxonWeb.ServerNoticesTest do
         "content" => %{"msgtype" => "m.text", "body" => "second notice"}
       })
 
-    assert conn1.status == 200
     assert conn2.status == 200
 
     sync_conn = authed(bob.token) |> get("/_matrix/client/v3/sync")
     join = decode(sync_conn)["rooms"]["join"]
     assert map_size(join) == 1
 
-    [{_room_id, room_data}] = Map.to_list(join)
+    [{^room_id, room_data}] = Map.to_list(join)
     bodies = Enum.map(room_data["timeline"]["events"], & &1["content"]["body"])
     assert "first notice" in bodies
     assert "second notice" in bodies
+  end
+
+  test "the recipient cannot leave (reject) the invite, but can leave once joined" do
+    admin = register("notice_leave_admin_#{System.unique_integer([:positive])}")
+    make_admin(admin.user_id)
+    carol = register("notice_leave_carol_#{System.unique_integer([:positive])}")
+
+    authed(admin.token)
+    |> jp("/_synapse/admin/v1/send_server_notice", %{
+      "user_id" => carol.user_id,
+      "content" => %{"msgtype" => "m.text", "body" => "hi"}
+    })
+
+    invite = decode(authed(carol.token) |> get("/_matrix/client/v3/sync"))["rooms"]["invite"]
+    [{room_id, _}] = Map.to_list(invite)
+
+    reject_conn = authed(carol.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
+    assert reject_conn.status == 403
+    assert decode(reject_conn)["errcode"] == "M_CANNOT_LEAVE_SERVER_NOTICE_ROOM"
+
+    join_conn = authed(carol.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+    assert join_conn.status == 200
+
+    leave_conn = authed(carol.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
+    assert leave_conn.status == 200
+  end
+
+  test "PUT with a txn_id is idempotent" do
+    admin = register("notice_txn_admin_#{System.unique_integer([:positive])}")
+    make_admin(admin.user_id)
+    dave = register("notice_txn_dave_#{System.unique_integer([:positive])}")
+    txn = "txn_#{System.unique_integer([:positive])}"
+
+    body = %{"user_id" => dave.user_id, "content" => %{"msgtype" => "m.text", "body" => "hi"}}
+
+    conn1 = authed(admin.token) |> jpu("/_synapse/admin/v1/send_server_notice/#{txn}", body)
+    conn2 = authed(admin.token) |> jpu("/_synapse/admin/v1/send_server_notice/#{txn}", body)
+
+    assert conn1.status == 200
+    assert conn2.status == 200
+    assert decode(conn1)["event_id"] == decode(conn2)["event_id"]
   end
 
   test "a non-admin cannot send a server notice" do

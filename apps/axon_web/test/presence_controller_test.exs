@@ -77,4 +77,28 @@ defmodule AxonWeb.PresenceControllerTest do
     assert conn.status == 200
     assert decode(conn)["presence"] == "offline"
   end
+
+  # `?set_presence=` on /sync (Complement's TestPresence "Presence can be
+  # set from sync") — previously read nowhere, so a client setting presence
+  # this way (rather than via PUT .../status) had no effect at all.
+  test "?set_presence= on /sync updates the user's presence" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    sync_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/sync?timeout=0&set_presence=unavailable")
+
+    assert sync_conn.status == 200
+
+    status_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/presence/#{alice.user_id}/status")
+
+    assert decode(status_conn)["presence"] == "unavailable"
+  end
+
+  test "an invalid ?set_presence= value on /sync is silently ignored, not an error" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    conn = authed(alice.token) |> get("/_matrix/client/v3/sync?timeout=0&set_presence=bogus")
+    assert conn.status == 200
+  end
 end
