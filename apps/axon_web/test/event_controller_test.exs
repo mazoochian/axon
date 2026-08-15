@@ -42,12 +42,12 @@ defmodule AxonWeb.EventControllerTest do
     decode(conn)["room_id"]
   end
 
-  defp send_message(token, room_id) do
+  defp send_message(token, room_id, content \\ %{"body" => "hi"}) do
     txn = "txn_#{System.unique_integer([:positive])}"
 
     conn =
       authed(token)
-      |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn}", %{"body" => "hi"})
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn}", content)
 
     assert conn.status == 200
     decode(conn)["event_id"]
@@ -287,6 +287,55 @@ defmodule AxonWeb.EventControllerTest do
 
       conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/messages")
       assert decode(conn)["state"] == []
+    end
+  end
+
+  describe "get_messages/2 contains_url" do
+    test "filter={contains_url:true} returns only events whose content has a url key" do
+      alice = register("curl_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      send_message(alice.token, room_id, %{"body" => "no url here"})
+
+      with_url =
+        send_message(alice.token, room_id, %{
+          "body" => "test.png",
+          "msgtype" => "m.file",
+          "url" => "mxc://localhost/abc"
+        })
+
+      filter = URI.encode_www_form(Jason.encode!(%{"contains_url" => true}))
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/messages?filter=#{filter}&limit=10")
+
+      assert conn.status == 200
+      chunk = decode(conn)["chunk"]
+      assert Enum.map(chunk, & &1["event_id"]) == [with_url]
+    end
+
+    test "filter={contains_url:false} excludes events whose content has a url key" do
+      alice = register("curl_false_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+
+      without_url = send_message(alice.token, room_id, %{"body" => "no url here"})
+
+      with_url =
+        send_message(alice.token, room_id, %{
+          "body" => "test.png",
+          "msgtype" => "m.file",
+          "url" => "mxc://localhost/abc"
+        })
+
+      filter = URI.encode_www_form(Jason.encode!(%{"contains_url" => false}))
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/messages?filter=#{filter}&limit=10")
+
+      event_ids = decode(conn)["chunk"] |> Enum.map(& &1["event_id"])
+      assert without_url in event_ids
+      refute with_url in event_ids
     end
   end
 end
