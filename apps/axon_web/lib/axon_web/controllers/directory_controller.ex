@@ -183,10 +183,30 @@ defmodule AxonWeb.DirectoryController do
            )
          ) do
       nil ->
-        {:error, :not_found}
+        get_remote_alias(conn, room_alias)
 
       room_id ->
         json(conn, %{"room_id" => room_id, "servers" => [server_name()]})
+    end
+  end
+
+  # Not one of our own aliases — for a room_alias suffixed with a server
+  # other than ours, ask that server directly (the same federation
+  # query/directory lookup RoomController's join flow already uses),
+  # rather than only ever answering for aliases we host ourselves.
+  defp get_remote_alias(conn, room_alias) do
+    alias_server = AxonCore.MatrixId.server_name(room_alias)
+    local_server = server_name()
+
+    with true <- is_binary(alias_server) and alias_server != local_server,
+         {:ok, %{"room_id" => room_id, "servers" => servers}} <-
+           AxonFederation.HttpClient.get(
+             alias_server,
+             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode(room_alias)}"
+           ) do
+      json(conn, %{"room_id" => room_id, "servers" => servers})
+    else
+      _ -> {:error, :not_found}
     end
   end
 

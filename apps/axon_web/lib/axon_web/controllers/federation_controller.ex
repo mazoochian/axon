@@ -899,24 +899,32 @@ defmodule AxonWeb.FederationController do
   # ---------------------------------------------------------------------------
 
   def query_profile(conn, %{"user_id" => user_id}) do
-    # Profile data lives on user_profiles (displayname/avatar_url) — the
-    # `users` table has neither column.
-    case Repo.one(
-           from(p in "user_profiles",
-             where: p.user_id == ^user_id,
-             select: %{displayname: p.displayname, avatar_url: p.avatar_url}
-           )
-         ) do
-      nil ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "User not found"})
+    server = AxonCore.MatrixId.server_name(user_id)
 
-      profile ->
-        json(conn, %{
-          "displayname" => profile.displayname,
-          "avatar_url" => profile.avatar_url
-        })
+    if is_nil(server) or not AxonCore.MatrixId.valid_server_name?(server) do
+      conn
+      |> put_status(400)
+      |> json(%{"errcode" => "M_INVALID_PARAM", "error" => "Invalid user_id"})
+    else
+      # Profile data lives on user_profiles (displayname/avatar_url) — the
+      # `users` table has neither column.
+      case Repo.one(
+             from(p in "user_profiles",
+               where: p.user_id == ^user_id,
+               select: %{displayname: p.displayname, avatar_url: p.avatar_url}
+             )
+           ) do
+        nil ->
+          conn
+          |> put_status(404)
+          |> json(%{"errcode" => "M_NOT_FOUND", "error" => "User not found"})
+
+        profile ->
+          json(conn, %{
+            "displayname" => profile.displayname,
+            "avatar_url" => profile.avatar_url
+          })
+      end
     end
   end
 

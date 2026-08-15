@@ -54,4 +54,28 @@ defmodule AxonCore.MatrixId do
   end
 
   def from_server?(_id, _server), do: false
+
+  @server_name_re ~r/^(\[[0-9a-fA-F:]+\](:\d+)?|[^:\[\]]+(:\d+)?)$/
+
+  @doc """
+  True when `server` is a syntactically valid Matrix server name —
+  `hostname[:port]`, an IPv6 literal in brackets, or an IPv4 address,
+  each with an optional `:port` that must be all-digits. A non-numeric
+  port (`localhost:http`) is the case this exists to catch (spec:
+  "Non-numeric ports in server names are rejected").
+
+      iex> AxonCore.MatrixId.valid_server_name?("example.com")
+      true
+
+      iex> AxonCore.MatrixId.valid_server_name?("example.com:8448")
+      true
+
+      iex> AxonCore.MatrixId.valid_server_name?("[::1]:8448")
+      true
+
+      iex> AxonCore.MatrixId.valid_server_name?("example.com:http")
+      false
+  """
+  def valid_server_name?(server) when is_binary(server), do: server =~ @server_name_re
+  def valid_server_name?(_), do: false
 end

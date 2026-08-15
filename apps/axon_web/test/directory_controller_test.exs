@@ -3,6 +3,22 @@ defmodule AxonWeb.DirectoryControllerTest do
 
   use AxonWeb.ConnCase, async: false
 
+  alias AxonFederation.FakeRemoteMatrixServer
+
+  @port 19_450
+  @server_name "fake-directory.test"
+
+  setup do
+    start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
+
+    Application.put_env(:axon_federation, :server_overrides, %{
+      @server_name => "http://127.0.0.1:#{@port}"
+    })
+
+    on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
+    :ok
+  end
+
   defp register(username) do
     conn =
       build_conn()
@@ -205,6 +221,31 @@ defmodule AxonWeb.DirectoryControllerTest do
     test "get_alias for an unknown alias 404s" do
       conn = build_conn() |> get("/_matrix/client/v3/directory/room/%23nonexistent:localhost")
       assert conn.status == 404
+    end
+
+    # get_alias previously only ever answered for aliases hosted locally,
+    # 404ing unconditionally for any other server's alias instead of asking
+    # that server via federation (the same query/directory lookup
+    # RoomController.join/2's alias resolution already uses) — Complement's
+    # TestRemoteAliasRequestsUnderstandUnicode caught this.
+    test "get_alias for a remote alias queries that server via federation" do
+      room_alias = "老虎Â£я🤨#{System.unique_integer([:positive])}"
+      full_alias = "##{room_alias}:#{@server_name}"
+      remote_room_id = "!remoteroom#{System.unique_integer([:positive])}:#{@server_name}"
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/query/directory}},
+        200,
+        %{"room_id" => remote_room_id, "servers" => [@server_name]}
+      )
+
+      conn = build_conn() |> get("/_matrix/client/v3/directory/room/#{encode_alias(full_alias)}")
+
+      assert conn.status == 200
+      body = decode(conn)
+      assert body["room_id"] == remote_room_id
+      assert body["servers"] == [@server_name]
     end
 
     test "list_room_aliases requires membership" do
