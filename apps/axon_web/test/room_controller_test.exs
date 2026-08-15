@@ -217,6 +217,35 @@ defmodule AxonWeb.RoomControllerTest do
     end
   end
 
+  describe "join content" do
+    # Per spec, the client's POST body becomes the m.room.member join
+    # event's content (alongside "membership"), e.g. a custom "foo": "bar"
+    # field — Complement's TestRoomMembers caught this being dropped
+    # entirely.
+    test "extra fields in the join body land on the stored m.room.member event, but can't forge membership" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      bob = register("bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{
+          "foo" => "bar",
+          "membership" => "leave"
+        })
+
+      assert conn.status == 200
+
+      state_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.member/#{bob.user_id}")
+
+      content = decode(state_conn)
+      assert content["foo"] == "bar"
+      assert content["membership"] == "join"
+    end
+  end
+
   describe "typing" do
     test "PUT typing always returns an empty ack (stub, not persisted)" do
       alice = register("alice_#{System.unique_integer([:positive])}")
