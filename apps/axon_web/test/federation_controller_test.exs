@@ -1247,13 +1247,14 @@ defmodule AxonWeb.FederationControllerTest do
       refute Map.has_key?(body["device_keys"], remote)
     end
 
-    test "claim_user_keys only claims for local users" do
+    test "claim_user_keys only claims for local users, and omits a user nothing was claimed for" do
       local_user = new_local_user("claimer")
       remote = remote_user("elsewhere")
 
       conn =
         signed_post("/_matrix/federation/v1/user/keys/claim", %{
           "one_time_keys" => %{
+            # No key uploaded for local_user's "DEV1" — nothing to claim.
             local_user => %{"DEV1" => "curve25519"},
             remote => %{"DEV1" => "curve25519"}
           }
@@ -1261,7 +1262,33 @@ defmodule AxonWeb.FederationControllerTest do
 
       assert conn.status == 200
       body = decode(conn)["one_time_keys"]
-      assert body[remote] == %{}
+      refute Map.has_key?(body, remote)
+      refute Map.has_key?(body, local_user)
+    end
+
+    test "claim_user_keys returns an uploaded key once, then omits the user once exhausted" do
+      local_user = new_local_user("claimer2")
+      key_json = %{"key" => "fake_curve25519_key_value"}
+
+      Repo.insert_all("one_time_keys", [
+        %{
+          user_id: local_user,
+          device_id: "DEV1",
+          algorithm: "curve25519",
+          key_id: "curve25519:AAAAAA",
+          key_json: key_json,
+          claimed: false,
+          inserted_at: DateTime.utc_now(:microsecond)
+        }
+      ])
+
+      request = %{"one_time_keys" => %{local_user => %{"DEV1" => "curve25519"}}}
+
+      conn1 = signed_post("/_matrix/federation/v1/user/keys/claim", request)
+      assert decode(conn1)["one_time_keys"][local_user]["DEV1"] == %{"curve25519:AAAAAA" => key_json}
+
+      conn2 = signed_post("/_matrix/federation/v1/user/keys/claim", request)
+      refute Map.has_key?(decode(conn2)["one_time_keys"], local_user)
     end
 
     test "get_user_devices 404s for a non-local user" do
