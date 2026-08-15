@@ -1049,17 +1049,43 @@ defmodule AxonWeb.FederationControllerTest do
       assert length(pdus) == 2
     end
 
-    test "get_missing_events returns events not in known_ids", %{room_id: room_id, owner: owner} do
+    test "get_missing_events walks prev_events from latest_events back to (not including) earliest_events, oldest first",
+         %{room_id: room_id, owner: owner} do
+      {:ok, earliest} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "e"})
       {:ok, e1} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "one"})
+      {:ok, e2} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "two"})
+      {:ok, latest} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "l"})
 
       conn =
         signed_post("/_matrix/federation/v1/get_missing_events/#{URI.encode(room_id)}", %{
-          "known_ids" => [e1],
+          "earliest_events" => [earliest],
+          "latest_events" => [latest],
           "limit" => 10
         })
 
       assert conn.status == 200
-      assert is_list(decode(conn)["events"])
+      event_ids = decode(conn)["events"] |> Enum.map(& &1["event_id"])
+
+      assert event_ids == [e1, e2, latest]
+    end
+
+    test "get_missing_events respects limit", %{room_id: room_id, owner: owner} do
+      {:ok, earliest} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "e"})
+
+      for i <- 1..5 do
+        RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "msg #{i}"})
+      end
+
+      {latest, _} = RoomProcess.get_position(room_id)
+
+      conn =
+        signed_post("/_matrix/federation/v1/get_missing_events/#{URI.encode(room_id)}", %{
+          "earliest_events" => [earliest],
+          "latest_events" => [latest],
+          "limit" => 2
+        })
+
+      assert length(decode(conn)["events"]) == 2
     end
   end
 
