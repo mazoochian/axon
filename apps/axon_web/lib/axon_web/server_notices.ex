@@ -79,19 +79,12 @@ defmodule AxonWeb.ServerNotices do
              # ever trying to gossip a system account's room to anyone else.
              creation_content: %{"m.federate" => false}
            ) do
-      # Auto-accept the invite on the recipient's behalf: an invited-only
-      # user can't see timeline content (just stripped invite_state), which
-      # would defeat the purpose of a notice they're not guaranteed to
-      # notice/act on. This is the one place in the codebase a membership
-      # event's sender is set to someone other than the actual caller —
-      # legitimate here because the room was just created specifically to
-      # deliver this message to exactly this user, not general-purpose
-      # force-join.
-      {:ok, _} =
-        RoomProcess.send_event(room_id, user_id, "m.room.member", %{"membership" => "join"},
-          state_key: user_id
-        )
-
+      # The recipient stays genuinely invited — not auto-joined. Per spec
+      # (and Synapse's behavior, which Complement's TestServerNotices
+      # pins), a server-notice invite can't be *rejected*
+      # (RoomController.leave/2 answers 403 M_CANNOT_LEAVE_SERVER_NOTICE_ROOM
+      # while still invited) but the recipient must actively join it
+      # themselves, same as any other invite.
       Repo.insert_all("server_notice_rooms", [
         %{user_id: user_id, room_id: room_id, inserted_at: DateTime.utc_now(:microsecond)}
       ])

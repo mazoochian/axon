@@ -50,7 +50,9 @@ defmodule AxonMedia.Store do
 
   @doc """
   Download local media. Returns `{:ok, %{content_type:, data:, filename:}}`
-  (filename is `nil` when the upload didn't supply one) or `{:error, :not_found}`.
+  (filename is `nil` when the upload didn't supply one), `{:error, :not_found}`,
+  or `{:error, :not_yet_uploaded}` for a media ID reserved via `create_pending/2`
+  (async upload, MSC2246) that hasn't had its content `PUT` yet.
   """
   def download(media_id) do
     case Repo.one(
@@ -74,7 +76,7 @@ defmodule AxonMedia.Store do
         {:error, :not_found}
 
       %{storage_path: nil} ->
-        {:error, :not_found}
+        {:error, :not_yet_uploaded}
 
       %{content_type: ct, storage_path: path, filename: filename} ->
         case File.read(path) do
@@ -82,6 +84,82 @@ defmodule AxonMedia.Store do
           {:error, _} -> {:error, :not_found}
         end
     end
+  end
+
+  @doc """
+  Reserves an MXC URI for a later async upload (`POST /media/v1/create`,
+  MSC2246) — a "media" row with no content yet, filled in by
+  `complete_upload/5` once the client `PUT`s the bytes. `download/1` on a
+  media_id in this state returns `{:error, :not_yet_uploaded}`.
+  """
+  def create_pending(user_id, server_name) do
+    media_id = :crypto.strong_rand_bytes(@id_bytes) |> Base.url_encode64(padding: false)
+
+    Repo.insert_all("media", [
+      %{
+        media_id: media_id,
+        origin_server: server_name,
+        uploader: user_id,
+        created_at: DateTime.utc_now(:microsecond)
+      }
+    ])
+
+    {:ok, media_id}
+  end
+
+  @doc """
+  Checks whether `media_id` is a pending reservation `user_id` may fill —
+  same outcomes as `complete_upload/5` minus actually writing anything.
+  Lets a caller reject a request (e.g. an already-uploaded conflict)
+  before spending the work of reading its body.
+  """
+  def complete_upload_precheck(media_id, user_id) do
+    case pending_upload_lookup(media_id) do
+      nil -> {:error, :not_found}
+      %{uploader: uploader} when uploader != user_id -> {:error, :forbidden}
+      %{storage_path: path} when not is_nil(path) -> {:error, :already_uploaded}
+      _ -> :ok
+    end
+  end
+
+  @doc """
+  Fills in a media ID previously reserved with `create_pending/2` (the
+  `PUT` half of async upload). Returns:
+  - `{:error, :not_found}` — no such media_id
+  - `{:error, :forbidden}` — reserved by a different user
+  - `{:error, :already_uploaded}` — already has content (spec:
+    `M_CANNOT_OVERWRITE_MEDIA`)
+  - `{:ok, media_id}` on success
+  """
+  def complete_upload(media_id, user_id, content_type, data, filename \\ nil) do
+    with :ok <- complete_upload_precheck(media_id, user_id) do
+      dir = base_dir()
+      File.mkdir_p!(dir)
+      path = Path.join(dir, media_id)
+
+      with :ok <- File.write(path, data) do
+        Repo.update_all(
+          from(m in "media", where: m.media_id == ^media_id),
+          set: [
+            content_type: content_type,
+            file_size: byte_size(data),
+            storage_path: path,
+            filename: filename
+          ]
+        )
+
+        {:ok, media_id}
+      end
+    end
+  end
+
+  defp pending_upload_lookup(media_id) do
+    Repo.one(
+      from(m in "media",
+        where: m.media_id == ^media_id,
+        select: %{uploader: m.uploader, storage_path: m.storage_path}
+      )
+    )
   end
 
   @doc "Look up content-type for a media_id without reading the file. Returns nil for quarantined media."
