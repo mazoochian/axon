@@ -328,8 +328,43 @@ defmodule AxonWeb.EventController do
         "start" => start_token,
         "end" => Integer.to_string(end_ordering),
         "chunk" => chunk,
-        "state" => []
+        "state" => lazy_loaded_member_state(room_id, chunk, params["filter"])
       })
+    end
+  end
+
+  # `lazy_load_members` (a RoomEventFilter field, not nested under a full
+  # Filter's `room.state` the way `/sync` takes it) asks that member events
+  # only be sent for senders actually present in this batch, instead of the
+  # room's full membership. `include_redundant_members` (default false) lets
+  # a client additionally ask for members it likely already has — axon
+  # doesn't track per-client "already seen" state across pagination, so it
+  # always returns the (deduplicated) current member event per sender, which
+  # satisfies both defaults: some redundancy across pages is spec-legal,
+  # never omitting a needed one is what actually matters.
+  defp lazy_loaded_member_state(room_id, chunk, filter_param) do
+    case decode_filter(filter_param) do
+      %{"lazy_load_members" => true} ->
+        chunk
+        |> Enum.map(& &1["sender"])
+        |> Enum.uniq()
+        |> Enum.map(&EventStore.get_state_event(room_id, "m.room.member", &1))
+        |> Enum.flat_map(fn
+          {:ok, event} -> [EventStore.event_to_map(event)]
+          {:error, :not_found} -> []
+        end)
+
+      _ ->
+        []
+    end
+  end
+
+  defp decode_filter(nil), do: %{}
+
+  defp decode_filter(filter_param) do
+    case Jason.decode(filter_param) do
+      {:ok, filter} when is_map(filter) -> filter
+      _ -> %{}
     end
   end
 

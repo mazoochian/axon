@@ -97,7 +97,7 @@ defmodule AxonWeb.RoomController do
       if is_local_room do
         # Local room join
         with {:ok, _} <- EventStore.get_room(room_id),
-             {:ok, content} <- build_join_content(room_id, user_id, params["third_party_signed"]),
+             {:ok, content} <- build_join_content(room_id, user_id, params),
              {:ok, _event_id} <-
                RoomProcess.send_event(room_id, user_id, "m.room.member", content,
                  state_key: user_id
@@ -668,7 +668,17 @@ defmodule AxonWeb.RoomController do
   # join_authorised_via_users_server when the room is restricted and the
   # user isn't already invited (MSC3083). Returns {:error, :restricted_join_denied}
   # if the room is restricted and the user isn't allow-listed either.
-  defp build_join_content(room_id, user_id, third_party_signed) do
+  #
+  # Per spec, the client's request body is used as the join event's content
+  # (e.g. a client-chosen "foo": "bar" survives onto the stored event) —
+  # `params` is the raw request params (path param plus JSON body merged by
+  # Phoenix), so server-controlled keys are dropped from it first and any
+  # server-computed fields are merged on *top* of what's left, so a client
+  # can't forge its own "membership" or "join_authorised_via_users_server".
+  defp build_join_content(room_id, user_id, params) do
+    client_content = Map.drop(params, ~w(room_id third_party_signed server_name))
+    third_party_signed = params["third_party_signed"]
+
     current_state = EventStore.get_current_state_map(room_id)
     join_rule_event = current_state[{"m.room.join_rules", ""}]
     join_rule = get_in(join_rule_event, ["content", "join_rule"]) || "invite"
@@ -681,17 +691,21 @@ defmodule AxonWeb.RoomController do
       result =
         cond do
           join_rule not in ["restricted", "knock_restricted"] ->
-            {:ok, %{"membership" => "join"}}
+            {:ok, Map.merge(client_content, %{"membership" => "join"})}
 
           sender_membership in ["invite", "join"] ->
-            {:ok, %{"membership" => "join"}}
+            {:ok, Map.merge(client_content, %{"membership" => "join"})}
 
           true ->
             join_rule_content = (join_rule_event && join_rule_event["content"]) || %{}
 
             case RestrictedJoin.authorise(join_rule_content, user_id, current_state) do
               {:ok, authoriser} ->
-                {:ok, %{"membership" => "join", "join_authorised_via_users_server" => authoriser}}
+                {:ok,
+                 Map.merge(client_content, %{
+                   "membership" => "join",
+                   "join_authorised_via_users_server" => authoriser
+                 })}
 
               {:error, _} = err ->
                 err

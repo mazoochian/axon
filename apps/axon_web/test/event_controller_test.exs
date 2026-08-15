@@ -250,4 +250,43 @@ defmodule AxonWeb.EventControllerTest do
       assert conn.status == 403
     end
   end
+
+  # `filter={"lazy_load_members":true}` on /messages — previously always
+  # returned "state": [] regardless. Now returns the current m.room.member
+  # event for each sender present in the returned chunk, deduplicated.
+  describe "get_messages/2 lazy_load_members" do
+    test "returns member events for senders present in the chunk" do
+      alice = register("llm_#{System.unique_integer([:positive])}")
+      bob = register("llm_bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})
+
+      send_message(alice.token, room_id)
+      send_message(bob.token, room_id)
+
+      filter = URI.encode_www_form(Jason.encode!(%{"lazy_load_members" => true}))
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/messages?filter=#{filter}")
+
+      assert conn.status == 200
+      body = decode(conn)
+
+      state_senders =
+        body["state"] |> Enum.map(& &1["state_key"]) |> Enum.sort()
+
+      assert state_senders == Enum.sort([alice.user_id, bob.user_id])
+      assert Enum.all?(body["state"], &(&1["type"] == "m.room.member"))
+    end
+
+    test "omits state entirely without the filter" do
+      alice = register("llm_off_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      send_message(alice.token, room_id)
+
+      conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/messages")
+      assert decode(conn)["state"] == []
+    end
+  end
 end
