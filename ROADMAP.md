@@ -354,3 +354,41 @@ That vindicates an earlier worker's negative result, which is worth recording as
 - **`AuthRules` rule 2 remains unimplemented** — an event's `auth_events` are never checked against what the selection algorithm would have chosen.
 - **The umbrella `mix test` cannot be run as one command reliably.** `FakeRemoteMatrixServer` binds fixed host ports, so cross-app runs collide and take down the `axon_web` application, producing a 528-of-529 failure cascade that looks catastrophic and is not. Per-app runs are green: 68 / 145 / 33 / 38 / 78 / 192 / 54 / 529.
 - The host's PostgreSQL service remains down (PG18 binaries against a v16 data directory); all work this phase ran against a disposable pg16 container. Unresolved by choice — that data directory is shared with unrelated projects.
+
+## Phase 20 — Redaction actually applied; csapi package 48/64 → 55/64
+
+Phase 19 built the spec's redaction algorithm but only ever used it for signing/hashing. This phase found and fixed the gap that left open, plus five smaller csapi-package bugs, all against a real Complement run (not inferred from spec reading alone). Full `mix test`: **1145 tests, 0 failures**.
+
+### `m.room.redaction` never touched the target event's stored content
+
+`PUT /redact` built and stored the redaction event correctly but never looked up the event it named, so `GET /event`, `/messages`, `/context`, `/sync` and full-text search all kept serving the original, unredacted `content` forever. Fixed at write time in `EventStore.insert_event/2` (the one choke point both local sends and inbound federation share): on an `m.room.redaction`, look up the target, call `AxonCrypto.Redaction.redact/2` (built last phase, wired in for the first time here), and `UPDATE` the target's stored `content` — which also fixes search for free, since it queries live `content` with no separate index.
+
+This closes over applying the redaction only when permitted — the redaction *event* is always accepted per spec, but *applying* it (stripping content) requires the redacter to be the target's original sender or hold the room's `redact` power level, which nothing checked before. An existing test had explicitly pinned the old, wrong "anyone can strip anyone's content" behavior as a documented gap; it now asserts the correct one.
+
+### Other real bugs found and fixed this phase
+
+- **`POST /join` silently dropped the client's request body.** Per spec it becomes the join event's content (a client-chosen `"foo": "bar"` should survive onto the stored `m.room.member` event) — caught by `TestRoomMembers`. Server-computed fields (`membership`, `join_authorised_via_users_server`) are merged on top so a client can't forge them.
+- **`GET /messages` ignored `lazy_load_members` entirely**, always returning `"state": []`. Now returns the current `m.room.member` event for each sender present in the returned chunk.
+- **`m.push_rules` never appeared in `/sync`.** It isn't a row in the generic `account_data` table, so nothing ever populated it; `AxonWeb.SyncHelpers` now computes it live from `AxonPush.UserRules` on every sync.
+- **`GET /members` ignored `not_membership`** entirely (only the allow-list `membership` param was ever read).
+- **Pushers survived a password change.** `logout_devices` (default `true`) logs out every device but the one making the request; a pusher belongs to a device, so one on a now-logged-out device should go with it. Now deleted; same-device pushers correctly survive.
+
+### Infrastructure notes
+
+- **The host's Postgres came back.** The v16-data-dir-vs-v18-binaries mismatch documented since Phase 16 was resolved by the machine owner at some point before this phase; `systemctl status postgresql` now shows a healthy PG 18.4 instance with `axon_dev`/`axon_test`/`axon_prod` intact. The disposable `axon-pg-dev` container is stale and unnecessary now — its port binding actively conflicts with the real service.
+- **A prior Complement run's containers were found orphaned mid-session**, still consuming host RAM with no owning process — apparently left behind when a backgrounded `go test` invocation was interrupted before it could run its own cleanup. Cleared with `docker rm -f`; worth checking `docker ps -a | grep complement` for stragglers before assuming a memory reading reflects idle state.
+- A single, solo `mix test` from the umbrella root works fine and gives the true 1145-test count — the "cannot be run as one command reliably" phrasing from Phase 19 describes *concurrent* runs colliding (`FakeRemoteMatrixServer`'s fixed ports), not a single run being broken. Scoping to one app via `cd apps/X && mix test` is its own trap: it starts only that app's OTP tree, not sibling apps' supervisors it depends on at runtime (`Axon.PubSub` is started by `axon_sync`, not `axon_core`), so an axon_core-only run crashes on any code path that broadcasts — looks like a regression, isn't.
+
+### Where it stands, honestly
+
+**csapi package: 55/64 (~86%), up from 48/64.** (89 was the whole-suite figure Phases 16-19 tracked, spanning `csapi` + top-level federation/room tests + `msc*`; this phase worked the `csapi` package specifically and didn't re-measure the full `./tests/...` figure.) Nine failures remain, each its own gap rather than one shared root cause:
+
+- **`TestGetRoomMembersAtPoint` / `TestLeftRoomFixture`** — both need genuine point-in-time state resolution (room state/membership *as of* a given stream position or a user's leave point), which nothing in axon currently computes; `RoomMembership` only tracks current state. The larger of the deferred items — a real feature, not a quick fix.
+- **`TestSearch`** — the redaction-related subtests now pass; two unrelated subtests (`Can_get_context_around_search_results`, `Can_back-paginate_search_results`) still fail — search result context/pagination, not investigated this phase.
+- **`TestAsyncUpload`** — `POST /_matrix/media/v1/create` doesn't exist at all (MSC2246 async uploads).
+- **`TestE2EKeyBackupReplaceRoomKeyRules`** — per-session key backup retrieval 404s where it shouldn't; not root-caused.
+- **`TestDeviceListUpdates`, `TestPresence`** — timeouts waiting for federation/sync propagation; not root-caused.
+- **`TestServerNotices`** — partly a genuinely-Synapse-specific admin API (`/_synapse/admin/v1/send_server_notice`) axon may never want to claim; not fully triaged apart from that.
+- **`TestRoomImageRoundtrip`** — `EOF` on `createRoom` mid-test; didn't reproduce consistently, plausible host-memory-pressure flake in the same family Phase 16/19 documented, not confirmed either way.
+
+Only the `csapi` package was run this phase — the top-level federation/room tests and `msc*` packages (the rest of the historical 89-test figure) weren't re-measured.
