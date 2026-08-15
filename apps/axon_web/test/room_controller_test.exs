@@ -182,6 +182,22 @@ defmodule AxonWeb.RoomControllerTest do
       refute bob.user_id in state_keys
     end
 
+    test "members can be filtered by not_membership" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      bob = register("bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+      join(bob.token, room_id)
+      authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/members?not_membership=leave")
+
+      state_keys = decode(conn)["chunk"] |> Enum.map(& &1["state_key"])
+      assert alice.user_id in state_keys
+      refute bob.user_id in state_keys
+    end
+
     test "joined_members requires the requester to be joined" do
       alice = register("alice_#{System.unique_integer([:positive])}")
       bob = register("bob_#{System.unique_integer([:positive])}")

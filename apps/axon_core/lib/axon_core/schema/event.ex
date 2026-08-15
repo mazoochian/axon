@@ -20,6 +20,8 @@ defmodule AxonCore.Schema.Event do
     field(:room_version, :string)
     field(:rejected, :boolean, default: false)
     field(:soft_failed, :boolean, default: false)
+    field(:redacted, :boolean, default: false)
+    field(:redacted_because, :string)
     field(:stream_ordering, :integer)
 
     belongs_to(:room, AxonCore.Schema.Room,

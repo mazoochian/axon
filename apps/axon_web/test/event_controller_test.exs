@@ -53,7 +53,11 @@ defmodule AxonWeb.EventControllerTest do
     decode(conn)["event_id"]
   end
 
-  test "a user can redact their own event" do
+  defp get_event(token, room_id, event_id) do
+    authed(token) |> get("/_matrix/client/v3/rooms/#{room_id}/event/#{URI.encode(event_id)}")
+  end
+
+  test "a user can redact their own event, and its content is stripped" do
     alice = register("alice_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token)
     event_id = send_message(alice.token, room_id)
@@ -68,9 +72,12 @@ defmodule AxonWeb.EventControllerTest do
 
     assert conn.status == 200
     assert is_binary(decode(conn)["event_id"])
+
+    after_conn = get_event(alice.token, room_id, event_id)
+    assert decode(after_conn)["content"] == %{}
   end
 
-  test "a moderator with redact power can redact another user's event" do
+  test "a moderator with redact power can redact another user's event, stripping its content" do
     alice = register("alice_#{System.unique_integer([:positive])}")
     bob = register("bob_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token)
@@ -84,22 +91,18 @@ defmodule AxonWeb.EventControllerTest do
       |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
 
     assert conn.status == 200
+
+    after_conn = get_event(alice.token, room_id, event_id)
+    assert decode(after_conn)["content"] == %{}
   end
 
-  # KNOWN GAP (documented, not fixed here — see plan's fix-small-flag-big
-  # policy): AxonRoom.AuthRules has no dedicated rule for m.room.redaction.
-  # It falls through to the generic non-state-event check, which only
-  # compares against events_default/events["m.room.redaction"] (unset, so
-  # events_default — normally 0) and never consults the room's "redact"
-  # power level at all. Per spec, redacting your OWN event should always be
-  # allowed, but redacting someone ELSE's event should require power >=
-  # "redact" (default 50) — currently ANY joined user can redact ANY other
-  # user's event. A correct fix needs AuthRules to know who sent the
-  # target event (via its "redacts" reference), which means either giving
-  # the currently-pure AuthRules module DB access or moving this check
-  # elsewhere — an architectural decision, not a one-line fix, so this is
-  # flagged as a finding rather than patched here.
-  test "a user without redact power CAN currently redact another's event (documents the gap above)" do
+  # Per spec (13.2 "Redactions"), the redaction event itself is *always*
+  # accepted regardless of the sender's power — whether it actually
+  # applies (strips the target's content) is a separate, server-local
+  # policy: only the target's original sender or someone with the room's
+  # "redact" power level (default 50). A user with neither still gets a
+  # 200 for the redaction event, but the target's content survives.
+  test "a user without redact power cannot strip another user's event content" do
     alice = register("alice_#{System.unique_integer([:positive])}")
     bob = register("bob_#{System.unique_integer([:positive])}")
     charlie = register("charlie_#{System.unique_integer([:positive])}")
@@ -115,6 +118,9 @@ defmodule AxonWeb.EventControllerTest do
       |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
 
     assert conn.status == 200
+
+    after_conn = get_event(alice.token, room_id, event_id)
+    assert decode(after_conn)["content"] == %{"body" => "hi"}
   end
 
   # Regression: get_messages/2, get_state/2, and get_state_event/2 had no
