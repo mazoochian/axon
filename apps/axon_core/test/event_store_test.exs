@@ -364,10 +364,11 @@ defmodule AxonCore.EventStoreTest do
           "10"
         )
 
-      {hits, count} = EventStore.search_messages([@room], "quick fox", "rank", 10)
+      {hits, count, next_offset} = EventStore.search_messages([@room], "quick fox", "rank", 10)
       assert count == 1
       assert [{event_id, _rank}] = hits
       assert is_binary(event_id)
+      assert is_nil(next_offset)
     end
 
     test "returns no hits for a non-matching term" do
@@ -377,11 +378,34 @@ defmodule AxonCore.EventStoreTest do
           "10"
         )
 
-      assert EventStore.search_messages([@room], "zzz_no_match_zzz", "rank", 10) == {[], 0}
+      assert EventStore.search_messages([@room], "zzz_no_match_zzz", "rank", 10) == {[], 0, nil}
     end
 
     test "an empty room list short-circuits to no hits" do
-      assert EventStore.search_messages([], "anything", "rank", 10) == {[], 0}
+      assert EventStore.search_messages([], "anything", "rank", 10) == {[], 0, nil}
+    end
+
+    test "a full page reports a next_offset to resume from, a partial page doesn't" do
+      for i <- 1..3 do
+        {:ok, _} =
+          EventStore.insert_event(
+            event(%{"content" => %{"msgtype" => "m.text", "body" => "pagetest message #{i}"}}),
+            "10"
+          )
+      end
+
+      {hits, count, next_offset} =
+        EventStore.search_messages([@room], "pagetest", "recent", 2)
+
+      assert count == 3
+      assert length(hits) == 2
+      assert next_offset == 2
+
+      {hits2, _count, next_offset2} =
+        EventStore.search_messages([@room], "pagetest", "recent", 2, next_offset)
+
+      assert length(hits2) == 1
+      assert is_nil(next_offset2)
     end
   end
 

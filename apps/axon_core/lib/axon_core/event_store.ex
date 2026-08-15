@@ -556,9 +556,27 @@ defmodule AxonCore.EventStore do
   (for `POST /search`). Returns `{[{event_id, rank}], total_count}`,
   ordered by `order_by` ("rank" or "recent").
   """
-  def search_messages([], _search_term, _order_by, _limit), do: {[], 0}
+  def search_messages(room_ids, search_term, order_by, limit, offset \\ 0)
 
-  def search_messages(room_ids, search_term, order_by, limit) do
+  def search_messages([], _search_term, _order_by, _limit, _offset), do: {[], 0, nil}
+
+  @doc """
+  Full-text search. `offset` (from a prior call's returned next-page
+  cursor, round-tripped through `/search`'s `next_batch`) skips the rows
+  already returned by earlier pages — plain `OFFSET`, not a keyset cursor,
+  since "rank" ordering has no single column to key off (ties are
+  expected, and meaningful only relative to the query) the way
+  `stream_ordering` would for "recent". Search result pages aren't
+  expected to stay stable under concurrent writes to the same degree
+  `/messages` pagination is, so the simpler, universally-correct-for-both-
+  orderings approach wins here.
+
+  Returns `{[{event_id, rank}], total_count, next_offset | nil}` —
+  `next_offset` is set only when this page came back full (there may be
+  more), never on the trailing empty page a client fetches to confirm
+  the end.
+  """
+  def search_messages(room_ids, search_term, order_by, limit, offset) do
     order_sql = if order_by == "recent", do: "stream_ordering DESC", else: "rank DESC"
 
     %{rows: rows} =
@@ -570,9 +588,9 @@ defmodule AxonCore.EventStore do
         WHERE room_id = ANY($1) AND type = 'm.room.message' AND NOT rejected
           AND to_tsvector('english', content->>'body') @@ plainto_tsquery('english', $2)
         ORDER BY #{order_sql}
-        LIMIT $3
+        LIMIT $3 OFFSET $4
         """,
-        [room_ids, search_term, limit]
+        [room_ids, search_term, limit, offset]
       )
 
     %{rows: [[count]]} =
@@ -587,7 +605,9 @@ defmodule AxonCore.EventStore do
         [room_ids, search_term]
       )
 
-    {Enum.map(rows, fn [event_id, rank] -> {event_id, rank} end), count}
+    next_offset = if length(rows) == limit, do: offset + limit
+
+    {Enum.map(rows, fn [event_id, rank] -> {event_id, rank} end), count, next_offset}
   end
 
   @doc "Returns the current max stream_ordering across all events."
