@@ -81,12 +81,62 @@ defmodule AxonCore.EventStore do
     |> Ecto.Multi.run(:auth_edges, fn repo, %{unreject: event} ->
       insert_auth_edges(repo, event)
     end)
+    |> Ecto.Multi.run(:redaction, fn repo, %{unreject: event} ->
+      maybe_apply_redaction(repo, event_map, event)
+    end)
     |> Repo.transaction()
     |> case do
       {:ok, %{unreject: event}} -> {:ok, event}
       {:error, :event_raw, changeset, _} -> {:error, changeset}
       {:error, step, reason, _} -> {:error, {step, reason}}
     end
+  end
+
+  # An `m.room.redaction` event is always accepted and stored like any other
+  # event (per spec, redaction is never an auth-rule concern) — but whether
+  # the target event's *content* actually gets stripped is a separate,
+  # server-local policy decision: only if the redacter is the target's
+  # original sender or holds the room's `redact` power level. `redacts` is a
+  # top-level wire field through room version 10 and moves into
+  # `content.redacts` from v11 (MSC2174), so both are checked against the
+  # original wire map — neither is a column on the stored row.
+  defp maybe_apply_redaction(repo, event_map, %Event{type: "m.room.redaction"} = redaction_event) do
+    target_id = event_map["redacts"] || get_in(event_map, ["content", "redacts"])
+
+    with true <- is_binary(target_id),
+         %Event{} = target <- repo.get_by(Event, event_id: target_id),
+         true <- redaction_permitted?(redaction_event.sender, target) do
+      redacted_content =
+        target
+        |> event_to_map()
+        |> AxonCrypto.Redaction.redact(target.room_version)
+        |> Map.fetch!("content")
+
+      repo.update_all(
+        from(e in Event, where: e.event_id == ^target_id),
+        set: [content: redacted_content, redacted: true, redacted_because: redaction_event.event_id]
+      )
+    end
+
+    {:ok, :ok}
+  end
+
+  defp maybe_apply_redaction(_repo, _event_map, _event), do: {:ok, :ok}
+
+  defp redaction_permitted?(sender, target) do
+    sender == target.sender or has_redact_power?(target.room_id, sender)
+  end
+
+  defp has_redact_power?(room_id, user_id) do
+    pl =
+      case get_current_state_map(room_id)[{"m.room.power_levels", ""}] do
+        nil -> %{}
+        event -> event["content"] || %{}
+      end
+
+    required = Map.get(pl, "redact", 50)
+    users = Map.get(pl, "users", %{})
+    Map.get(users, user_id, Map.get(pl, "users_default", 0)) >= required
   end
 
   @doc """

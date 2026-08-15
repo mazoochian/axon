@@ -603,10 +603,17 @@ defmodule AxonWeb.RoomController do
 
   # GET /_matrix/client/v3/rooms/:room_id/members
   def members(conn, %{"room_id" => room_id} = params) do
-    memberships = params["membership"]
+    filter_memberships =
+      case params["membership"] do
+        nil -> ["join", "invite", "ban", "leave", "knock"]
+        m -> [m]
+      end
 
     filter_memberships =
-      if memberships, do: [memberships], else: ["join", "invite", "ban", "leave"]
+      case params["not_membership"] do
+        nil -> filter_memberships
+        m -> List.delete(filter_memberships, m)
+      end
 
     members = EventStore.get_room_members(room_id, filter_memberships)
 

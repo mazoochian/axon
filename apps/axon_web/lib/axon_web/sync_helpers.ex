@@ -148,14 +148,24 @@ defmodule AxonWeb.SyncHelpers do
 
   # Initial sync: return all account_data for the user.
   # Incremental sync: return only types that changed since ad_since (account_data_stream cursor).
+  #
+  # `m.push_rules` is not stored in the `account_data` table — it is always
+  # computed live from `AxonPush.UserRules` (server defaults merged with any
+  # customization) and included on every sync, initial or incremental. This
+  # is simpler than tracking a change cursor for it, and correct either way:
+  # a client that missed a push-rule change still sees the current effective
+  # ruleset on its very next sync.
   def get_global_account_data(user_id, _is_initial = true, _ad_since) do
-    Repo.all(
-      from(a in "account_data",
-        where: a.user_id == ^user_id,
-        select: %{type: a.type, content: a.content}
+    stored =
+      Repo.all(
+        from(a in "account_data",
+          where: a.user_id == ^user_id,
+          select: %{type: a.type, content: a.content}
+        )
       )
-    )
-    |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
+      |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
+
+    [push_rules_event(user_id) | stored]
   end
 
   def get_global_account_data(user_id, _is_initial = false, ad_since) do
@@ -168,17 +178,24 @@ defmodule AxonWeb.SyncHelpers do
         )
       )
 
-    if changed_types == [] do
-      []
-    else
-      Repo.all(
-        from(a in "account_data",
-          where: a.user_id == ^user_id and a.type in ^changed_types,
-          select: %{type: a.type, content: a.content}
+    stored =
+      if changed_types == [] do
+        []
+      else
+        Repo.all(
+          from(a in "account_data",
+            where: a.user_id == ^user_id and a.type in ^changed_types,
+            select: %{type: a.type, content: a.content}
+          )
         )
-      )
-      |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
-    end
+        |> Enum.map(fn a -> %{"type" => a.type, "content" => a.content} end)
+      end
+
+    [push_rules_event(user_id) | stored]
+  end
+
+  defp push_rules_event(user_id) do
+    %{"type" => "m.push_rules", "content" => %{"global" => UserRules.effective_rules(user_id)}}
   end
 
   def build_room_account_data(room_id, user_id) do
