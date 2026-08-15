@@ -32,8 +32,16 @@ defmodule AxonWeb.MediaController do
     # filename"). Previously read into a local and immediately discarded.
     filename = non_empty(params["filename"])
 
+    # `read_body/2` returns an updated `conn` that must be threaded through
+    # to whatever sends the response — Bandit tracks body-read state on it,
+    # and responding with the stale pre-read `conn` left the connection
+    # thinking this request's body was never drained. Invisible in
+    # Phoenix.ConnTest (no real transport), but over real HTTP the next
+    # request pipelined on the same keep-alive connection would then stall
+    # for `read_body`'s default 15s read_timeout before Bandit gave up
+    # waiting for bytes that were never coming.
     case Plug.Conn.read_body(conn, length: 100_000_000) do
-      {:ok, body, _conn} when byte_size(body) > 0 ->
+      {:ok, body, conn} when byte_size(body) > 0 ->
         case Store.upload(user_id, content_type, body, server_name, filename) do
           {:ok, media_id} ->
             mxc_uri = "mxc://#{server_name}/#{media_id}"
@@ -47,7 +55,7 @@ defmodule AxonWeb.MediaController do
             |> json(%{"errcode" => "M_UNKNOWN", "error" => "Upload failed"})
         end
 
-      {:ok, <<>>, _conn} ->
+      {:ok, <<>>, conn} ->
         conn
         |> put_status(400)
         |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "Empty body"})
@@ -107,7 +115,7 @@ defmodule AxonWeb.MediaController do
       case Store.complete_upload_precheck(media_id, user_id) do
         :ok ->
           case Plug.Conn.read_body(conn, length: 100_000_000) do
-            {:ok, body, _conn} ->
+            {:ok, body, conn} ->
               case Store.complete_upload(media_id, user_id, content_type, body, filename) do
                 {:ok, _media_id} ->
                   json(conn, %{})
