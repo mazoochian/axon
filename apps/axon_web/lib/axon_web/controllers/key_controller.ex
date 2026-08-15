@@ -644,26 +644,15 @@ defmodule AxonWeb.KeyController do
     )
   end
 
+  # The three PUT routes (bulk `/keys`, per-room `/keys/:room_id`,
+  # per-session `/keys/:room_id/:session_id`) share this one action —
+  # `params` carries whichever path params matched, which is exactly what
+  # tells the three body shapes apart (bulk's `{"rooms": {...}}`, per-room's
+  # `{"sessions": {...}}`, per-session's a bare `KeyBackupData` object).
   defp do_put_backup_keys(conn, user_id, version, params) do
-    rooms = get_in(params, ["rooms"]) || %{}
-
     entries =
-      Enum.flat_map(rooms, fn {room_id, room_data} ->
-        sessions = room_data["sessions"] || %{}
-
-        Enum.map(sessions, fn {session_id, session_data} ->
-          %{
-            user_id: user_id,
-            version: version,
-            room_id: room_id,
-            session_id: session_id,
-            first_message_index: session_data["first_message_index"],
-            forwarded_count: session_data["forwarded_count"] || 0,
-            is_verified: session_data["is_verified"] || false,
-            session_data: session_data["session_data"] || %{}
-          }
-        end)
-      end)
+      normalize_backup_entries(user_id, version, params)
+      |> Enum.filter(&replaces_existing?/1)
 
     if entries != [] do
       Repo.insert_all("room_key_backups", entries,
@@ -692,6 +681,75 @@ defmodule AxonWeb.KeyController do
       "etag" => Integer.to_string(System.os_time(:millisecond)),
       "count" => length(entries)
     })
+  end
+
+  defp normalize_backup_entries(user_id, version, %{"session_id" => session_id, "room_id" => room_id} = params) do
+    [build_backup_entry(user_id, version, room_id, session_id, params)]
+  end
+
+  defp normalize_backup_entries(user_id, version, %{"room_id" => room_id} = params) do
+    sessions = params["sessions"] || %{}
+
+    Enum.map(sessions, fn {session_id, session_data} ->
+      build_backup_entry(user_id, version, room_id, session_id, session_data)
+    end)
+  end
+
+  defp normalize_backup_entries(user_id, version, params) do
+    rooms = params["rooms"] || %{}
+
+    Enum.flat_map(rooms, fn {room_id, room_data} ->
+      sessions = room_data["sessions"] || %{}
+
+      Enum.map(sessions, fn {session_id, session_data} ->
+        build_backup_entry(user_id, version, room_id, session_id, session_data)
+      end)
+    end)
+  end
+
+  defp build_backup_entry(user_id, version, room_id, session_id, session_data) do
+    %{
+      user_id: user_id,
+      version: version,
+      room_id: room_id,
+      session_id: session_id,
+      first_message_index: session_data["first_message_index"],
+      forwarded_count: session_data["forwarded_count"] || 0,
+      is_verified: session_data["is_verified"] || false,
+      session_data: session_data["session_data"] || %{}
+    }
+  end
+
+  # Per spec (11.12.3.3): a key only overwrites what's already backed up if
+  # it is "better" — preferring is_verified=true, then a lower
+  # first_message_index, then a lower forwarded_count, in that priority
+  # order. No existing row (first upload of this session) always writes.
+  defp replaces_existing?(entry) do
+    existing =
+      Repo.one(
+        from(b in "room_key_backups",
+          where:
+            b.user_id == ^entry.user_id and b.version == ^entry.version and
+              b.room_id == ^entry.room_id and b.session_id == ^entry.session_id,
+          select: %{
+            is_verified: b.is_verified,
+            first_message_index: b.first_message_index,
+            forwarded_count: b.forwarded_count
+          }
+        )
+      )
+
+    case existing do
+      nil ->
+        true
+
+      old ->
+        cond do
+          entry.is_verified != old.is_verified -> entry.is_verified and not old.is_verified
+          entry.first_message_index != old.first_message_index -> entry.first_message_index < old.first_message_index
+          true -> entry.forwarded_count < old.forwarded_count
+        end
+    end
   end
 
   def get_backup_keys(conn, params) do
