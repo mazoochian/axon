@@ -303,10 +303,13 @@ defmodule AxonWeb.EventController do
       from_token = params["from"]
       dir = params["dir"] || "b"
       limit = String.to_integer(params["limit"] || "10")
+      filter = decode_filter(params["filter"])
 
       from_ordering = parse_token(from_token) || EventStore.room_max_stream_ordering(room_id) + 1
 
-      events = EventStore.get_messages(room_id, from_ordering, dir, limit)
+      events =
+        EventStore.get_messages(room_id, from_ordering, dir, limit)
+        |> filter_contains_url(filter)
 
       start_token = if from_token, do: from_token, else: Integer.to_string(from_ordering)
 
@@ -328,10 +331,24 @@ defmodule AxonWeb.EventController do
         "start" => start_token,
         "end" => Integer.to_string(end_ordering),
         "chunk" => chunk,
-        "state" => lazy_loaded_member_state(room_id, chunk, params["filter"])
+        "state" => lazy_loaded_member_state(room_id, chunk, filter)
       })
     end
   end
+
+  # `contains_url` (a RoomEventFilter field): only events whose content has
+  # a "url" key when true, only events without one when false. Filtered
+  # after the page is fetched rather than in the query — the query already
+  # has to serve two independent orderings/cursors; not folding a third,
+  # rarely-used predicate into it keeps that simpler at the cost of a page
+  # that can come back smaller than `limit` when this filter is active,
+  # same known trade-off as everywhere else in this codebase that filters
+  # a fetched page rather than the query behind it.
+  defp filter_contains_url(events, %{"contains_url" => wants_url}) when is_boolean(wants_url) do
+    Enum.filter(events, fn e -> Map.has_key?(e.content || %{}, "url") == wants_url end)
+  end
+
+  defp filter_contains_url(events, _filter), do: events
 
   # `lazy_load_members` (a RoomEventFilter field, not nested under a full
   # Filter's `room.state` the way `/sync` takes it) asks that member events
@@ -342,8 +359,8 @@ defmodule AxonWeb.EventController do
   # always returns the (deduplicated) current member event per sender, which
   # satisfies both defaults: some redundancy across pages is spec-legal,
   # never omitting a needed one is what actually matters.
-  defp lazy_loaded_member_state(room_id, chunk, filter_param) do
-    case decode_filter(filter_param) do
+  defp lazy_loaded_member_state(room_id, chunk, filter) do
+    case filter do
       %{"lazy_load_members" => true} ->
         chunk
         |> Enum.map(& &1["sender"])
