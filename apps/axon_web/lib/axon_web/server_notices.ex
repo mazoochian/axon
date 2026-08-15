@@ -16,7 +16,10 @@ defmodule AxonWeb.ServerNotices do
   alias AxonCore.{Repo, UserStore}
   alias AxonRoom.{CreateRoom, RoomProcess}
 
-  @system_localpart "server-notices"
+  # Matches Complement's hardcoded expectation (TestServerNotices'
+  # syncUntilInvite checks for sender == "@_server:hs1" specifically) —
+  # also Synapse's own convention for `server_notices_mxid`.
+  @system_localpart "_server"
 
   def system_user_id do
     server_name = Application.fetch_env!(:axon_web, :server_name)

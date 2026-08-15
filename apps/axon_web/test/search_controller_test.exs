@@ -129,6 +129,29 @@ defmodule AxonWeb.SearchControllerTest do
     assert body["results"] == []
   end
 
+  # Per spec, events_before is reverse-chronological (closest match first)
+  # and events_after is chronological (closest match first too, just
+  # forward) — a stray Enum.reverse/1 had events_before backwards.
+  test "context events_before is reverse-chronological, events_after is chronological" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token)
+    unique = "ordertest#{System.unique_integer([:positive])}"
+    send_message(alice.token, room_id, "one")
+    send_message(alice.token, room_id, "two")
+    send_message(alice.token, room_id, unique)
+    send_message(alice.token, room_id, "three")
+    send_message(alice.token, room_id, "four")
+
+    conn = search(alice.token, unique, %{"event_context" => %{"before_limit" => 2, "after_limit" => 2}})
+    [result] = decode(conn)["search_categories"]["room_events"]["results"]
+
+    before_bodies = Enum.map(result["context"]["events_before"], & &1["content"]["body"])
+    after_bodies = Enum.map(result["context"]["events_after"], & &1["content"]["body"])
+
+    assert before_bodies == ["two", "one"]
+    assert after_bodies == ["three", "four"]
+  end
+
   test "results include timeline context" do
     alice = register("alice_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token)

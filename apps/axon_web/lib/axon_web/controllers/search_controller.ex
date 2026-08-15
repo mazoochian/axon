@@ -93,9 +93,12 @@ defmodule AxonWeb.SearchController do
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp build_context(event, before_limit, after_limit) do
+    # Per spec, events_before is reverse-chronological (closest-to-the-result
+    # first) — get_messages(..., "b", ...) already returns that order
+    # natively, so no re-sort is needed (or wanted: reversing it here was
+    # backwards from what the spec, and Complement's TestSearch, expect).
     events_before =
       EventStore.get_messages(event.room_id, event.stream_ordering, "b", before_limit)
-      |> Enum.reverse()
       |> Enum.map(&EventStore.event_to_map/1)
 
     events_after =
