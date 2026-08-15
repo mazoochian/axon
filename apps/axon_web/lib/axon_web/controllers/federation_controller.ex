@@ -986,21 +986,34 @@ defmodule AxonWeb.FederationController do
     local_server = KeyServer.server_name()
 
     result =
-      Enum.into(one_time_keys_request, %{}, fn {user_id, device_map} ->
+      one_time_keys_request
+      |> Enum.map(fn {user_id, device_map} ->
         device_result =
           if local_user?(user_id, local_server) do
-            Enum.into(device_map, %{}, fn {device_id, algorithm} ->
-              key = KeyStore.claim_one_time_key(user_id, device_id, algorithm)
-              {device_id, key || %{}}
-            end)
+            claim_devices(user_id, device_map)
           else
             %{}
           end
 
         {user_id, device_result}
       end)
+      # A user with nothing actually claimed must be absent from the
+      # response entirely, not present with an empty device map —
+      # Complement's TestFederationKeyUploadQuery checks the *key* for an
+      # exhausted user is missing, not merely empty.
+      |> Enum.reject(fn {_user_id, device_result} -> device_result == %{} end)
+      |> Map.new()
 
     json(conn, %{"one_time_keys" => result})
+  end
+
+  defp claim_devices(user_id, device_map) do
+    device_map
+    |> Enum.map(fn {device_id, algorithm} ->
+      {device_id, KeyStore.claim_one_time_key(user_id, device_id, algorithm)}
+    end)
+    |> Enum.reject(fn {_device_id, key} -> is_nil(key) end)
+    |> Map.new()
   end
 
   # ---------------------------------------------------------------------------

@@ -168,17 +168,24 @@ defmodule AxonWeb.KeyController do
     {local_req, remote_req} = split_local_remote(one_time_keys_request, local_server)
 
     local_result =
-      Enum.into(local_req, %{}, fn user_id ->
+      local_req
+      |> Enum.map(fn user_id ->
         device_map = one_time_keys_request[user_id]
 
         device_result =
-          Enum.into(device_map, %{}, fn {target_device_id, algorithm} ->
-            key = KeyStore.claim_one_time_key(user_id, target_device_id, algorithm)
-            {target_device_id, key || %{}}
+          device_map
+          |> Enum.map(fn {target_device_id, algorithm} ->
+            {target_device_id, KeyStore.claim_one_time_key(user_id, target_device_id, algorithm)}
           end)
+          |> Enum.reject(fn {_device_id, key} -> is_nil(key) end)
+          |> Map.new()
 
         {user_id, device_result}
       end)
+      # A user with nothing actually claimed must be absent from the
+      # response, not present with an empty device map.
+      |> Enum.reject(fn {_user_id, device_result} -> device_result == %{} end)
+      |> Map.new()
 
     {remote_result, failures} = claim_remote_keys(remote_req)
 
