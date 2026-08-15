@@ -16,8 +16,10 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
 - Third-party (3pid) invites have no actual email/SMS delivery — no identity-server integration exists, so the token has to reach the invitee out-of-band.
 - Sliding sync re-sends a full `SYNC` op per range on every request rather than diffing against a remembered session — spec-valid, just not bandwidth-optimal.
+- No point-in-time state resolution: `GET /rooms/{roomId}/members?at=<token>` and history visibility for a user who's left a room both need room state *as of* a specific moment, which nothing currently computes (only current state is tracked).
+- `soft_failed` is never set on an event — axon has rejection (an event that fails auth outright), but not the second, softer check against current state that a genuine soft-failure requires.
 
-See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 15 — the roadmap as originally scoped is complete, plus a production-readiness pass).
+See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 21 and counting — the roadmap as originally scoped is complete; ongoing phases are a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
 
 ## Why BEAM?
 
@@ -324,7 +326,13 @@ COMPLEMENT_BASE_IMAGE=axon-complement:latest \
 
 ### Current results
 
-The last full Complement run (37/50 CS API tests) predates Phases 3–7 and is stale — most of its 13 failures (media, presence, search) are in areas that have since been built out. Re-run the suite above for current numbers.
+As of Phase 21 (see [ROADMAP.md](ROADMAP.md) for the full trail):
+
+- **`tests/csapi` (core Client-Server API): 61/64 (~95%)**. The 3 remaining failures: one is a scenario even Synapse doesn't reliably pass (a documented upstream Synapse issue Complement skips it for); the other two need genuine point-in-time state resolution (room state/membership *as of* a given moment) — a real feature gap, not a bug.
+- **`tests/` (top-level federation/room package): 48/88 (~55%)**. The dominant blocker is a `send_join` signature-verification mismatch — confirmed, across three independent from-scratch cryptographic verifications, to **not** be an axon bug (most likely a bug in a dev-snapshot dependency Complement's own harness pins). It alone gates the entire knocking feature family and most of the restricted-rooms cluster (~13 tests). A second known gap (`soft_failed` never being set) plausibly explains a chunk of the remaining auth-chain/rejection-handling failures.
+- `tests/msc*` (unstable MSCs) not run — expected failures, axon has never claimed to implement unstable MSCs.
+
+Re-run the suite above for current numbers; these will drift as both axon and Complement itself change.
 
 ### Real-client end-to-end tests
 
