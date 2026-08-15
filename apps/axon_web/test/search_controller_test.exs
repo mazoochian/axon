@@ -56,12 +56,17 @@ defmodule AxonWeb.SearchControllerTest do
     decode(conn)["event_id"]
   end
 
-  defp search(token, term, extra \\ %{}) do
+  defp search(token, term, extra \\ %{}, next_batch \\ nil) do
     body = %{
       "search_categories" => %{"room_events" => Map.merge(%{"search_term" => term}, extra)}
     }
 
-    authed(token) |> jp("/_matrix/client/v3/search", body)
+    path =
+      if next_batch,
+        do: "/_matrix/client/v3/search?next_batch=#{URI.encode_www_form(next_batch)}",
+        else: "/_matrix/client/v3/search"
+
+    authed(token) |> jp(path, body)
   end
 
   test "finds a message in a joined room" do
@@ -136,5 +141,54 @@ defmodule AxonWeb.SearchControllerTest do
     [result] = decode(conn)["search_categories"]["room_events"]["results"]
     assert is_list(result["context"]["events_before"])
     assert is_list(result["context"]["events_after"])
+  end
+
+  # Complement's TestSearch: result page size is `filter.limit`, not
+  # `event_context.limit` (event_context only has before_limit/after_limit
+  # — there's no such thing as event_context.limit). Reading from the
+  # wrong place meant an explicit filter.limit was always silently
+  # ignored in favor of the 10-result default.
+  test "filter.limit controls the page size, not any event_context field" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token)
+    unique = "pagelimit#{System.unique_integer([:positive])}"
+    for i <- 1..5, do: send_message(alice.token, room_id, "#{unique} number #{i}")
+
+    conn = search(alice.token, unique, %{"filter" => %{"limit" => 2}})
+    body = decode(conn)["search_categories"]["room_events"]
+    assert length(body["results"]) == 2
+    assert body["count"] == 5
+    assert is_binary(body["next_batch"])
+  end
+
+  test "next_batch pages through results and is absent once exhausted" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token)
+    unique = "pagethrough#{System.unique_integer([:positive])}"
+    for i <- 1..5, do: send_message(alice.token, room_id, "#{unique} number #{i}")
+
+    extra = %{"order_by" => "recent", "filter" => %{"limit" => 2}}
+
+    page1 = decode(search(alice.token, unique, extra))["search_categories"]["room_events"]
+    assert length(page1["results"]) == 2
+    assert is_binary(page1["next_batch"])
+
+    page2 =
+      decode(search(alice.token, unique, extra, page1["next_batch"]))
+      |> get_in(["search_categories", "room_events"])
+
+    assert length(page2["results"]) == 2
+    assert is_binary(page2["next_batch"])
+
+    page1_ids = Enum.map(page1["results"], & &1["result"]["event_id"])
+    page2_ids = Enum.map(page2["results"], & &1["result"]["event_id"])
+    assert Enum.empty?(MapSet.intersection(MapSet.new(page1_ids), MapSet.new(page2_ids)))
+
+    page3 =
+      decode(search(alice.token, unique, extra, page2["next_batch"]))
+      |> get_in(["search_categories", "room_events"])
+
+    assert length(page3["results"]) == 1
+    refute Map.has_key?(page3, "next_batch")
   end
 end

@@ -30,7 +30,8 @@ defmodule AxonWeb.SearchController do
       })
     else
       order_by = if room_events["order_by"] == "recent", do: "recent", else: "rank"
-      limit = get_in(room_events, ["event_context", "limit"]) || @default_limit
+      limit = get_in(room_events, ["filter", "limit"]) || @default_limit
+      offset = parse_offset(params["next_batch"])
 
       before_limit =
         get_in(room_events, ["event_context", "before_limit"]) || @default_context_limit
@@ -47,7 +48,9 @@ defmodule AxonWeb.SearchController do
           do: Enum.filter(joined_rooms, &(&1 in requested_rooms)),
           else: joined_rooms
 
-      {ranked_ids, count} = EventStore.search_messages(search_rooms, search_term, order_by, limit)
+      {ranked_ids, count, next_offset} =
+        EventStore.search_messages(search_rooms, search_term, order_by, limit, offset)
+
       rank_by_id = Map.new(ranked_ids)
 
       results =
@@ -65,17 +68,29 @@ defmodule AxonWeb.SearchController do
           }
         end)
 
-      json(conn, %{
-        "search_categories" => %{
-          "room_events" => %{
-            "count" => count,
-            "results" => results,
-            "highlights" => search_term |> String.split() |> Enum.uniq()
-          }
+      room_events_response =
+        %{
+          "count" => count,
+          "results" => results,
+          "highlights" => search_term |> String.split() |> Enum.uniq()
         }
-      })
+        |> maybe_put("next_batch", next_offset && Integer.to_string(next_offset))
+
+      json(conn, %{"search_categories" => %{"room_events" => room_events_response}})
     end
   end
+
+  defp parse_offset(nil), do: 0
+
+  defp parse_offset(next_batch) do
+    case Integer.parse(next_batch) do
+      {n, _} when n >= 0 -> n
+      _ -> 0
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp build_context(event, before_limit, after_limit) do
     events_before =
