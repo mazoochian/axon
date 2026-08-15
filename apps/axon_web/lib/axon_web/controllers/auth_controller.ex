@@ -155,7 +155,19 @@ defmodule AxonWeb.AuthController do
             set: [password_hash: new_hash]
           )
 
-          if logout_devices, do: UserStore.logout_all(user_id, conn.assigns.current_token)
+          if logout_devices do
+            UserStore.logout_all(user_id, conn.assigns.current_token)
+
+            # Pushers on the device making this request survive (that device
+            # isn't being logged out); pushers registered under any other
+            # device — now logged out — are deleted along with it.
+            Repo.delete_all(
+              from(p in "pushers",
+                where: p.user_id == ^user_id and p.device_id != ^conn.assigns.current_device_id
+              )
+            )
+          end
+
           json(conn, %{})
         else
           conn
