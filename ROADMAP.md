@@ -392,3 +392,26 @@ This closes over applying the redaction only when permitted — the redaction *e
 - **`TestRoomImageRoundtrip`** — `EOF` on `createRoom` mid-test; didn't reproduce consistently, plausible host-memory-pressure flake in the same family Phase 16/19 documented, not confirmed either way.
 
 Only the `csapi` package was run this phase — the top-level federation/room tests and `msc*` packages (the rest of the historical 89-test figure) weren't re-measured.
+
+### Phase 20 continued — csapi package: 55/64 → 61/64
+
+Kept going on the same phase after the redaction/media/search fixes above landed: worked through every remaining csapi failure with real Complement verification after each fix, not just local `mix test`.
+
+- **`?set_presence=` on `/sync`** was read nowhere — `AxonSync.Presence.set_presence/3` was only ever called from `PUT /presence/{userId}/status`.
+- **Server-notices bot user ID mismatch**: Complement hardcodes the recipient's expected inviter as `@_server:hs1` (Synapse's own `server_notices_mxid` convention); axon used `@server-notices:...`, so the invite-sender check could never match.
+- **Server-notices room reuse never re-invited a recipient who'd left.** `ensure_room/1` returned the stored room_id unconditionally; a second notice after the recipient left landed in a room they weren't in anymore, with no invite to bring them back. Now checks current membership and re-invites when it isn't join/invite.
+- **Key backup**: the single-session `PUT /room_keys/keys/{roomId}/{sessionId}` form (a bare body, no `rooms`/`sessions` wrapper) was silently a no-op — `do_put_backup_keys/4` only ever read `params["rooms"]`. Normalized all three PUT route shapes into one entry list. Also implemented the spec's actual replace rule (11.12.3.3) for the first time — is_verified=true beats false, then lower first_message_index, then lower forwarded_count — where axon previously overwrote unconditionally on every conflict.
+- **Search**: page size was read from `event_context.limit` (not a real field — `event_context` only has before/after limits) instead of `filter.limit`; pagination (`next_batch`) didn't exist at all; and `events_before` was reversed into chronological order when spec (and the reference behavior) wants reverse-chronological, closest-match-first. Added an `offset`-based `next_batch` (not a keyset cursor — "rank" order has no single column to key off the way "recent" has `stream_ordering`) and fixed both bugs.
+- **A real stuck-connection bug, not flakiness**: `TestAsyncUpload` failed with a bare `EOF` on the request *after* a successful upload — previously assumed to be the same class of host-memory-pressure flakiness Phase 16/19 documented for `TestRoomImageRoundtrip`. It wasn't. Both `MediaController` upload actions discarded the `conn` `Plug.Conn.read_body/2` returns (bound to `_conn`) and kept responding with the stale pre-read one; Plug's own docs are explicit that the returned conn must be threaded through, since Bandit tracks body-read state on it. Answering with the stale conn left the connection thinking the request body was never drained, so the *next* request pipelined on that same keep-alive connection stalled for exactly `read_body`'s default 15s `read_timeout` before Bandit gave up. The giveaway was the precision — three separate stalls, each within milliseconds of exactly 15.00s, too consistent to be memory-pressure jitter. Invisible in `Phoenix.ConnTest`, which never exercises a real transport. Fixing it also turned out to fix `TestRoomImageRoundtrip`'s EOF, which really was this same bug, not environmental flakiness as previously assumed.
+- **`TestRoomImageRoundtrip`'s remaining failure** (after the above): `filter={"contains_url":true}` on `/messages` was read nowhere, so the filter was silently a no-op. Now filters the fetched page (not folded into the query, same documented trade-off as `lazy_load_members`).
+
+Every fix above shipped with `mix test` regression coverage and was re-verified against a real Complement run, not just inferred from reading the fix. Full `mix test`: **1170 tests, 0 failures**.
+
+### Where the csapi package stands, honestly
+
+**61/64 (~95%)**, up from 48/64 at the start of this phase. Three failures remain:
+
+- **`TestDeviceListUpdates`**: 9 of 10 subtests pass; the tenth (`when leaving a room with a remote user`) is the one Complement itself documents as unresolved even for Synapse — `runtime.SkipIf(t, runtime.Synapse) // FIXME: https://github.com/matrix-org/synapse/issues/13650`. Not chased further; the reference implementation doesn't reliably pass this either.
+- **`TestLeftRoomFixture`** and **`TestGetRoomMembersAtPoint`** both need genuine point-in-time state resolution — room state/membership *as of* a given stream position, or as of a user's leave point — which nothing in axon computes today (`RoomMembership` only tracks current state, not history). This is a real feature, not a quick fix; explicitly deferred rather than attempted under time pressure.
+
+The top-level federation/room tests and `msc*` packages (the rest of the historical 89-test figure) weren't run this phase.
