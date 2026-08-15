@@ -298,6 +298,29 @@ defmodule AxonRoom.CreateRoomTest do
       assert Enum.sort(create_content["additional_creators"]) == Enum.sort([bob, charlie])
     end
 
+    test "is_direct is echoed onto each initial invite's own m.room.member content" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      assert {:ok, room_id} =
+               CreateRoom.execute(creator, server_name: "localhost", is_direct: true, invite: [bob])
+
+      assert content_of(room_id, "m.room.member", bob) == %{
+               "membership" => "invite",
+               "is_direct" => true
+             }
+    end
+
+    test "without is_direct, an initial invite's content is just the membership" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      assert {:ok, room_id} =
+               CreateRoom.execute(creator, server_name: "localhost", invite: [bob])
+
+      assert content_of(room_id, "m.room.member", bob) == %{"membership" => "invite"}
+    end
+
     test "trusted_private_chat with no invite doesn't add an empty additional_creators key" do
       creator = new_user("alice")
 

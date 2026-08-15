@@ -64,9 +64,17 @@ defmodule AxonRoom.CreateRoom do
         )
       end
 
-      # Invite initial members
+      # Invite initial members. Per spec, createRoom's top-level is_direct
+      # flag is echoed onto each invite's own m.room.member content — it's
+      # how the invitee's client knows to treat the room as a DM before
+      # they've joined and can see any other state.
+      invite_content =
+        if opts[:is_direct],
+          do: %{"membership" => "invite", "is_direct" => true},
+          else: %{"membership" => "invite"}
+
       Enum.each(opts[:invite] || [], fn invitee ->
-        RoomProcess.send_event(room_id, creator, "m.room.member", %{"membership" => "invite"},
+        RoomProcess.send_event(room_id, creator, "m.room.member", invite_content,
           state_key: invitee
         )
       end)
