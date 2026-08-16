@@ -295,7 +295,11 @@ defmodule AxonWeb.FederationController do
   defp validate_invite_event(_event, _room_id, _origin), do: {:error, :invalid_invite}
 
   defp accept_invite(room_id, room_version, event, invite_room_state) do
-    signed_event = KeyServer.sign_event(event, room_version)
+    signed_event =
+      event
+      |> KeyServer.sign_event(room_version)
+      |> ensure_event_id(room_version)
+
     now = DateTime.utc_now(:microsecond)
 
     Repo.insert_all(
@@ -324,6 +328,19 @@ defmodule AxonWeb.FederationController do
       EventStore.set_invite_preview_state(room_id, signed_event["state_key"], invite_room_state)
       {:ok, signed_event}
     end
+  end
+
+  # Room versions 3+ never carry "event_id" on the wire (it's derived from
+  # the reference hash) — the inviting server's event has none, and signing
+  # it here doesn't add one either. Without this, EventStore.insert_event/2
+  # gets a nil event_id and the changeset's NOT NULL violation surfaces as
+  # an opaque 500 to the inviting server (Complement:
+  # TestIsDirectFlagFederation and most of TestFederationRoomsInvite's
+  # subtests). Same pattern as AxonFederation.RoomJoin's auth-chain storage.
+  defp ensure_event_id(%{"event_id" => id} = event, _room_version) when is_binary(id), do: event
+
+  defp ensure_event_id(event, room_version) do
+    Map.put(event, "event_id", EventHash.reference_hash(event, room_version))
   end
 
   # ---------------------------------------------------------------------------
