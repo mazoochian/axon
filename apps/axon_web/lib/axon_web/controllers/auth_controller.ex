@@ -32,15 +32,10 @@ defmodule AxonWeb.AuthController do
     if kind == "guest" do
       localpart = "guest_#{:crypto.strong_rand_bytes(6) |> Base.url_encode64(padding: false)}"
 
-      with {:ok, result} <-
-             UserStore.register(localpart, nil, server_name: server_name(), is_guest: true) do
-        conn
-        |> put_status(200)
-        |> json(%{
-          "user_id" => result.user_id,
-          "access_token" => result.access_token,
-          "device_id" => result.device_id
-        })
+      opts = [server_name: server_name(), is_guest: true, refresh_token: refresh_requested?(params)]
+
+      with {:ok, result} <- UserStore.register(localpart, nil, opts) do
+        conn |> put_status(200) |> json(login_response(result))
       end
     else
       username = params["username"]
@@ -77,17 +72,12 @@ defmodule AxonWeb.AuthController do
               opts = [
                 server_name: server_name(),
                 device_id: params["device_id"],
-                display_name: username
+                display_name: username,
+                refresh_token: refresh_requested?(params)
               ]
 
               with {:ok, result} <- UserStore.register(String.downcase(username), password, opts) do
-                conn
-                |> put_status(200)
-                |> json(%{
-                  "user_id" => result.user_id,
-                  "access_token" => result.access_token,
-                  "device_id" => result.device_id
-                })
+                conn |> put_status(200) |> json(login_response(result))
               end
             end
           end
@@ -315,16 +305,12 @@ defmodule AxonWeb.AuthController do
           opts = [
             server_name: server_name(),
             device_id: params["device_id"],
-            device_display_name: params["initial_device_display_name"]
+            device_display_name: params["initial_device_display_name"],
+            refresh_token: refresh_requested?(params)
           ]
 
           with {:ok, result} <- UserStore.login(String.downcase(user), password, opts) do
-            json(conn, %{
-              "user_id" => result.user_id,
-              "access_token" => result.access_token,
-              "device_id" => result.device_id,
-              "home_server" => server_name()
-            })
+            json(conn, login_response(result, %{"home_server" => server_name()}))
           end
         end
 
@@ -334,6 +320,64 @@ defmodule AxonWeb.AuthController do
         |> json(%{"errcode" => "M_UNKNOWN", "error" => "Unsupported login type: #{type}"})
     end
   end
+
+  # POST /_matrix/client/v3/refresh — stable Matrix spec (formerly
+  # MSC2918). Unauthenticated (no Bearer token): the refresh_token in the
+  # body *is* the credential. See AxonCore.UserStore.refresh/1 for the
+  # rotation semantics and error-code sourcing (Synapse's auth.py).
+  def refresh(conn, params) do
+    case params["refresh_token"] do
+      raw when is_binary(raw) and raw != "" ->
+        case UserStore.refresh(raw) do
+          {:ok, result} ->
+            json(conn, %{
+              "access_token" => result.access_token,
+              "refresh_token" => result.refresh_token,
+              "expires_in_ms" => result.expires_in_ms
+            })
+
+          {:error, :unknown_token} ->
+            conn
+            |> put_status(401)
+            |> json(%{"errcode" => "M_UNKNOWN_TOKEN", "error" => "Invalid refresh token"})
+
+          {:error, reason} when reason in [:already_used, :refresh_expired] ->
+            conn
+            |> put_status(403)
+            |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Refresh token is no longer valid"})
+
+          {:error, :internal} ->
+            conn
+            |> put_status(500)
+            |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal server error"})
+        end
+
+      _ ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "refresh_token required"})
+    end
+  end
+
+  # `refresh_token: true` in a login/register request body — per spec this
+  # opts in to also receiving a refresh_token and a real access_token
+  # expiry. Anything else (omitted, false, or a non-boolean) leaves the
+  # pre-existing never-expiring-single-token behavior untouched.
+  defp refresh_requested?(params), do: params["refresh_token"] == true
+
+  defp login_response(result, extra \\ %{}) do
+    %{
+      "user_id" => result.user_id,
+      "access_token" => result.access_token,
+      "device_id" => result.device_id
+    }
+    |> Map.merge(extra)
+    |> maybe_put("expires_in_ms", result[:expires_in_ms])
+    |> maybe_put("refresh_token", result[:refresh_token])
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   # GET /_matrix/client/v3/login (list supported login types)
   def login_types(conn, _params) do

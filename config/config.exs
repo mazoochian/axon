@@ -26,6 +26,24 @@ config :axon_web, :oidc,
 # for why it's kept on there.
 config :axon_web, :registration, enabled: false
 
+# Refresh tokens (stable Matrix spec, formerly MSC2918). Defaults mirror
+# Synapse's own (synapse/config/registration.py):
+#   - `access_token_lifetime_ms` is the lifetime given to an access token
+#     minted *because* `refresh_token: true` was requested at
+#     login/register, or by /refresh — Synapse's
+#     `refreshable_access_token_lifetime` default is "5m".
+#   - `refresh_token_lifetime_ms` is nil (never expires) by default,
+#     matching Synapse's `refresh_token_lifetime: None` default — a
+#     refresh token still stops working the moment it's used once
+#     (single-use rotation), it just doesn't also carry a clock.
+# An access token minted *without* requesting a refresh token is
+# unaffected by either setting: it keeps Axon's pre-existing behavior of
+# never expiring, matching Synapse's `nonrefreshable_access_token_lifetime:
+# None` default.
+config :axon_web, :refresh_tokens,
+  access_token_lifetime_ms: 300_000,
+  refresh_token_lifetime_ms: nil
+
 # Ecto repo
 config :axon_core, AxonCore.Repo,
   adapter: Ecto.Adapters.Postgres,

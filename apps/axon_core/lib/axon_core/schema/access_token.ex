@@ -8,6 +8,10 @@ defmodule AxonCore.Schema.AccessToken do
     field(:device_id, :string)
     field(:valid, :boolean, default: true)
     field(:last_validated, :utc_datetime_usec)
+    # Millisecond epoch timestamp; nil means "never expires" — the default
+    # for every access token minted without `refresh_token: true` at
+    # login/register, exactly as before this field existed.
+    field(:expires_at_ms, :integer)
 
     belongs_to(:user, AxonCore.Schema.User,
       foreign_key: :user_id,
@@ -20,7 +24,7 @@ defmodule AxonCore.Schema.AccessToken do
 
   def changeset(token, attrs) do
     token
-    |> cast(attrs, [:token_hash, :user_id, :device_id, :valid])
+    |> cast(attrs, [:token_hash, :user_id, :device_id, :valid, :expires_at_ms])
     |> validate_required([:token_hash, :user_id, :device_id])
     |> unique_constraint(:token_hash)
   end
