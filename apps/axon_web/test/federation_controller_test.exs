@@ -1094,7 +1094,7 @@ defmodule AxonWeb.FederationControllerTest do
       assert gap_request.body["latest_events"] == [expected_event_id]
     end
 
-    test "falls back to backfill when get_missing_events comes back empty" do
+    test "falls back to backfill when get_missing_events genuinely fails" do
       owner = new_local_user("owner")
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
       remote_member = remote_user("member")
@@ -1117,8 +1117,8 @@ defmodule AxonWeb.FederationControllerTest do
       FakeRemoteMatrixServer.put_response(
         @port,
         {"POST", ~r{^/_matrix/federation/v1/get_missing_events/}},
-        200,
-        %{"events" => []}
+        500,
+        %{"errcode" => "M_UNKNOWN", "error" => "nope"}
       )
 
       FakeRemoteMatrixServer.put_response(
@@ -1149,6 +1149,68 @@ defmodule AxonWeb.FederationControllerTest do
 
       requests = FakeRemoteMatrixServer.requests(@port)
       assert Enum.any?(requests, &(&1.path =~ "/backfill/"))
+    end
+
+    # Regression: a well-formed 200 with no events is a completed, successful
+    # answer ("I have nothing more to give you"), not a failure — falling
+    # back to backfill anyway here was wrong, and unprompted from the origin
+    # server's point of view (Complement:
+    # TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6's
+    # fake server only stubs get_missing_events for this exact scenario and
+    # fails the test on any other inbound request, backfill included).
+    test "does NOT fall back to backfill when get_missing_events succeeds with no events" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"POST", ~r{^/_matrix/federation/v1/get_missing_events/}},
+        200,
+        %{"events" => []}
+      )
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/backfill/}},
+        500,
+        %{"errcode" => "M_UNKNOWN", "error" => "should never be called"}
+      )
+
+      never_seen_id = "$gapempty_#{System.unique_integer([:positive])}"
+
+      pdu =
+        signed_remote_event(%{
+          "event_id" => "$gapemptyhead_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "head with no closable gap"},
+          "depth" => depth + 2,
+          "prev_events" => [never_seen_id],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      conn = signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [pdu], "edus" => []})
+
+      assert conn.status == 200
+
+      requests = FakeRemoteMatrixServer.requests(@port)
+      assert Enum.any?(requests, &(&1.path =~ "/get_missing_events/"))
+      refute Enum.any?(requests, &(&1.path =~ "/backfill/"))
+
+      # The gap was never closed, so the head PDU couldn't be auth-checked
+      # against real ancestry — stored rejected (per
+      # AxonRoom.RoomProcess's :unresolvable path), never applied.
+      # Asserting this beats trusting the 200 alone, since /send always
+      # 200s regardless of per-PDU outcome.
+      assert {:ok, stored} = AxonCore.EventStore.get_event(pdu["event_id"])
+      assert stored.rejected
+      assert RoomProcess.get_position(room_id) == {last_event_id, depth}
     end
   end
 
