@@ -252,6 +252,51 @@ defmodule AxonCore.EventStoreTest do
     end
   end
 
+  # Regression: GET /_matrix/client/v3/rooms/{roomId}/event/{eventId} used
+  # the bare, unfiltered get_event/1 to look up the event — the only query
+  # in this module with no `rejected`/`soft_failed` filter at all — so a
+  # rejected (e.g. transitively, via an auth_events reference to another
+  # rejected/unknown event — see AxonRoom.RoomProcess's any_rejected?/
+  # unknown_ids checks) or soft-failed event was still served to clients
+  # with a 200 instead of 404 (Complement:
+  # TestInboundFederationRejectsEventsWithRejectedAuthEvents).
+  describe "get_event/1 vs get_visible_event/1" do
+    test "get_event/1 returns a rejected event (federation's GET /event and " <>
+           "/event_auth chain walks intentionally still need to see it)" do
+      ev = event()
+      {:ok, _} = EventStore.insert_rejected_event(ev, "10")
+
+      assert {:ok, fetched} = EventStore.get_event(ev["event_id"])
+      assert fetched.rejected == true
+    end
+
+    test "get_visible_event/1 treats a rejected event as not found" do
+      ev = event()
+      {:ok, _} = EventStore.insert_rejected_event(ev, "10")
+
+      assert EventStore.get_visible_event(ev["event_id"]) == {:error, :not_found}
+    end
+
+    test "get_visible_event/1 treats a soft-failed event as not found" do
+      ev = event()
+      {:ok, _} = EventStore.insert_soft_failed_event(ev, "10")
+
+      assert EventStore.get_visible_event(ev["event_id"]) == {:error, :not_found}
+    end
+
+    test "get_visible_event/1 returns a normally-accepted event" do
+      ev = event()
+      {:ok, _} = EventStore.insert_event(ev, "10")
+
+      assert {:ok, fetched} = EventStore.get_visible_event(ev["event_id"])
+      assert fetched.event_id == ev["event_id"]
+    end
+
+    test "get_visible_event/1 is not_found for an id that was never stored at all" do
+      assert EventStore.get_visible_event("$never-existed") == {:error, :not_found}
+    end
+  end
+
   describe "insert_event/2 — unrejecting a previously-rejected event" do
     test "flips rejected to false, applies state, and gets a fresh (later) stream_ordering" do
       # Mirrors TestUnrejectRejectedEvents: an event is first rejected
