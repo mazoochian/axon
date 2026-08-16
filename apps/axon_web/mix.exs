@@ -60,6 +60,7 @@ defmodule AxonWeb.MixProject do
       {:phoenix_live_view, "~> 1.0"},
       {:phoenix_live_dashboard, "~> 0.8"},
       {:sentry, "~> 13.3"},
+      {:gen_smtp, "~> 1.2"},
       {:mox, "~> 1.1", only: :test}
     ]
   end

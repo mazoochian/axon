@@ -59,6 +59,22 @@ if config_env() == :prod do
   # AxonWeb.AppService.RegistrationYaml.
   config :axon_web, :appservice_dir, System.get_env("AXON_APPSERVICE_DIR")
 
+  # Optional — leave SMTP_HOST unset and 3pid (email) invites stay
+  # out-of-band only, same as before AxonWeb.Mailer existed. SMTP_FROM
+  # defaults to a generic no-reply at this server's own name; SMTP_TLS
+  # defaults to "if_available" (upgrade via STARTTLS when the relay
+  # offers it, don't hard-require it) rather than "always", since not
+  # every relay an operator points this at will support it.
+  if System.get_env("SMTP_HOST") do
+    config :axon_web, :smtp,
+      relay: System.get_env("SMTP_HOST"),
+      port: String.to_integer(System.get_env("SMTP_PORT", "587")),
+      username: System.get_env("SMTP_USERNAME"),
+      password: System.get_env("SMTP_PASSWORD"),
+      tls: String.to_atom(System.get_env("SMTP_TLS", "if_available")),
+      from: System.get_env("SMTP_FROM", "no-reply@#{server_name}")
+  end
+
   # Optional — leave SENTRY_DSN unset to run without error tracking.
   config :sentry, dsn: System.get_env("SENTRY_DSN")
 
