@@ -6,7 +6,7 @@ defmodule AxonFederation.TimestampToEvent do
   `timestamp_answer/3`) whenever the local search
   (`AxonCore.EventStore.find_event_by_timestamp/3`) either comes up empty,
   or comes back with an answer that isn't trustworthy
-  (`AxonCore.EventStore.trustworthy_local_timestamp_answer?/2`). Either
+  (`AxonCore.EventStore.trustworthy_local_timestamp_answer?/3`). Either
   happens whenever this server's own history doesn't reach far enough back
   (or forward) to cover the requested timestamp — most commonly a member
   who joined the room after the target time and was only ever handed the

@@ -585,7 +585,7 @@ defmodule AxonWeb.EventController do
   # `>=`/`<=` comparison with an event that merely sits at the edge of what
   # it knows — most commonly its own earliest known event in the room, e.g.
   # a member who joined late, queried for a timestamp from before the join.
-  # `EventStore.trustworthy_local_timestamp_answer?/2` is the check for
+  # `EventStore.trustworthy_local_timestamp_answer?/3` is the check for
   # that; an untrustworthy answer is treated the same as no answer at all
   # and federation is asked, but if federation comes back empty too the
   # untrustworthy local answer is still better than a bare 404, so it's
@@ -596,7 +596,7 @@ defmodule AxonWeb.EventController do
         federation_timestamp_fallback(room_id, ts, dir)
 
       event ->
-        if EventStore.trustworthy_local_timestamp_answer?(room_id, event) do
+        if EventStore.trustworthy_local_timestamp_answer?(room_id, event, dir) do
           event
         else
           federation_timestamp_fallback(room_id, ts, dir) || event

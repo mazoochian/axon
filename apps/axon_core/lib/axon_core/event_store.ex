@@ -635,7 +635,7 @@ defmodule AxonCore.EventStore do
   The `stream_ordering` of the earliest (not rejected/soft-failed) event
   this server knows about in `room_id`, or `nil` if it knows none at all.
   Same visibility filter `find_event_by_timestamp/3` applies, so the two
-  stay consistent — see `trustworthy_local_timestamp_answer?/2`.
+  stay consistent — see `trustworthy_local_timestamp_answer?/3`.
   """
   def earliest_known_stream_ordering(room_id) do
     Repo.one(
@@ -648,30 +648,87 @@ defmodule AxonCore.EventStore do
 
   @doc """
   Whether `event` — an answer `find_event_by_timestamp/3` already produced
-  for `room_id` — is trustworthy as the room's true globally-nearest event,
-  or merely the nearest *this server happens to know about*.
+  for `room_id` and `dir` — is trustworthy as the room's true
+  globally-nearest event, or merely the nearest *this server happens to
+  know about*.
 
   Matches Synapse's heuristic for the same problem
   (`get_event_for_timestamp`): a server's local history can fall short of
   the room's real history in either direction — most commonly a member who
-  joined late, whose local timeline starts at the join and has nothing
-  older. `find_event_by_timestamp/3`'s `>=`/`<=` comparison can't tell the
-  difference between "this genuinely is the nearest event in the room" and
-  "this is merely the edge of what I've been told about" — a query for a
-  timestamp from before the join will happily return the join event itself
-  (or whatever else sits at that edge) as if it were the real answer.
+  joined late. A remote join only ever imports a *state snapshot* (current
+  state + auth chain, see `AxonFederation.RoomJoin.import_room_state/5`),
+  never the timeline in between, so a late joiner's local history has a
+  real hole in it: full knowledge of the room's state as of the join, full
+  knowledge of everything sent *after* the join (ordinary live traffic),
+  and nothing reliable in between. `find_event_by_timestamp/3`'s `>=`/`<=`
+  comparison can't tell a genuine answer from a value that merely
+  satisfies the inequality because the real answer fell in that hole — and
+  the wrong answer isn't always this server's single earliest or latest
+  known event either: a query landing inside the hole resolves to
+  whichever *state* event happens to sit nearest the requested time (e.g.
+  the late joiner's own earlier-joined roommate), which can be squarely in
+  the *middle* of what this server knows by insertion order.
 
-  The signal: whether the candidate event *is* this server's own earliest
-  known event in the room. If so, there is no way to rule out an earlier
-  (and, depending on direction, possibly closer) event on some other
-  resident server that this server was never told about, so the caller
-  should treat the candidate as provisional and ask federation
-  (`AxonFederation.TimestampToEvent`) before trusting it — in either
-  direction: a query landing on that edge is exactly as suspect whether it
-  arrived there searching forward or backward.
+  Two independent signals, one per direction:
+
+    * `dir == "f"`: distrust if `event` is this server's own earliest
+      known event in the room (the plain edge-of-history case), or if it
+      is missing any of its own `prev_event_ids` locally (a "backward
+      gap" — proof this server never received whatever came immediately
+      before it, so an earlier event that still satisfies `>= ts` may
+      exist without this server's knowledge).
+
+    * `dir == "b"`: distrust if no locally known event lists `event` in
+      *its* `prev_event_ids` (a "forward gap" — proof nothing connects
+      this event forward to what this server knows came later, so a
+      later-but-still-`<= ts` event may exist without this server's
+      knowledge). This also catches `event` being this server's own
+      latest known event, since by definition nothing later can reference
+      it.
+
+  Either way, the caller treats the candidate as provisional and asks
+  federation (`AxonFederation.TimestampToEvent`) before trusting it.
   """
-  def trustworthy_local_timestamp_answer?(room_id, event) do
-    event.stream_ordering != earliest_known_stream_ordering(room_id)
+  def trustworthy_local_timestamp_answer?(room_id, event, dir) do
+    case dir do
+      "f" ->
+        event.stream_ordering != earliest_known_stream_ordering(room_id) and
+          not backward_gap?(room_id, event)
+
+      "b" ->
+        not forward_gap?(room_id, event)
+    end
+  end
+
+  # Whether `event` is missing any of its own declared `prev_event_ids`
+  # from this server's local history — i.e. whether this server was ever
+  # actually told what came immediately before it, as opposed to merely
+  # receiving it as part of a join's state snapshot. A genuine room-root
+  # event (empty `prev_event_ids`) is never a gap.
+  defp backward_gap?(_room_id, %{prev_event_ids: []}), do: false
+
+  defp backward_gap?(room_id, %{prev_event_ids: prev_event_ids}) do
+    known =
+      Repo.all(
+        from(e in Event,
+          where: e.room_id == ^room_id and e.event_id in ^prev_event_ids,
+          select: e.event_id
+        )
+      )
+      |> MapSet.new()
+
+    Enum.any?(prev_event_ids, &(not MapSet.member?(known, &1)))
+  end
+
+  # Whether any event this server locally knows about in `room_id` lists
+  # `event` as one of *its* `prev_event_ids` — i.e. whether this server
+  # can see anything connecting forward from `event` toward the present.
+  defp forward_gap?(room_id, event) do
+    not Repo.exists?(
+      from(e in Event,
+        where: e.room_id == ^room_id and fragment("? = ANY(?)", ^event.event_id, e.prev_event_ids)
+      )
+    )
   end
 
   @doc """

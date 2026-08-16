@@ -1251,4 +1251,95 @@ defmodule AxonCore.EventStoreTest do
       assert Enum.any?(Map.get(viewer_events, @room, []), &(&1.event_id == join_ev.event_id))
     end
   end
+
+  describe "trustworthy_local_timestamp_answer?/3" do
+    # Mirrors the shape AxonFederation.RoomJoin.import_room_state/5 produces
+    # for a late-to-the-room member: it inserts events directly via
+    # insert_event/2 (no DAG/auth resolution, exactly like a join's state
+    # snapshot), so an event can land locally with prev_event_ids this
+    # server has no record of — a "hole" that isn't necessarily this
+    # server's single earliest or latest known event (see
+    # AxonWeb.TimestampToEventTest's "federation" describe block for the
+    # end-to-end version of this same scenario, matching Complement's
+    # remoteCharlie).
+
+    test "dir=f: the earliest known event is untrustworthy even with no gap (edge of local history)" do
+      {:ok, root} = EventStore.insert_event(event(%{"prev_events" => []}), "10")
+      assert EventStore.trustworthy_local_timestamp_answer?(@room, root, "f") == false
+    end
+
+    test "dir=f: a later, fully DAG-connected event is trustworthy" do
+      {:ok, first} = EventStore.insert_event(event(%{"prev_events" => []}), "10")
+
+      {:ok, second} =
+        EventStore.insert_event(event(%{"prev_events" => [first.event_id]}), "10")
+
+      assert EventStore.trustworthy_local_timestamp_answer?(@room, second, "f") == true
+    end
+
+    test "dir=f: an event isn't this server's earliest known but still has a backward gap is untrustworthy" do
+      {:ok, first} = EventStore.insert_event(event(%{"prev_events" => []}), "10")
+
+      # Inserted directly, the way a join's state snapshot would be — its
+      # prev_events names an event this server was never given, so it
+      # can't rule out an earlier real event in that unknown span still
+      # satisfying `>= ts`.
+      missing_id = "$never_stored_#{System.unique_integer([:positive])}"
+
+      {:ok, gappy} =
+        EventStore.insert_event(event(%{"prev_events" => [missing_id]}), "10")
+
+      assert gappy.stream_ordering != EventStore.earliest_known_stream_ordering(@room)
+      assert EventStore.trustworthy_local_timestamp_answer?(@room, gappy, "f") == false
+
+      # A control case proving the check is about the gap, not merely
+      # "this event": once the missing predecessor is backfilled in, the
+      # same event becomes trustworthy.
+      {:ok, _backfilled} =
+        EventStore.insert_event(event(%{"event_id" => missing_id, "prev_events" => [first.event_id]}), "10")
+
+      assert EventStore.trustworthy_local_timestamp_answer?(@room, gappy, "f") == true
+    end
+
+    test "dir=b: the latest known event is untrustworthy (nothing can reference it forward yet)" do
+      {:ok, only} = EventStore.insert_event(event(%{"prev_events" => []}), "10")
+      assert EventStore.trustworthy_local_timestamp_answer?(@room, only, "b") == false
+    end
+
+    test "dir=b: an earlier event with a known successor referencing it is trustworthy" do
+      {:ok, first} = EventStore.insert_event(event(%{"prev_events" => []}), "10")
+
+      {:ok, _second} =
+        EventStore.insert_event(event(%{"prev_events" => [first.event_id]}), "10")
+
+      assert EventStore.trustworthy_local_timestamp_answer?(@room, first, "b") == true
+    end
+
+    test "dir=b: a mid-history event with no known successor is untrustworthy, even though it's neither this server's earliest nor latest known event" do
+      # The exact "alice_join" shape from Complement's remoteCharlie
+      # scenario: fully connected near the room's start (so it's not the
+      # earliest known event), and something even later is known too (so
+      # it's not the latest known event either) — but nothing locally
+      # known references it going forward, because the real next event in
+      # the room's history (analogous to Complement's eventA/eventB) was
+      # never fetched, only this state-snapshot fragment plus a later,
+      # disconnected join were.
+      {:ok, root} = EventStore.insert_event(event(%{"prev_events" => []}), "10")
+
+      {:ok, stranded} =
+        EventStore.insert_event(event(%{"prev_events" => [root.event_id]}), "10")
+
+      # Inserted directly (like a join's state snapshot), its prev_events
+      # names the room's real, unknown-to-us head rather than `stranded` —
+      # nothing here connects forward from `stranded`.
+      missing_head_id = "$never_stored_#{System.unique_integer([:positive])}"
+
+      {:ok, _later_disconnected} =
+        EventStore.insert_event(event(%{"prev_events" => [missing_head_id]}), "10")
+
+      assert stranded.stream_ordering != EventStore.earliest_known_stream_ordering(@room)
+      refute stranded.stream_ordering == EventStore.room_max_stream_ordering(@room)
+      assert EventStore.trustworthy_local_timestamp_answer?(@room, stranded, "b") == false
+    end
+  end
 end
