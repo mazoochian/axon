@@ -194,6 +194,16 @@ defmodule AxonWeb.DirectoryController do
   # other than ours, ask that server directly (the same federation
   # query/directory lookup RoomController's join flow already uses),
   # rather than only ever answering for aliases we host ourselves.
+  #
+  # room_alias must go through URI.encode_www_form/1, not URI.encode/1:
+  # every Matrix alias starts with "#", which URI.encode/1 leaves
+  # unescaped. Finch.build/5 re-parses the whole URL string with
+  # URI.parse/1 before sending, and per RFC 3986 an unescaped "#"
+  # introduces the fragment — so the literal alias never reached the wire
+  # at all, only an empty room_alias= did. Silent 404s on every remote
+  # alias lookup; the existing test coverage missed it because
+  # FakeRemoteMatrixServer.put_response/3 matches by path regex only and
+  # never inspects the query string it actually received.
   defp get_remote_alias(conn, room_alias) do
     alias_server = AxonCore.MatrixId.server_name(room_alias)
     local_server = server_name()
@@ -202,7 +212,7 @@ defmodule AxonWeb.DirectoryController do
          {:ok, %{"room_id" => room_id, "servers" => servers}} <-
            AxonFederation.HttpClient.get(
              alias_server,
-             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode(room_alias)}"
+             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode_www_form(room_alias)}"
            ) do
       json(conn, %{"room_id" => room_id, "servers" => servers})
     else
