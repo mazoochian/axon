@@ -586,6 +586,133 @@ defmodule AxonRoom.RoomProcessTest do
     end
   end
 
+  describe "apply_remote_event/2 — soft failure" do
+    # The spec's actual soft-failure shape: remote_user sends a message
+    # while, unbeknownst to them, a *concurrent* branch of the DAG has
+    # them banned. Their message is legitimately authorized against the
+    # ancestry they actually built it on (state as of the fork point,
+    # before the ban) — this is not a forged or malformed event — but it
+    # conflicts with the room's current live state (the ban already
+    # resolved in). That's exactly the "authorized against its own
+    # ancestry, not against current state" distinction that separates
+    # soft-failure from outright rejection.
+    test "a message authorized at its own ancestry but banned by the time it arrives is soft-failed, not rejected or applied" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      remote_user = "@remote4:federated.example"
+      {joined_at_id, joined_at_depth} = RoomProcess.get_position(room_id)
+
+      join_pdu = %{
+        "event_id" => "$softfailjoin_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => joined_at_depth + 1,
+        "prev_events" => [joined_at_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, _} = RoomProcess.apply_remote_event(room_id, join_pdu)
+      {fork_point_id, fork_depth} = RoomProcess.get_position(room_id)
+
+      # The other branch: creator bans remote_user, which becomes the
+      # room's actual current head.
+      assert {:ok, _} =
+               RoomProcess.send_event(room_id, creator, "m.room.member", %{"membership" => "ban"},
+                 state_key: remote_user
+               )
+
+      # remote_user's message, built against the fork point — before the
+      # ban existed from their point of view — arrives after the ban
+      # already won.
+      message_pdu = %{
+        "event_id" => "$softfailmsg_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => remote_user,
+        "content" => %{"body" => "sent before I knew I was banned"},
+        "depth" => fork_depth + 1,
+        "prev_events" => [fork_point_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, message_pdu) == {:error, :soft_failed}
+
+      {:ok, stored} = AxonCore.EventStore.get_event(message_pdu["event_id"])
+      assert stored.soft_failed, "message should be stored soft-failed"
+      refute stored.rejected, "soft failure is not the same as rejection"
+
+      # Never advanced the room head, never visible to local /sync — the
+      # same invisibility rejected events already get, via the
+      # `not e.soft_failed` filters throughout AxonCore.EventStore.
+      {last_event_id, _depth} = RoomProcess.get_position(room_id)
+      refute last_event_id == message_pdu["event_id"]
+
+      by_room =
+        AxonCore.EventStore.get_user_events_since(creator, 0)
+        |> Map.get(room_id, [])
+
+      refute Enum.any?(by_room, &(&1.event_id == message_pdu["event_id"])),
+             "soft-failed event leaked into /sync"
+    end
+
+    test "the same message, if it had actually been authorized at ancestry AND current state, is applied normally" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      remote_user = "@remote5:federated.example"
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      join_pdu = %{
+        "event_id" => "$softfailok_join_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, _} = RoomProcess.apply_remote_event(room_id, join_pdu)
+      {head_id, head_depth} = RoomProcess.get_position(room_id)
+
+      message_pdu = %{
+        "event_id" => "$softfailok_msg_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => remote_user,
+        "content" => %{"body" => "still a member, no fork, no soft-fail"},
+        "depth" => head_depth + 1,
+        "prev_events" => [head_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, event_id} = RoomProcess.apply_remote_event(room_id, message_pdu)
+      assert event_id == message_pdu["event_id"]
+
+      {:ok, stored} = AxonCore.EventStore.get_event(event_id)
+      refute stored.soft_failed
+      refute stored.rejected
+    end
+  end
+
   describe "stop_if_running/1" do
     test "terminates a resident process, which restarts fresh on next access" do
       creator = new_user("alice")
