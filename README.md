@@ -15,8 +15,9 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
 - Third-party (3pid) invites deliver over email when `SMTP_HOST` is configured (`AxonWeb.Mailer`, best-effort, fire-and-forget); SMS still has no delivery path — no identity-server or SMS-provider integration exists, so without SMTP configured the token has to reach the invitee out-of-band.
+- **`POST /register` is now gated behind `REGISTRATION_ENABLED` (off by default in production)** — see the [Environment variables](#environment-variables) table. This is a behavior change from earlier versions of axon, which left self-registration open (rate-limited only) on any deployment not using OIDC. If you're upgrading an existing public deployment, set `REGISTRATION_ENABLED=true` explicitly or self-registration will silently stop working.
 
-See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 22 and counting — the roadmap as originally scoped is complete; ongoing phases are a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
+See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 23 and counting — the roadmap as originally scoped is complete; ongoing phases are a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
 
 ## Why BEAM?
 
@@ -129,6 +130,7 @@ The server is now listening at `http://localhost:8008`. You can point any Matrix
 | `SECRET_KEY_BASE` | *none* | 64-byte Phoenix secret key. **Required in production** — the release refuses to boot without it (generate with `openssl rand -hex 32`) |
 | `SENTRY_DSN` | *unset* | Optional. Enables crash reporting via [Sentry](https://sentry.io) when set; the app runs normally without it |
 | `SIGNING_KEY_PATH` | *unset* | Optional. Path to persist the server's federation signing key across restarts (generated there on first boot if missing). Unset means a fresh identity every restart — fine for throwaway/dev use, not for a real deployment (invalidates cached `/_matrix/key/v2/server` responses and prior signatures). `docker-compose.yml` already mounts a volume at the default path, `/axon/data/signing.key` |
+| `REGISTRATION_ENABLED` | `false` | Whether `POST /register` accepts open self-registration. Off by default, matching Synapse's own `enable_registration: false` — set to `true` to allow public self-registration, or leave off and provision accounts via `_synapse/admin/v1/register` (shared-secret, unaffected either way) or OIDC instead. `mix phx.server`/dev and the test suite both default this on locally regardless of this table's prod default — see `config/dev.exs`/`config/test.exs`. |
 
 ## Deploying with Docker
 
@@ -328,6 +330,8 @@ As of Phase 22 (see [ROADMAP.md](ROADMAP.md) for the full trail):
 - **`tests/csapi` (core Client-Server API): 61/64 (~95%)**. The 3 remaining failures: one is a scenario even Synapse doesn't reliably pass (a documented upstream Synapse issue Complement skips it for); the other two need genuine point-in-time state resolution (room state/membership *as of* a given moment) — a real feature gap, not a bug.
 - **`tests/` (top-level federation/room package): 61/88 (~69%)**. The dominant blocker is a `send_join` signature-verification mismatch — confirmed, across three independent from-scratch cryptographic verifications, to **not** be an axon bug (most likely a bug in a dev-snapshot dependency Complement's own harness pins). It alone gates the entire knocking feature family and most of the restricted-rooms cluster (~13 tests). A second known gap (`soft_failed` never being set) plausibly explains a chunk of the remaining auth-chain/rejection-handling failures.
 - `tests/msc*` (unstable MSCs) not run — expected failures, axon has never claimed to implement unstable MSCs.
+
+**Not yet re-verified**: Phase 23 (`mix test`-only, no live Complement run) landed fixes targeting `TestInboundCanReturnMissingEvents`, `TestNetworkPartitionOrdering`, `TestInboundFederationRejectsEventsWithRejectedAuthEvents`, and `TestJumpToDateEndpoint` — see the Phase 23 entry in [ROADMAP.md](ROADMAP.md) for what each fix does and why it should move the `tests/` count above 61/88. Treat that number as stale until a fresh before/after Complement diff confirms the actual delta.
 
 Re-run the suite above for current numbers; these will drift as both axon and Complement itself change.
 
