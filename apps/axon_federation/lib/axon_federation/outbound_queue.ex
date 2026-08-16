@@ -93,6 +93,35 @@ defmodule AxonFederation.OutboundQueue do
 
   @impl true
   def handle_info(:sweep, state) do
+    # A failed sweep must never crash this process. Under the Ecto sandbox,
+    # this GenServer starts once at application boot and outlives every
+    # individual test's connection ownership — a :sweep tick that happens
+    # to land in the gap between two tests (nothing currently owns/allows a
+    # sandboxed connection) raises DBConnection.OwnershipError. Crashing
+    # here every 5 seconds exhausts the supervisor's restart intensity and
+    # takes down the entire axon_federation application with it, cascading
+    # into every subsequent test across the whole suite failing with "the
+    # table identifier does not refer to an existing ETS table" (axon_web's
+    # Endpoint config, unrelated on its face, but downstream of the same
+    # crashed supervision tree). A skipped sweep is harmless: whatever was
+    # due just waits for the next tick. Same pattern as
+    # AxonFederation.DeviceListFanout's poll/1.
+    new_state =
+      try do
+        sweep(state)
+      rescue
+        _ in [DBConnection.OwnershipError, DBConnection.ConnectionError] -> state
+      catch
+        :exit, _ -> state
+      end
+
+    Process.send_after(self(), :sweep, @tick_interval)
+    {:noreply, new_state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  defp sweep(state) do
     due_rows =
       Repo.all(
         from(t in "federation_outbound_transactions",
@@ -106,11 +135,8 @@ defmodule AxonFederation.OutboundQueue do
       spawn_attempt(id, destination)
     end)
 
-    Process.send_after(self(), :sweep, @tick_interval)
-    {:noreply, state}
+    state
   end
-
-  def handle_info(_msg, state), do: {:noreply, state}
 
   # ---------------------------------------------------------------------------
   # Private: delivery attempts (run in Task.Supervisor children, not the
