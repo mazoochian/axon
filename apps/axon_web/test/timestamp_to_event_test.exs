@@ -432,4 +432,126 @@ defmodule AxonWeb.TimestampToEventTest do
       assert EventStore.get_event(bad_event_id) == {:error, :not_found}
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # The heuristic (ROADMAP: "TestJumpToDateEndpoint's real blocker"): a local
+  # answer isn't trusted unconditionally just because it satisfies the
+  # timestamp comparison — if it's this server's own earliest known event in
+  # the room, that's exactly what a late joiner's local search returns when
+  # asked about a time before it joined (the join event itself, or whatever
+  # else sits at the edge of local history), and it can't be told apart from
+  # a genuine answer without asking around. These mirror the two describe
+  # blocks above but with a resident remote server configured throughout, to
+  # positively confirm *which* path was taken rather than merely asserting a
+  # final status/body that either path could also produce by coincidence.
+  # ---------------------------------------------------------------------------
+
+  describe "local-vs-federation trust heuristic" do
+    @port 19_401
+    @server_name "fake-ts2e-heuristic.test"
+
+    setup do
+      start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{@port}"
+      })
+
+      on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
+
+      alice = register("alice_heur_#{unique()}")
+      room_id = create_room(alice.token)
+      bob = remote_user(@port, "bob")
+      join_remote_member(@port, room_id, bob)
+
+      %{alice: alice, room_id: room_id, bob: bob}
+    end
+
+    test "a local answer that isn't the room's earliest known event is trusted as-is, never consulting federation",
+         %{alice: alice, room_id: room_id} do
+      # A remote answer configured to be obviously wrong, so that returning
+      # it instead of the correct local one would fail this assertion —
+      # proving the trustworthy local path really did skip federation
+      # rather than happening to agree with it.
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/timestamp_to_event/}},
+        200,
+        %{"event_id" => "$should_not_be_used", "origin_server_ts" => 1}
+      )
+
+      {_a_id, _a_ts} = send_message(alice.token, room_id, "first")
+      Process.sleep(10)
+      {b_id, b_ts} = send_message(alice.token, room_id, "second")
+      Process.sleep(10)
+      {c_id, _c_ts} = send_message(alice.token, room_id, "third")
+
+      conn = jump(alice.token, room_id, b_ts + 1, "f")
+      assert conn.status == 200
+      assert %{"event_id" => ^c_id} = decode(conn)
+    end
+
+    test "a local answer that IS the room's earliest known event is distrusted and federation's older answer wins",
+         %{alice: alice, room_id: room_id, bob: bob} do
+      # ts=0, dir=f: the local search's `>=` comparison is satisfied by
+      # *any* locally known event, so it resolves to the very first event
+      # this server ever stored for the room (its m.room.create event) —
+      # exactly the "edge of local history" shape a late joiner's own join
+      # event would take. Nothing distinguishes this from the real
+      # root-caused bug at the EventStore.find_event_by_timestamp/3 level;
+      # only the earliest-known-event heuristic added to timestamp_answer/3
+      # keeps it from being handed back unconditionally the way it used to.
+      federation_event_id = "$federation_answer_#{unique()}"
+      federation_ts = 1
+
+      pdu =
+        signed_remote_event(@port, %{
+          "event_id" => federation_event_id,
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => bob,
+          "content" => %{"msgtype" => "m.text", "body" => "genuinely the earliest"},
+          "depth" => 1,
+          "prev_events" => [],
+          "origin_server_ts" => federation_ts
+        })
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/timestamp_to_event/}},
+        200,
+        %{"event_id" => federation_event_id, "origin_server_ts" => federation_ts}
+      )
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/event/}},
+        200,
+        %{"origin" => @server_name, "origin_server_ts" => federation_ts, "pdus" => [pdu]}
+      )
+
+      conn = jump(alice.token, room_id, 0, "f")
+      assert conn.status == 200
+
+      assert %{"event_id" => ^federation_event_id, "origin_server_ts" => ^federation_ts} =
+               decode(conn)
+    end
+
+    test "when the local answer IS the earliest known event and federation has nothing either, the local answer is still returned rather than 404ing",
+         %{alice: alice, room_id: room_id} do
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/timestamp_to_event/}},
+        404,
+        %{"errcode" => "M_NOT_FOUND", "error" => "nothing here either"}
+      )
+
+      local_earliest = EventStore.find_event_by_timestamp(room_id, 0, "f")
+
+      conn = jump(alice.token, room_id, 0, "f")
+      assert conn.status == 200
+      assert %{"event_id" => event_id} = decode(conn)
+      assert event_id == local_earliest.event_id
+    end
+  end
 end

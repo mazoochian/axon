@@ -474,7 +474,10 @@ defmodule AxonWeb.EventController do
   # AxonFederation.TimestampToEvent, which asks the room's other resident
   # servers over the federation counterpart of this endpoint and, per spec,
   # backfills whatever event they name before it's handed back here — so a
-  # client can immediately paginate /context or /messages around it.
+  # client can immediately paginate /context or /messages around it. That
+  # covers the case where the local search finds nothing at all, but a
+  # local search can also come back with *something* that isn't actually
+  # the right answer: see timestamp_answer/3.
   def timestamp_to_event(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
 
@@ -486,16 +489,10 @@ defmodule AxonWeb.EventController do
           |> put_status(403)
           |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
 
-        event = EventStore.find_event_by_timestamp(room_id, ts, dir) ->
+        event = timestamp_answer(room_id, ts, dir) ->
           json(conn, %{
             "event_id" => event.event_id,
             "origin_server_ts" => event.origin_server_ts
-          })
-
-        result = federation_timestamp_fallback(room_id, ts, dir) ->
-          json(conn, %{
-            "event_id" => result.event_id,
-            "origin_server_ts" => result.origin_server_ts
           })
 
         true ->
@@ -509,6 +506,31 @@ defmodule AxonWeb.EventController do
     else
       {:error, errcode, message} ->
         conn |> put_status(400) |> json(%{"errcode" => errcode, "error" => message})
+    end
+  end
+
+  # A local answer isn't accepted unconditionally: `EventStore` only ever
+  # searches history this server actually holds, and a server whose own
+  # history doesn't reach back (or forward) far enough can satisfy the
+  # `>=`/`<=` comparison with an event that merely sits at the edge of what
+  # it knows — most commonly its own earliest known event in the room, e.g.
+  # a member who joined late, queried for a timestamp from before the join.
+  # `EventStore.trustworthy_local_timestamp_answer?/2` is the check for
+  # that; an untrustworthy answer is treated the same as no answer at all
+  # and federation is asked, but if federation comes back empty too the
+  # untrustworthy local answer is still better than a bare 404, so it's
+  # used as the last resort.
+  defp timestamp_answer(room_id, ts, dir) do
+    case EventStore.find_event_by_timestamp(room_id, ts, dir) do
+      nil ->
+        federation_timestamp_fallback(room_id, ts, dir)
+
+      event ->
+        if EventStore.trustworthy_local_timestamp_answer?(room_id, event) do
+          event
+        else
+          federation_timestamp_fallback(room_id, ts, dir) || event
+        end
     end
   end
 

@@ -606,6 +606,49 @@ defmodule AxonCore.EventStore do
   end
 
   @doc """
+  The `stream_ordering` of the earliest (not rejected/soft-failed) event
+  this server knows about in `room_id`, or `nil` if it knows none at all.
+  Same visibility filter `find_event_by_timestamp/3` applies, so the two
+  stay consistent — see `trustworthy_local_timestamp_answer?/2`.
+  """
+  def earliest_known_stream_ordering(room_id) do
+    Repo.one(
+      from(e in Event,
+        where: e.room_id == ^room_id and not e.rejected and not e.soft_failed,
+        select: min(e.stream_ordering)
+      )
+    )
+  end
+
+  @doc """
+  Whether `event` — an answer `find_event_by_timestamp/3` already produced
+  for `room_id` — is trustworthy as the room's true globally-nearest event,
+  or merely the nearest *this server happens to know about*.
+
+  Matches Synapse's heuristic for the same problem
+  (`get_event_for_timestamp`): a server's local history can fall short of
+  the room's real history in either direction — most commonly a member who
+  joined late, whose local timeline starts at the join and has nothing
+  older. `find_event_by_timestamp/3`'s `>=`/`<=` comparison can't tell the
+  difference between "this genuinely is the nearest event in the room" and
+  "this is merely the edge of what I've been told about" — a query for a
+  timestamp from before the join will happily return the join event itself
+  (or whatever else sits at that edge) as if it were the real answer.
+
+  The signal: whether the candidate event *is* this server's own earliest
+  known event in the room. If so, there is no way to rule out an earlier
+  (and, depending on direction, possibly closer) event on some other
+  resident server that this server was never told about, so the caller
+  should treat the candidate as provisional and ask federation
+  (`AxonFederation.TimestampToEvent`) before trusting it — in either
+  direction: a query landing on that edge is exactly as suspect whether it
+  arrived there searching forward or backward.
+  """
+  def trustworthy_local_timestamp_answer?(room_id, event) do
+    event.stream_ordering != earliest_known_stream_ordering(room_id)
+  end
+
+  @doc """
   Paginate events related to `target_event_id` (for GET /rooms/:id/relations/:eventId).
   `rel_type` and `event_type` are optional filters, `nil` means "any".
   """
