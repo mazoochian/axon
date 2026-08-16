@@ -350,6 +350,85 @@ defmodule AxonCore.EventStoreTest do
     end
   end
 
+  # Regression for TestNetworkPartitionOrdering: a remote event can be
+  # created early in the DAG (low `depth`, computed from its real
+  # `prev_events` at creation time on the remote server) but only reach this
+  # server — and get inserted, and thus assigned its `stream_ordering` —
+  # late, after the local room head has already moved on to a higher depth.
+  # Ordering dir=b purely by `desc: stream_ordering` would put that
+  # late-inserted, low-depth event ahead of topologically deeper events it
+  # actually precedes. Ordering by `depth` first (with `stream_ordering` only
+  # as a same-depth tiebreak) fixes that.
+  #
+  # Uses its own room (rather than `@room`, which the "get_events_since /
+  # get_messages" describe block above already seeds with three depth-1
+  # events) so the expected ordering isn't entangled with unrelated fixtures.
+  describe "get_messages backwards (dir=b) depth ordering" do
+    @depth_room "!depth-order:localhost"
+
+    setup do
+      insert_user(@creator)
+      {:ok, _room} = EventStore.insert_room(@depth_room, @creator, "10", false)
+      :ok
+    end
+
+    test "orders by depth, so a late-arriving forked event with low depth doesn't jump ahead of topologically deeper events" do
+      # Simulates a local chain (depth 1 -> 2 -> 3) advancing normally, then
+      # a remote event forked off depth 1 (depth 2, same generation as the
+      # second local event) arriving and being inserted last — after the
+      # depth-3 event — so it gets the highest stream_ordering of the four
+      # despite its low depth.
+      d1 =
+        event(%{
+          "room_id" => @depth_room,
+          "content" => %{"body" => "local depth 1"},
+          "depth" => 1
+        })
+
+      d2 =
+        event(%{
+          "room_id" => @depth_room,
+          "content" => %{"body" => "local depth 2"},
+          "depth" => 2
+        })
+
+      d3 =
+        event(%{
+          "room_id" => @depth_room,
+          "content" => %{"body" => "local depth 3"},
+          "depth" => 3
+        })
+
+      remote_forked =
+        event(%{
+          "room_id" => @depth_room,
+          "content" => %{"body" => "late remote fork"},
+          "depth" => 2
+        })
+
+      {:ok, p1} = EventStore.insert_event(d1, "10")
+      {:ok, p2} = EventStore.insert_event(d2, "10")
+      {:ok, p3} = EventStore.insert_event(d3, "10")
+      {:ok, p4} = EventStore.insert_event(remote_forked, "10")
+
+      # p4 has the highest stream_ordering (inserted last) but only depth 2 —
+      # lower than p3's depth 3.
+      assert p4.stream_ordering > p3.stream_ordering
+      assert p4.depth < p3.depth
+
+      events = EventStore.get_messages(@depth_room, p4.stream_ordering + 1, "b", 10)
+
+      # Depth-first ordering: p3 (depth 3) first; p4 and p2 tie at depth 2,
+      # broken by stream_ordering desc (p4 was inserted after p2); p1 last.
+      assert Enum.map(events, & &1.event_id) == [
+               p3.event_id,
+               p4.event_id,
+               p2.event_id,
+               p1.event_id
+             ]
+    end
+  end
+
   describe "search_messages" do
     test "finds a message by body text and reports a total count" do
       {:ok, _} =
