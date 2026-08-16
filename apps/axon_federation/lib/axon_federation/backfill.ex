@@ -103,6 +103,20 @@ defmodule AxonFederation.Backfill do
           still_missing -> fetch_and_apply_backfill(room_id, origin, still_missing)
         end
 
+      {:ok, []} ->
+        # A well-formed response the origin had nothing to add to —
+        # distinct from the request itself failing below. Falling back to
+        # backfill here anyway was wrong: the origin already told us,
+        # successfully, that get_missing_events has nothing more to give;
+        # asking again via a completely different endpoint isn't a retry,
+        # it's an unprompted extra request no caller expects (Complement:
+        # TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6's
+        # fake server only stubs get_missing_events for this exact
+        # scenario and fails the test on any other inbound request).
+        # Give up on this gap for now — the same "harmless, next event
+        # retries" tradeoff as a request that errors out entirely.
+        :error
+
       _ ->
         fetch_and_apply_backfill(room_id, origin, missing)
     end
