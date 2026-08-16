@@ -184,6 +184,61 @@ defmodule AxonCore.EventStore do
     end
   end
 
+  @doc """
+  Persists an event that failed auth-checking against the room's *current*
+  live state, despite passing auth-checking against the state as of its
+  own ancestry, as **soft-failed**.
+
+  This is the second, softer check `insert_rejected_event/2`'s moduledoc
+  refers to — distinct from outright rejection, which means the event was
+  never valid at all. A soft-failed event was legitimately authorized by
+  whoever sent it, based on what they knew of the room at the time; it
+  only conflicts with state that changed here (via some other event)
+  after they built it, most commonly a concurrent fork resolving against
+  them (e.g. sent while their own power was being revoked from a
+  different branch of the DAG). Per spec it must still be treated as a
+  genuine part of the room's history — a future event may legitimately
+  reference it as a `prev_event` or resolve state through it — just never
+  shown to a client directly and never advances the local room head.
+
+  Same non-application semantics as `insert_rejected_event/2` (no
+  `current_room_state`/`room_memberships` write; invisible to `/sync`,
+  `/messages`, `/state` via the `not e.soft_failed` filters throughout
+  this module) but, unlike rejection, there is no "un-soft-fail" — this
+  is a one-time determination made against state as it stood at receipt,
+  not something a later-arriving event can retroactively undo (matching
+  Synapse's own behavior).
+
+  Same no-op-if-already-accepted guard as `insert_rejected_event/2`.
+  """
+  def insert_soft_failed_event(event_map, room_version) do
+    params =
+      event_map
+      |> Event.from_wire(room_version)
+      |> Map.put(:soft_failed, true)
+
+    Ecto.Multi.new()
+    |> Ecto.Multi.insert(:event_raw, Event.changeset(%Event{}, params),
+      on_conflict: :nothing,
+      conflict_target: :event_id
+    )
+    |> Ecto.Multi.run(:event, fn repo, %{event_raw: _raw} ->
+      case repo.get_by(Event, event_id: params.event_id) do
+        nil -> {:error, :event_not_found}
+        event -> {:ok, event}
+      end
+    end)
+    |> Ecto.Multi.run(:auth_edges, fn repo, %{event: event} ->
+      insert_auth_edges(repo, event)
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{event: event}} -> {:ok, event}
+      {:error, :event_raw, changeset, _} -> {:error, changeset}
+      {:error, step, reason, _} -> {:error, {step, reason}}
+    end
+  end
+
   @doc "True if any of `event_ids` is a stored, rejected event."
   def any_rejected?([]), do: false
 

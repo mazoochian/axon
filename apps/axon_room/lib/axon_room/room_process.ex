@@ -300,54 +300,80 @@ defmodule AxonRoom.RoomProcess do
                 reject_and_persist(pdu, state, reason)
 
               :ok ->
-                case EventStore.insert_event(pdu, state.room_version) do
-                  {:ok, persisted} ->
-                    event_map = EventStore.event_to_map(persisted)
+                # Soft-fail check: pdu is authorized against the state as of
+                # its own ancestry (just verified above) — the second,
+                # softer check is whether it's ALSO authorized against the
+                # room's current live state, which can have moved on since
+                # the sender built it (most commonly: this event and
+                # something else forked from a common ancestor, and the
+                # *other* branch is what actually resolved into current
+                # state). Only meaningful when forked at all — when it
+                # isn't, resolved_state and state.current_state are the
+                # same value, so re-checking against it can't produce a
+                # different verdict. See EventStore.insert_soft_failed_event/2.
+                soft_fail_reason =
+                  if forked?,
+                    do: AuthRules.check(pdu, state.current_state, state.room_version),
+                    else: :ok
 
-                    base_state =
-                      if forked?, do: %{state | current_state: resolved_state}, else: state
-
-                    new_state =
-                      apply_and_advance(base_state, event_map, persisted.stream_ordering)
-
-                    # Fan out to local /sync clients. Not re-broadcast to federation
-                    # by default: for an ordinary /send transaction PDU, the origin
-                    # server already pushed it to every other resident server
-                    # itself (relaying it further here would just duplicate that).
-                    # See apply_remote_event/3's doc for the send_join/leave/knock
-                    # exception, opted into via opts[:relay_exclude].
-                    broadcast(state.room_id, event_map)
-
-                    case Keyword.get(opts, :relay_exclude, :no_relay) do
-                      :no_relay ->
-                        :ok
-
-                      exclude ->
-                        # PDU form, not client form — see the sibling call in
-                        # handle_call({:send_event, ...}) above.
-                        broadcast_for_federation(
-                          state.room_id,
-                          EventStore.event_to_pdu(persisted),
-                          new_state.current_state,
-                          exclude
-                        )
-                    end
-
-                    AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
-
-                    Phoenix.PubSub.broadcast(
-                      @pubsub,
-                      "all_events",
-                      {:new_event, state.room_id, event_map}
-                    )
-
-                    {:reply, {:ok, event_map["event_id"]}, new_state}
-
+                case soft_fail_reason do
                   {:error, reason} ->
-                    {:reply, {:error, reason}, state}
+                    soft_fail_and_persist(pdu, state, reason)
+
+                  :ok ->
+                    apply_authorized_event(pdu, state, resolved_state, forked?, opts)
                 end
             end
         end
+    end
+  end
+
+  defp apply_authorized_event(pdu, state, resolved_state, forked?, opts) do
+    case EventStore.insert_event(pdu, state.room_version) do
+      {:ok, persisted} ->
+        event_map = EventStore.event_to_map(persisted)
+
+        base_state =
+          if forked?, do: %{state | current_state: resolved_state}, else: state
+
+        new_state =
+          apply_and_advance(base_state, event_map, persisted.stream_ordering)
+
+        # Fan out to local /sync clients. Not re-broadcast to federation
+        # by default: for an ordinary /send transaction PDU, the origin
+        # server already pushed it to every other resident server
+        # itself (relaying it further here would just duplicate that).
+        # See apply_remote_event/3's doc for the send_join/leave/knock
+        # exception, opted into via opts[:relay_exclude].
+        broadcast(state.room_id, event_map)
+
+        case Keyword.get(opts, :relay_exclude, :no_relay) do
+          :no_relay ->
+            :ok
+
+          exclude ->
+            # PDU form, not client form — see the sibling call in
+            # handle_call({:send_event, ...}) above.
+            broadcast_for_federation(
+              state.room_id,
+              EventStore.event_to_pdu(persisted),
+              new_state.current_state,
+              exclude
+            )
+        end
+
+        AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
+
+        Phoenix.PubSub.broadcast(
+          @pubsub,
+          "all_events",
+          {:new_event, state.room_id, event_map}
+        )
+
+        {:reply, {:ok, event_map["event_id"]}, new_state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -406,6 +432,27 @@ defmodule AxonRoom.RoomProcess do
     end
 
     {:reply, {:error, reason}, state}
+  end
+
+  # See EventStore.insert_soft_failed_event/2 for the full spec rationale.
+  # Same shape as reject_and_persist/3 (stored, not applied, state
+  # unchanged) — the caller-visible difference is only the reply reason,
+  # {:error, :soft_failed} rather than the auth-check failure reason
+  # itself, since from here on the *why* isn't actionable to the sender
+  # the way an outright rejection reason is.
+  defp soft_fail_and_persist(pdu, state, reason) do
+    case EventStore.insert_soft_failed_event(pdu, state.room_version) do
+      {:ok, _persisted} ->
+        Logger.debug("Soft-failed PDU #{pdu["event_id"]} in #{state.room_id}: #{inspect(reason)}")
+
+      {:error, insert_reason} ->
+        Logger.warning(
+          "Failed to persist soft-failed PDU #{pdu["event_id"]} in #{state.room_id}: " <>
+            "#{inspect(insert_reason)} (original soft-fail reason: #{inspect(reason)})"
+        )
+    end
+
+    {:reply, {:error, :soft_failed}, state}
   end
 
   defp load_room(room_id) do

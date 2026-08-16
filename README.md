@@ -17,7 +17,6 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 - Third-party (3pid) invites have no actual email/SMS delivery — no identity-server integration exists, so the token has to reach the invitee out-of-band.
 - Sliding sync re-sends a full `SYNC` op per range on every request rather than diffing against a remembered session — spec-valid, just not bandwidth-optimal.
 - No point-in-time state resolution: `GET /rooms/{roomId}/members?at=<token>` and history visibility for a user who's left a room both need room state *as of* a specific moment, which nothing currently computes (only current state is tracked).
-- `soft_failed` is never set on an event — axon has rejection (an event that fails auth outright), but not the second, softer check against current state that a genuine soft-failure requires.
 
 See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 22 and counting — the roadmap as originally scoped is complete; ongoing phases are a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
 
