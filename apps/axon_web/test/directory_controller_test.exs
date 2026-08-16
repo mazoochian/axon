@@ -246,6 +246,17 @@ defmodule AxonWeb.DirectoryControllerTest do
       body = decode(conn)
       assert body["room_id"] == remote_room_id
       assert body["servers"] == [@server_name]
+
+      # The mock above matches by path regex alone and would happily return
+      # 200 even if the outbound request never actually carried the alias
+      # (regression: room_alias was interpolated with URI.encode/1, which
+      # leaves the alias's leading "#" unescaped — Finch then re-parses the
+      # URL and treats that "#" as the start of a fragment, silently
+      # truncating the query string to "room_alias=" before the request
+      # ever left this server). Assert on what the fake server actually
+      # received, not just what it chose to answer with.
+      [%{query_string: query_string}] = FakeRemoteMatrixServer.requests(@port)
+      assert URI.decode_query(query_string) == %{"room_alias" => full_alias}
     end
 
     test "list_room_aliases requires membership" do

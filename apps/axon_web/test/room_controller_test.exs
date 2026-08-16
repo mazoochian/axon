@@ -333,6 +333,48 @@ defmodule AxonWeb.RoomControllerTest do
     end
   end
 
+  describe "join by remote alias (regression)" do
+    # Every Matrix alias starts with "#" — RoomController.resolve_remote_alias/3
+    # interpolated it into a federation query string with URI.encode/1, which
+    # leaves "#" unescaped. Finch.build/5 then re-parses that URL string with
+    # URI.parse/1, which treats an unescaped "#" as the start of a fragment —
+    # so the alias never made it onto the wire, only an empty room_alias= did,
+    # and every federated alias-join 404'd (Complement: TestOutboundFederationSend,
+    # TestNetworkPartitionOrdering, both of which join a remote room by alias).
+    test "resolves the remote alias via a correctly query-encoded federation lookup" do
+      port = 19_460
+      server_name = "fake-roomjoin-alias.test"
+      start_supervised!({AxonFederation.FakeRemoteMatrixServer, port: port, server_name: server_name})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        server_name => "http://127.0.0.1:#{port}"
+      })
+
+      on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
+
+      alice = register("alice_aliasjoin_#{System.unique_integer([:positive])}")
+      full_alias = "#flibble_#{System.unique_integer([:positive])}:#{server_name}"
+      remote_room_id = "!remoteroom#{System.unique_integer([:positive])}:#{server_name}"
+
+      AxonFederation.FakeRemoteMatrixServer.put_response(
+        port,
+        {"GET", ~r{^/_matrix/federation/v1/query/directory}},
+        200,
+        %{"room_id" => remote_room_id, "servers" => [server_name]}
+      )
+
+      path_alias = full_alias |> URI.encode() |> String.replace("#", "%23")
+      authed(alice.token) |> jp("/_matrix/client/v3/join/#{path_alias}", %{})
+
+      [directory_request] =
+        Enum.filter(AxonFederation.FakeRemoteMatrixServer.requests(port), fn r ->
+          r.path == "/_matrix/federation/v1/query/directory"
+        end)
+
+      assert URI.decode_query(directory_request.query_string) == %{"room_alias" => full_alias}
+    end
+  end
+
   defp get_state_event(token, room_id, type) do
     conn = authed(token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/#{type}?format=event")
     {conn.status, decode(conn)}

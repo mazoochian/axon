@@ -826,11 +826,17 @@ defmodule AxonWeb.RoomController do
     |> Enum.map(fn {_k, v} -> v end)
   end
 
+  # room_alias must go through URI.encode_www_form/1, not URI.encode/1 — see
+  # AxonWeb.DirectoryController.get_remote_alias/2 for why: every Matrix
+  # alias starts with "#", which URI.encode/1 leaves unescaped, and
+  # Finch.build/5 re-parses the URL with URI.parse/1 before sending, which
+  # treats an unescaped "#" as the start of the fragment — so the alias
+  # never made it onto the wire and every federated alias-join 404'd.
   defp resolve_remote_alias(room_alias, via_servers, _local_server) do
     Enum.find_value(via_servers, {nil, []}, fn server ->
       case AxonFederation.HttpClient.get(
              server,
-             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode(room_alias)}"
+             "/_matrix/federation/v1/query/directory?room_alias=#{URI.encode_www_form(room_alias)}"
            ) do
         {:ok, %{"room_id" => room_id, "servers" => servers}} ->
           {room_id, servers}
