@@ -655,7 +655,18 @@ defmodule AxonWeb.RoomController do
   # EventStore.get_room_members_at/3 for why this is a real point-in-time
   # query, not an approximation, despite axon otherwise only ever
   # materializing current state.
+  #
+  # Per spec, a requester with no explicit `at` who has left (or been
+  # banned from) the room gets membership *as of when they left* rather
+  # than the room's live current membership — otherwise a departed member
+  # would see anyone who joined after they left, which is exactly the
+  # room_membership leak Complement's TestLeftRoomFixture catches. Reuses
+  # EventController.visibility_bounds/2's leave_ordering (the same
+  # boundary GET /event/{id} and /messages already cap a departed
+  # member's visibility at) rather than re-deriving it.
   def members(conn, %{"room_id" => room_id} = params) do
+    user_id = conn.assigns.current_user_id
+
     filter_memberships =
       case params["membership"] do
         nil -> ["join", "invite", "ban", "leave", "knock"]
@@ -668,18 +679,28 @@ defmodule AxonWeb.RoomController do
         m -> List.delete(filter_memberships, m)
       end
 
-    chunk =
+    stream_ordering =
       case params["at"] do
+        nil ->
+          case AxonWeb.EventController.visibility_bounds(room_id, user_id) do
+            %{membership: m, leave_ordering: ord} when m in ["leave", "ban"] -> ord
+            _ -> nil
+          end
+
+        token ->
+          elem(AxonWeb.SyncHelpers.parse_token(token), 0)
+      end
+
+    chunk =
+      case stream_ordering do
         nil ->
           EventStore.get_room_members(room_id, filter_memberships)
           |> Enum.map(fn m ->
             member_chunk_entry(room_id, m.user_id, m.sender, m.membership)
           end)
 
-        token ->
-          stream_ordering = elem(AxonWeb.SyncHelpers.parse_token(token), 0)
-
-          EventStore.get_room_members_at(room_id, stream_ordering, filter_memberships)
+        ordering ->
+          EventStore.get_room_members_at(room_id, ordering, filter_memberships)
           |> Enum.map(fn e ->
             member_chunk_entry(room_id, e.state_key, e.sender, e.content["membership"])
           end)

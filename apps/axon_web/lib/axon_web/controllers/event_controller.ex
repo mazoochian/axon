@@ -140,6 +140,13 @@ defmodule AxonWeb.EventController do
   defp validate_state_event(_type, _content, _room_id), do: :ok
 
   # GET /_matrix/client/v3/rooms/:room_id/state
+  #
+  # Per spec (SPEC-216): a user who has left (or been banned from) the
+  # room gets the state *as of when they left* here, not the room's
+  # current state — RoomProcess only ever holds the live GenServer view,
+  # so a departed member is routed to the point-in-time query instead
+  # (same `leave_ordering` computation `event_visible?/2` already uses
+  # for GET /event/{id} and /messages).
   def get_state(conn, %{"room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
 
@@ -148,7 +155,20 @@ defmodule AxonWeb.EventController do
       |> put_status(403)
       |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
     else
-      case RoomProcess.get_state(room_id) do
+      bounds = visibility_bounds(room_id, user_id)
+
+      result =
+        case departed_boundary(bounds) do
+          nil ->
+            RoomProcess.get_state(room_id)
+
+          leave_ordering ->
+            {:ok,
+             EventStore.get_room_state_at(room_id, leave_ordering)
+             |> Enum.map(&EventStore.event_to_map/1)}
+        end
+
+      case result do
         {:ok, events} ->
           json(conn, events)
 
@@ -159,6 +179,9 @@ defmodule AxonWeb.EventController do
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/state/:event_type/:state_key
+  #
+  # Same departed-member point-in-time routing as get_state/2 above, for
+  # a single state key.
   def get_state_event(conn, %{"room_id" => room_id, "event_type" => event_type} = params) do
     user_id = conn.assigns.current_user_id
     state_key = params["state_key"] || ""
@@ -169,7 +192,21 @@ defmodule AxonWeb.EventController do
       |> put_status(403)
       |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
     else
-      case RoomProcess.get_state_event(room_id, event_type, state_key) do
+      bounds = visibility_bounds(room_id, user_id)
+
+      fetched =
+        case departed_boundary(bounds) do
+          nil ->
+            RoomProcess.get_state_event(room_id, event_type, state_key)
+
+          leave_ordering ->
+            case EventStore.get_state_event_at(room_id, event_type, state_key, leave_ordering) do
+              {:ok, event} -> EventStore.event_to_map(event)
+              {:error, :not_found} -> nil
+            end
+        end
+
+      case fetched do
         nil ->
           {:error, :not_found}
 
@@ -182,6 +219,15 @@ defmodule AxonWeb.EventController do
       end
     end
   end
+
+  # `visibility_bounds/2`'s leave_ordering, but only when it actually
+  # applies to this request — a current join/invite (or a user who was
+  # never a member, already blocked above by member_or_forgotten?/2)
+  # gets nil, meaning "use the live/current-state path".
+  defp departed_boundary(%{membership: m, leave_ordering: ord}) when m in ["leave", "ban"],
+    do: ord
+
+  defp departed_boundary(_bounds), do: nil
 
   # Regression guard (finding): get_state/2, get_state_event/2, and
   # get_messages/2 used to have no membership check at all (or, for
@@ -383,6 +429,30 @@ defmodule AxonWeb.EventController do
       from_ordering = parse_token(from_token) || EventStore.room_max_stream_ordering(room_id) + 1
 
       bounds = visibility_bounds(room_id, user_id)
+
+      # EventStore.get_messages/4's dir=b is exclusive of `from_ordering`
+      # itself (by design — see event_store_test.exs's `stream_ordering +
+      # 1` convention for including a specific event on purpose). A
+      # departed member's own leave/ban event is the last thing
+      # event_visible?/2 will let them see, and it commonly *is*
+      # `from_ordering` verbatim: a `from` token lifted from that same
+      # user's own /sync `next_batch` (taken right after leaving) carries
+      # exactly their leave event's stream_ordering, since that's the
+      # newest event they were ever delivered. Left as-is, the exclusive
+      # boundary would silently drop that one legitimate event off a
+      # backward page. Nudging the query boundary out by one only ever
+      # *admits* it to the raw fetch — event_visible?/2 below still caps
+      # everything at `leave_ordering`, so nothing past it can leak in.
+      from_ordering =
+        case departed_boundary(bounds) do
+          leave_ordering
+          when dir == "b" and not is_nil(leave_ordering) and
+                 from_ordering <= leave_ordering ->
+            leave_ordering + 1
+
+          _ ->
+            from_ordering
+        end
 
       events =
         EventStore.get_messages(room_id, from_ordering, dir, limit)

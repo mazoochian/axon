@@ -325,9 +325,9 @@ COMPLEMENT_BASE_IMAGE=axon-complement:latest \
 
 ### Current results
 
-As of Phase 22 (see [ROADMAP.md](ROADMAP.md) for the full trail):
+As of Phase 24 (see [ROADMAP.md](ROADMAP.md) for the full trail):
 
-- **`tests/csapi` (core Client-Server API): 61/64 (~95%)**. The 3 remaining failures: one is a scenario even Synapse doesn't reliably pass (a documented upstream Synapse issue Complement skips it for); the other two need genuine point-in-time state resolution (room state/membership *as of* a given moment) — a real feature gap, not a bug.
+- **`tests/csapi` (core Client-Server API): 63/64**. Phase 24 closed the point-in-time-state gap Phase 22 had left open (`TestGetRoomMembersAtPoint` and `TestLeftRoomFixture`, confirmed individually via a clean before/after Complement diff) — that commit's own feature had real edges it didn't cover; see the Phase 24 entry for what was actually missing. The one remaining failure is a scenario even Synapse doesn't reliably pass (a documented upstream Synapse issue Complement skips it for). A full whole-package re-run wasn't completed this phase — see the Phase 24 entry.
 - **`tests/` (top-level federation/room package): 61/88 (~69%)**. The dominant blocker is a `send_join` signature-verification mismatch — confirmed, across three independent from-scratch cryptographic verifications, to **not** be an axon bug (most likely a bug in a dev-snapshot dependency Complement's own harness pins). It alone gates the entire knocking feature family and most of the restricted-rooms cluster (~13 tests). A second known gap (`soft_failed` never being set) plausibly explains a chunk of the remaining auth-chain/rejection-handling failures.
 - `tests/msc*` (unstable MSCs) not run — expected failures, axon has never claimed to implement unstable MSCs.
 
