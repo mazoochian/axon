@@ -34,10 +34,36 @@ defmodule AxonCore.EventStore do
   An idempotent resend of an event that's already accepted (not
   previously rejected) is unaffected: the ordering bump only fires on an
   actual rejected -> accepted transition.
+
+  A row that already exists as **soft-failed**, by contrast, is never
+  touched at all — not even to leave it soft-failed while otherwise
+  proceeding. `insert_soft_failed_event/2`'s one-time-determination
+  guarantee ("matching Synapse's own... behavior") has to hold no matter
+  which of this module's several callers re-presents the same event_id
+  later (`AxonRoom.RoomProcess.apply_remote_event/2` re-running its own
+  auth check on a retried/backfilled PDU is the common case, but
+  `AxonFederation.RoomJoin`/`RoomKnock`/`RoomLeave` and
+  `AxonWeb.FederationController` all call this function directly too), so
+  it's enforced once here rather than relying on every call site to
+  re-check first. Without this, a caller that independently decides the
+  retried event is authorized against *some* current state would resolve
+  the on_conflict below and both flip `soft_failed` back to `false` *and*
+  re-run the state/membership writes — silently promoting an event the
+  soft-fail determination said must never advance room state.
   """
   def insert_event(event_map, room_version) do
     params = Event.from_wire(event_map, room_version)
 
+    case Repo.get_by(Event, event_id: params.event_id) do
+      %Event{soft_failed: true} = already_soft_failed ->
+        {:ok, already_soft_failed}
+
+      _ ->
+        do_insert_event(event_map, params)
+    end
+  end
+
+  defp do_insert_event(event_map, params) do
     Ecto.Multi.new()
     |> Ecto.Multi.run(:existing, fn repo, _ ->
       {:ok, repo.get_by(Event, event_id: params.event_id)}

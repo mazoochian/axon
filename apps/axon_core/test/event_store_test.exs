@@ -340,6 +340,62 @@ defmodule AxonCore.EventStoreTest do
     end
   end
 
+  # Regression: insert_event/2's on_conflict clause unconditionally reset
+  # BOTH `rejected` and `soft_failed` to false — correct for rejection
+  # (that's the intentional "unreject" feature above), wrong for
+  # soft-failure, which insert_soft_failed_event/2's own doc promises is a
+  # permanent, one-time determination "matching Synapse's own... behavior".
+  # Every caller of insert_event/2 (not just AxonRoom.RoomProcess — also
+  # AxonFederation.RoomJoin/RoomKnock/RoomLeave and
+  # AxonWeb.FederationController call it directly) has to see that promise
+  # held, so it's enforced once here rather than trusted to every call site.
+  describe "insert_event/2 — never un-soft-fails" do
+    test "a soft-failed event stays soft-failed and unapplied on a later insert_event/2 call" do
+      ev =
+        event(%{
+          "type" => "m.room.topic",
+          "state_key" => "",
+          "content" => %{"topic" => "should stay hidden forever"}
+        })
+
+      {:ok, soft_failed_persisted} = EventStore.insert_soft_failed_event(ev, "10")
+      assert soft_failed_persisted.soft_failed == true
+
+      assert {:ok, resend_result} = EventStore.insert_event(ev, "10")
+      assert resend_result.soft_failed == true
+      assert resend_result.rejected == false
+
+      # Still never applied — the retried "accept" must not resurrect it.
+      assert EventStore.get_state_event(@room, "m.room.topic", "") == {:error, :not_found}
+      assert EventStore.get_visible_event(ev["event_id"]) == {:error, :not_found}
+    end
+
+    test "a soft-failed membership event still derives no room_memberships row after a resend" do
+      bob = "@bob:remote.example"
+
+      ev =
+        event(%{
+          "type" => "m.room.member",
+          "state_key" => bob,
+          "sender" => bob,
+          "content" => %{"membership" => "join"}
+        })
+
+      {:ok, _} = EventStore.insert_soft_failed_event(ev, "10")
+      assert {:ok, _} = EventStore.insert_event(ev, "10")
+
+      assert EventStore.get_membership(@room, bob) == {:ok, nil}
+    end
+
+    test "does not bump stream_ordering on a resent soft-failed event" do
+      ev = event()
+      {:ok, first} = EventStore.insert_soft_failed_event(ev, "10")
+      {:ok, second} = EventStore.insert_event(ev, "10")
+
+      assert first.stream_ordering == second.stream_ordering
+    end
+  end
+
   describe "event_to_map/1" do
     # Regression: "origin" was silently dropped when rebuilding the wire map
     # from a persisted %Event{}, which broke signature verification on every
