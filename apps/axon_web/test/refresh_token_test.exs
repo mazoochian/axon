@@ -143,7 +143,9 @@ defmodule AxonWeb.RefreshTokenTest do
       hash = :crypto.hash(:sha256, token) |> Base.encode16(case: :lower)
 
       expires_at_ms =
-        Repo.one(from(t in "access_tokens", where: t.token_hash == ^hash, select: t.expires_at_ms))
+        Repo.one(
+          from(t in "access_tokens", where: t.token_hash == ^hash, select: t.expires_at_ms)
+        )
 
       assert is_nil(expires_at_ms)
     end

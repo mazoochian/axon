@@ -32,7 +32,11 @@ defmodule AxonWeb.AuthController do
     if kind == "guest" do
       localpart = "guest_#{:crypto.strong_rand_bytes(6) |> Base.url_encode64(padding: false)}"
 
-      opts = [server_name: server_name(), is_guest: true, refresh_token: refresh_requested?(params)]
+      opts = [
+        server_name: server_name(),
+        is_guest: true,
+        refresh_token: refresh_requested?(params)
+      ]
 
       with {:ok, result} <- UserStore.register(localpart, nil, opts) do
         conn |> put_status(200) |> json(login_response(result))

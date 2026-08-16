@@ -8,7 +8,7 @@ defmodule AxonCore.Repo.Migrations.AddRefreshTokenSupport do
     # before this migration — matching Synapse's own default of
     # `nonrefreshable_access_token_lifetime: None`.
     alter table(:access_tokens) do
-      add :expires_at_ms, :bigint
+      add(:expires_at_ms, :bigint)
     end
 
     # The `refresh_tokens` table itself was already created by
@@ -17,6 +17,6 @@ defmodule AxonCore.Repo.Migrations.AddRefreshTokenSupport do
     # has gone unused until now — no application code referenced it. Add
     # the lookup index its actual usage (rotation on logout/logout_all,
     # scoped per user+device) needs.
-    create index(:refresh_tokens, [:user_id, :device_id])
+    create(index(:refresh_tokens, [:user_id, :device_id]))
   end
 end
