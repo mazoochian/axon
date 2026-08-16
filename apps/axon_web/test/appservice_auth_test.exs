@@ -144,6 +144,57 @@ defmodule AxonWeb.AppServiceAuthTest do
   # covering everything except the file-discovery glob itself, which
   # RegistrationYamlTest and Manager's own JSON-loader tests don't
   # exercise via a real file either.
+  describe "?ts= timestamp massaging" do
+    test "an appservice's ?ts= overrides origin_server_ts" do
+      put_registrations([bridge_registration("bridge8", "as-secret-8")])
+
+      alice = register("aliceasts_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      as_authed("as-secret-8")
+      |> jp("/_matrix/client/v3/join/#{room_id}", %{})
+
+      backdated_ts = 1_000_000_000_000
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        as_authed("as-secret-8")
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn_id}?ts=#{backdated_ts}",
+          %{"msgtype" => "m.text", "body" => "backdated"}
+        )
+
+      assert conn.status == 200
+      event_id = decode(conn)["event_id"]
+
+      assert {:ok, event} = AxonCore.EventStore.get_event(event_id)
+      assert event.origin_server_ts == backdated_ts
+    end
+
+    test "a regular (non-appservice) user's ?ts= is silently ignored, not applied or leaked into content" do
+      alice = register("alicets_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      backdated_ts = 1_000_000_000_000
+      before = System.os_time(:millisecond)
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        authed(alice.token)
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn_id}?ts=#{backdated_ts}",
+          %{"msgtype" => "m.text", "body" => "not backdated"}
+        )
+
+      assert conn.status == 200
+      event_id = decode(conn)["event_id"]
+
+      assert {:ok, event} = AxonCore.EventStore.get_event(event_id)
+      assert event.origin_server_ts >= before
+      refute Map.has_key?(event.content, "ts")
+    end
+  end
+
   test "a registration parsed from a real Complement-shaped YAML file authenticates identically" do
     yaml = """
     id: my_as_id

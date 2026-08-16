@@ -25,7 +25,14 @@ defmodule AxonWeb.EventController do
       |> put_status(400)
       |> json(%{"errcode" => "M_BAD_JSON", "error" => "Request body must be a JSON object"})
     else
-      content = Map.drop(params, ~w(room_id event_type txn_id))
+      # "ts" (timestamp massaging) is a protocol-level query param, not
+      # event content — drop it from content regardless of who sent it.
+      # Only honored for an appservice (per spec, ordinary users can't
+      # backdate history): everyone else's ?ts= is silently ignored, the
+      # same tolerance Synapse gives it, rather than erroring on an
+      # otherwise-harmless extra query param.
+      content = Map.drop(params, ~w(room_id event_type txn_id ts))
+      send_opts = send_event_opts(conn, params["ts"])
 
       # Reject events exceeding 65535 bytes
       case check_event_size(content) do
@@ -42,7 +49,7 @@ defmodule AxonWeb.EventController do
 
             :new ->
               with {:ok, event_id} <-
-                     RoomProcess.send_event(room_id, user_id, event_type, content) do
+                     RoomProcess.send_event(room_id, user_id, event_type, content, send_opts) do
                 record_txn(user_id, device_id, txn_id, event_id)
                 json(conn, %{"event_id" => event_id})
               end
@@ -50,6 +57,15 @@ defmodule AxonWeb.EventController do
       end
     end
   end
+
+  defp send_event_opts(%{assigns: %{is_appservice: true}}, ts) when is_binary(ts) do
+    case Integer.parse(ts) do
+      {ms, ""} -> [origin_server_ts: ms]
+      _ -> []
+    end
+  end
+
+  defp send_event_opts(_conn, _ts), do: []
 
   # PUT /_matrix/client/v3/rooms/:room_id/state/:event_type
   # PUT /_matrix/client/v3/rooms/:room_id/state/:event_type/:state_key

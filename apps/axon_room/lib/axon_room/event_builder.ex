@@ -29,7 +29,7 @@ defmodule AxonRoom.EventBuilder do
       "type" => type,
       "sender" => sender,
       "content" => content,
-      "origin_server_ts" => System.os_time(:millisecond),
+      "origin_server_ts" => Keyword.get(opts, :origin_server_ts) || System.os_time(:millisecond),
       "origin" => server_name,
       "prev_events" => prev_events,
       "auth_events" => auth_event_ids,
