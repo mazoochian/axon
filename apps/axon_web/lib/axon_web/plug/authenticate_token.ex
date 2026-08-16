@@ -21,14 +21,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
       raw_token ->
         case UserStore.validate_token(raw_token) do
           {:ok, {user_id, device_id}} ->
-            AxonSync.Presence.bump_activity(user_id)
-            UserStore.touch_device(user_id, device_id, remote_ip(conn))
-            Logger.metadata(user_id: user_id)
-
-            conn
-            |> assign(:current_user_id, user_id)
-            |> assign(:current_device_id, device_id)
-            |> assign(:current_token, raw_token)
+            finish_auth(conn, user_id, device_id, raw_token)
 
           :error ->
             authenticate_fallback(conn, raw_token)
@@ -63,7 +56,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
          device_id <- "APPSERVICE_" <> registration["id"],
          {:ok, {^target_user_id, ^device_id}} <-
            UserStore.authenticate_via_appservice(localpart, device_id, server_name) do
-      finish_auth(conn, target_user_id, device_id, raw_token)
+      finish_auth(conn, target_user_id, device_id, raw_token, is_appservice: true)
     else
       _ ->
         conn
@@ -80,7 +73,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
     "@#{registration["sender_localpart"]}:#{Application.get_env(:axon_web, :server_name, "localhost")}"
   end
 
-  defp finish_auth(conn, user_id, device_id, raw_token) do
+  defp finish_auth(conn, user_id, device_id, raw_token, opts \\ []) do
     AxonSync.Presence.bump_activity(user_id)
     UserStore.touch_device(user_id, device_id, remote_ip(conn))
     Logger.metadata(user_id: user_id)
@@ -89,6 +82,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
     |> assign(:current_user_id, user_id)
     |> assign(:current_device_id, device_id)
     |> assign(:current_token, raw_token)
+    |> assign(:is_appservice, Keyword.get(opts, :is_appservice, false))
   end
 
   defp extract_token(conn) do
