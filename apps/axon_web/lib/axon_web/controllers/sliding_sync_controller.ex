@@ -51,6 +51,7 @@ defmodule AxonWeb.SlidingSyncController do
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{EventStore, Repo}
   alias AxonSync.Manager, as: SyncManager
+  alias AxonWeb.EventController
   alias AxonWeb.SlidingSync.ConnState
   alias AxonWeb.SyncHelpers
 
@@ -307,9 +308,17 @@ defmodule AxonWeb.SlidingSyncController do
   defp build_room_entry(room_id, user_id, cfg, is_initial, dm_ids, :join) do
     timeline_limit = cfg["timeline_limit"] || 0
 
+    # Same history_visibility gate classic /sync applies to its timeline
+    # (AxonWeb.SyncController) — without it, the most-recent-N events
+    # fetched here could include events from before this user joined a
+    # room whose history_visibility is "joined"/"invited". Cheap for the
+    # common "shared"/"world_readable" case (see EventController.event_visible?/2).
     raw_timeline =
       if timeline_limit > 0 do
+        bounds = EventController.visibility_bounds(room_id, user_id)
+
         EventStore.get_recent_room_events(room_id, timeline_limit, user_id)
+        |> Enum.filter(&EventController.event_visible?(bounds, &1))
       else
         []
       end

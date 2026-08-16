@@ -30,6 +30,7 @@ defmodule AxonWeb.SyncController do
   alias AxonCore.{EventStore, Repo}
   alias AxonSync.Manager, as: SyncManager
   alias AxonSync.Presence
+  alias AxonWeb.EventController
   alias AxonWeb.SyncHelpers
 
   @default_timeline_limit 100
@@ -203,7 +204,19 @@ defmodule AxonWeb.SyncController do
     join_response =
       joined_rooms
       |> Enum.reduce(%{}, fn room_id, acc ->
-        room_events = Map.get(events_by_room, room_id, [])
+        # A joined member's timeline must not surface events from before
+        # they had access under the room's history_visibility (e.g.
+        # "joined"/"invited") — state (always sent in full, current
+        # snapshot) and past-membership rooms (`leave_response`, already
+        # bounded by their own leave_ordering) are unaffected. Cheap for
+        # the common "shared"/"world_readable" case: `event_visible?/2`
+        # short-circuits true without needing the extra ordering lookups.
+        bounds = EventController.visibility_bounds(room_id, user_id)
+
+        room_events =
+          events_by_room
+          |> Map.get(room_id, [])
+          |> Enum.filter(&EventController.event_visible?(bounds, &1))
 
         has_new_events =
           room_events != [] or SyncHelpers.has_ephemeral_change?(room_id, eph_since)
