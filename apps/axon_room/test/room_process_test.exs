@@ -509,6 +509,81 @@ defmodule AxonRoom.RoomProcessTest do
 
       assert {:ok, _} = RoomProcess.apply_remote_event(room_id, forked_pdu)
     end
+
+    # Reproduces Complement's TestNetworkPartitionOrdering shape: a remote
+    # server creates an event (single prev_event, no merge) *before* several
+    # further local events are sent, then only transmits it afterward — by
+    # the time axon receives it, its lone prev_event is several generations
+    # behind the current head. Unlike the merge-point test above (two
+    # prev_events), this is the single-prev_event "we're behind" fork that
+    # StateResolver.needs_resolution?/2 has its own unit coverage for; this
+    # test instead checks the full apply_remote_event/2 path actually
+    # accepts and applies such an event end-to-end, rather than silently
+    # dropping it (a silent drop here would explain the event never
+    # reaching affected users' /sync, with no error logged anywhere: /send
+    # transactions always 200 per-PDU regardless of per-event outcome, and
+    # rejection is only ever logged at :debug).
+    test "a late-arriving PDU whose single prev_event is several generations behind our head is still applied" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      remote_user = "@remote3:federated.example"
+      {joined_at_id, joined_at_depth} = RoomProcess.get_position(room_id)
+
+      join_pdu = %{
+        "event_id" => "$latejoin_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => joined_at_depth + 1,
+        "prev_events" => [joined_at_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, _} = RoomProcess.apply_remote_event(room_id, join_pdu)
+      {fork_point_id, fork_depth} = RoomProcess.get_position(room_id)
+
+      # Advance the head several generations via ordinary local sends —
+      # exactly what "alice.SendEventSynced" x4 does in the Complement test
+      # before the remote's late event ever arrives.
+      for i <- 1..4 do
+        {:ok, _} =
+          RoomProcess.send_event(room_id, creator, "m.room.message", %{"body" => "event #{i}"})
+      end
+
+      # The remote event was built against the room as it stood at
+      # fork_point_id — it has no idea the 4 local events above exist.
+      late_pdu = %{
+        "event_id" => "$late_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => remote_user,
+        "content" => %{"body" => "Event 1'"},
+        "depth" => fork_depth + 1,
+        "prev_events" => [fork_point_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, late_event_id} = RoomProcess.apply_remote_event(room_id, late_pdu)
+      assert late_event_id == late_pdu["event_id"]
+
+      {:ok, stored} = AxonCore.EventStore.get_event(late_event_id)
+      refute stored.rejected, "late-arriving forked PDU was rejected instead of applied"
+      refute stored.soft_failed, "late-arriving forked PDU was soft-failed instead of applied"
+
+      # A normal local send afterward must still work — the room isn't left
+      # in a broken state by having processed the fork.
+      assert {:ok, _} =
+               RoomProcess.send_event(room_id, creator, "m.room.message", %{"body" => "after"})
+    end
   end
 
   describe "stop_if_running/1" do

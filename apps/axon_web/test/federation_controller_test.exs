@@ -876,6 +876,48 @@ defmodule AxonWeb.FederationControllerTest do
       assert new_last_event_id == pdu["event_id"]
     end
 
+    # Reproduces Complement's TestNetworkPartitionOrdering shape end-to-end
+    # over real HTTP (signature verification + AxonFederation.Backfill's
+    # gap-check included, unlike AxonRoom.RoomProcessTest's direct-call
+    # coverage of the same fork): a remote event whose single prev_event is
+    # a known, already-applied ancestor several generations behind the
+    # current head (not missing — a genuine DAG fork, not a gap) must still
+    # be accepted, not silently soft-failed.
+    test "a PDU whose single prev_event is a known ancestor several generations behind our head is accepted, not soft-failed" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+
+      {fork_point_id, fork_depth} = RoomProcess.get_position(room_id)
+
+      for i <- 1..4 do
+        {:ok, _} =
+          RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "event #{i}"})
+      end
+
+      late_pdu =
+        signed_remote_event(%{
+          "event_id" => "$netpartition_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"body" => "Event 1'"},
+          "depth" => fork_depth + 1,
+          "prev_events" => [fork_point_id],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      conn = signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [late_pdu]})
+
+      assert conn.status == 200
+
+      {:ok, stored} = EventStore.get_event(late_pdu["event_id"])
+      refute stored.rejected, "late-arriving forked PDU was rejected instead of applied"
+      refute stored.soft_failed, "late-arriving forked PDU was soft-failed instead of applied"
+    end
+
     test "a duplicate txn_id is idempotent — replayed without reprocessing" do
       owner = new_local_user("owner")
       {:ok, _room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
