@@ -374,10 +374,30 @@ defmodule AxonWeb.SyncController do
       end
 
     prev =
-      if limited and tl_events != [] do
-        Integer.to_string(hd(tl_events).stream_ordering - 1)
-      else
-        "0"
+      cond do
+        limited and tl_events != [] ->
+          # There's earlier history this response didn't include —
+          # point to just before it, so backward /messages pagination
+          # picks up where this chunk left off.
+          Integer.to_string(hd(tl_events).stream_ordering - 1)
+
+        tl_events != [] ->
+          # Not limited: every event this room has is already in
+          # `tl_events`. There's nothing earlier to page to, but this
+          # token is also the room's contribution to a `GET
+          # /members?at=` point-in-time query (see
+          # EventStore.get_room_members_at/3's `<=` semantics) — it
+          # must resolve to "membership as observed in *this* response"
+          # rather than "before this room existed", or every full
+          # initial sync hands out a token that answers every `at=`
+          # query with an empty chunk. The tail (most recent) event's
+          # own ordering is the right boundary for that: inclusive of
+          # everything this response actually showed, exclusive of
+          # anything that happens afterward (e.g. a later join).
+          Integer.to_string(List.last(tl_events).stream_ordering)
+
+        true ->
+          "0"
       end
 
     {full_state, Enum.map(tl_events, &EventStore.event_to_map/1), limited, prev}
@@ -455,13 +475,21 @@ defmodule AxonWeb.SyncController do
         []
       end
 
-    _ = since_ordering
-
     prev =
-      if limited and tl_events != [] do
-        Integer.to_string(hd(tl_events).stream_ordering - 1)
-      else
-        "0"
+      cond do
+        limited and tl_events != [] ->
+          Integer.to_string(hd(tl_events).stream_ordering - 1)
+
+        tl_events != [] ->
+          # Not limited: see build_initial_room_data/4's matching branch —
+          # same "this token must mean *as of this response*" reasoning.
+          Integer.to_string(List.last(tl_events).stream_ordering)
+
+        true ->
+          # No events in this room's window at all (only got here for
+          # an ephemeral-only change) — the response's own snapshot is
+          # unchanged from where the client already was.
+          Integer.to_string(since_ordering)
       end
 
     {state_events, Enum.map(tl_events, &EventStore.event_to_map/1), limited, prev}

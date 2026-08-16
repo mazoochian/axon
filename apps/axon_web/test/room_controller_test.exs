@@ -244,6 +244,75 @@ defmodule AxonWeb.RoomControllerTest do
       assert current_bob["membership"] == "leave"
     end
 
+    # Regression (Complement TestGetRoomMembersAtPoint): a room's own
+    # `timeline.prev_batch` (as opposed to the top-level `next_batch` the
+    # test above uses) was hardcoded to "0" whenever that sync response
+    # wasn't `limited` — which every small, non-truncated room's sync
+    # always is. `at=0` then always resolved to "before this room's very
+    # first event", so `?members?at=<a room's own prev_batch>` came back
+    # empty instead of the membership actually visible in that response.
+    test "members?at=<a room's own sync prev_batch> returns membership as of that snapshot" do
+      alice = register("alice_pb_#{System.unique_integer([:positive])}")
+      bob = register("bob_pb_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      txn = "txn_#{System.unique_integer([:positive])}"
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn}", %{
+        "msgtype" => "m.text",
+        "body" => "Hello world!"
+      })
+
+      sync_body = authed(alice.token) |> get("/_matrix/client/v3/sync") |> decode()
+      prev_batch = get_in(sync_body, ["rooms", "join", room_id, "timeline", "prev_batch"])
+      refute prev_batch == "0"
+
+      join(bob.token, room_id)
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/members?at=#{prev_batch}")
+
+      state_keys = decode(conn)["chunk"] |> Enum.map(& &1["state_key"])
+      assert alice.user_id in state_keys
+      refute bob.user_id in state_keys
+    end
+
+    # Regression (Complement TestLeftRoomFixture / members_for_a_departed_room,
+    # SPEC-216): GET /members with no `at` always answered with current, live
+    # membership — so a departed member asking "who was here" saw anyone who
+    # joined *after* they left. Per spec, no `at` + a requester who has left
+    # (or been banned) should default to membership as of when they left.
+    test "members with no ?at, for a departed requester, excludes members who joined after they left" do
+      alice = register("alice_dep_#{System.unique_integer([:positive])}")
+      bob = register("bob_dep_#{System.unique_integer([:positive])}")
+      charlie = register("charlie_dep_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join(bob.token, room_id)
+
+      authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
+
+      join(charlie.token, room_id)
+
+      conn = authed(bob.token) |> get("/_matrix/client/v3/rooms/#{room_id}/members")
+      chunk = decode(conn)["chunk"]
+      state_keys = Enum.map(chunk, & &1["state_key"])
+
+      assert alice.user_id in state_keys
+      assert bob.user_id in state_keys
+      refute charlie.user_id in state_keys
+
+      bob_entry = Enum.find(chunk, &(&1["state_key"] == bob.user_id))
+      assert bob_entry["membership"] == "leave"
+
+      # A currently-joined requester is unaffected: still gets live membership.
+      current_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/members")
+      current_keys = decode(current_conn)["chunk"] |> Enum.map(& &1["state_key"])
+      assert charlie.user_id in current_keys
+    end
+
     test "joined_members requires the requester to be joined" do
       alice = register("alice_#{System.unique_integer([:positive])}")
       bob = register("bob_#{System.unique_integer([:positive])}")
@@ -390,6 +459,7 @@ defmodule AxonWeb.RoomControllerTest do
     test "resolves the remote alias via a correctly query-encoded federation lookup" do
       port = 19_460
       server_name = "fake-roomjoin-alias.test"
+
       start_supervised!({AxonFederation.FakeRemoteMatrixServer, port: port, server_name: server_name})
 
       Application.put_env(:axon_federation, :server_overrides, %{

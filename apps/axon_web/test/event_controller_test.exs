@@ -480,6 +480,136 @@ defmodule AxonWeb.EventControllerTest do
     end
   end
 
+  describe "point-in-time state/messages for a departed member (Complement TestLeftRoomFixture, SPEC-216)" do
+    # Regression: GET /state/:type/:state_key (and /state) routed every
+    # request through RoomProcess, which only ever holds the room's
+    # *live* current state — a member who left before some later state
+    # change (a name change, some other bit of state) saw the room's
+    # current value anyway, not the value as of when they left. Per spec
+    # a departed member should see the room frozen at their leave point.
+    test "get_state_event/2 returns the value as of when a departed member left, not the current value" do
+      alice = register("alice_depstate_#{System.unique_integer([:positive])}")
+      bob = register("bob_depstate_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join_room(bob.token, room_id)
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/m.room.name/", %{"name" => "before"})
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/madeup.test.state/", %{"body" => "before"})
+
+      leave_room(bob.token, room_id)
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/m.room.name/", %{"name" => "after"})
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/madeup.test.state/", %{"body" => "after"})
+
+      bob_name =
+        authed(bob.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.name/")
+
+      assert bob_name.status == 200
+      assert decode(bob_name)["name"] == "before"
+
+      bob_madeup =
+        authed(bob.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/madeup.test.state/")
+
+      assert bob_madeup.status == 200
+      assert decode(bob_madeup)["body"] == "before"
+
+      # Alice, still joined, gets the live current value.
+      alice_name =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.name/")
+
+      assert decode(alice_name)["name"] == "after"
+    end
+
+    test "get_state/2 (full room state) is frozen at a departed member's leave point too" do
+      alice = register("alice_depstatefull_#{System.unique_integer([:positive])}")
+      bob = register("bob_depstatefull_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join_room(bob.token, room_id)
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/m.room.name/", %{"name" => "before"})
+
+      leave_room(bob.token, room_id)
+
+      authed(alice.token)
+      |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/m.room.name/", %{"name" => "after"})
+
+      conn = authed(bob.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state")
+      assert conn.status == 200
+
+      name_event = decode(conn) |> Enum.find(&(&1["type"] == "m.room.name"))
+      assert name_event["content"]["name"] == "before"
+
+      # Bob's own leave event is part of the state as of his leave point.
+      bob_member =
+        decode(conn)
+        |> Enum.find(&(&1["type"] == "m.room.member" and &1["state_key"] == bob.user_id))
+
+      assert bob_member["content"]["membership"] == "leave"
+    end
+
+    # Regression: EventStore.get_messages/4's dir=b query is exclusive of
+    # its `from_ordering` boundary by design (see event_store_test.exs's
+    # `stream_ordering + 1` convention). A departed member's own leave
+    # event is very often exactly that boundary — a `from` token lifted
+    # from their own /sync `next_batch` right after leaving carries their
+    # leave event's own stream_ordering, since that was the newest event
+    # ever delivered to them. Left unhandled, the exclusive boundary
+    # silently dropped that one legitimate, already-seen event off a
+    # backward /messages page.
+    test "get_messages/2 dir=b from a departed member's own post-leave sync token includes their leave event" do
+      alice = register("alice_depmsg_#{System.unique_integer([:positive])}")
+      bob = register("bob_depmsg_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join_room(bob.token, room_id)
+      send_message(alice.token, room_id, %{"body" => "M1"})
+      send_message(alice.token, room_id, %{"body" => "M2"})
+      leave_room(bob.token, room_id)
+
+      bob_since =
+        authed(bob.token)
+        |> get("/_matrix/client/v3/sync")
+        |> decode()
+        |> Map.fetch!("next_batch")
+
+      # Events after bob left must not leak into his page even though the
+      # boundary nudge above admits a couple of extra rows to the raw fetch.
+      send_message(alice.token, room_id, %{"body" => "M3"})
+
+      conn =
+        authed(bob.token)
+        |> get(
+          "/_matrix/client/v3/rooms/#{room_id}/messages?dir=b&limit=3&from=#{URI.encode_www_form(bob_since)}"
+        )
+
+      assert conn.status == 200
+      chunk = decode(conn)["chunk"]
+
+      assert Enum.any?(
+               chunk,
+               &(&1["type"] == "m.room.member" and &1["state_key"] == bob.user_id and
+                   &1["content"]["membership"] == "leave")
+             )
+
+      bodies = chunk |> Enum.map(&get_in(&1, ["content", "body"])) |> Enum.reject(&is_nil/1)
+      assert "M1" in bodies
+      assert "M2" in bodies
+      refute "M3" in bodies
+    end
+  end
+
   # Regression: GET /event/{id} used the shared, unfiltered
   # AxonCore.EventStore.get_event/1 (no `rejected`/`soft_failed` check at
   # all — unlike every other client-facing query in that module), so an

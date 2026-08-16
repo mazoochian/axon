@@ -996,6 +996,53 @@ defmodule AxonCore.EventStore do
     end)
   end
 
+  @doc """
+  Room state *as of* `stream_ordering` — `get_current_state/1`'s
+  point-in-time counterpart, generalizing `get_room_members_at/3`'s
+  DISTINCT ON pattern (latest row per group, capped by ordering) from
+  `m.room.member` alone to every `(type, state_key)` pair. Backs GET
+  /rooms/:id/state for a user who has left or been banned (per spec:
+  such a request answers with the state as of when they left, not
+  current state — see `AxonWeb.EventController.get_state/2`).
+  """
+  def get_room_state_at(room_id, stream_ordering) do
+    Repo.all(
+      from(e in Event,
+        where:
+          e.room_id == ^room_id and not is_nil(e.state_key) and
+            e.stream_ordering <= ^stream_ordering and
+            not e.rejected and not e.soft_failed,
+        order_by: [asc: e.type, asc: e.state_key, desc: e.stream_ordering],
+        distinct: [asc: e.type, asc: e.state_key]
+      )
+    )
+  end
+
+  @doc """
+  The state event for `{room_id, type, state_key}` *as of* `stream_ordering`
+  — `get_state_event/3`'s point-in-time counterpart, same rationale as
+  `get_room_state_at/2` but for a single key (backs GET
+  /rooms/:id/state/:type/:state_key for a departed member).
+  """
+  def get_state_event_at(room_id, type, state_key, stream_ordering) do
+    result =
+      Repo.one(
+        from(e in Event,
+          where:
+            e.room_id == ^room_id and e.type == ^type and e.state_key == ^state_key and
+              e.stream_ordering <= ^stream_ordering and
+              not e.rejected and not e.soft_failed,
+          order_by: [desc: e.stream_ordering],
+          limit: 1
+        )
+      )
+
+    case result do
+      nil -> {:error, :not_found}
+      event -> {:ok, event}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Membership queries
   # ---------------------------------------------------------------------------
