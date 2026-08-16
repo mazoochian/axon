@@ -610,6 +610,109 @@ defmodule AxonWeb.EventControllerTest do
     end
   end
 
+  # Regression (Complement TestNetworkPartitionOrdering): a room's
+  # `/sync` `timeline.prev_batch` was computed as
+  # `hd(tl_events).stream_ordering - 1`. EventStore.get_messages/4's
+  # dir=b bound (`stream_ordering < from_ordering`) is already exclusive
+  # of `from_ordering` itself, so that extra `- 1` over-excluded by one:
+  # it silently dropped the single room event immediately preceding the
+  # returned timeline off the very next backward `/messages` page.
+  #
+  # This reproduces the Complement scenario directly: two local users
+  # (alice, bob) plus a simulated remote member (via
+  # `RoomProcess.apply_remote_event/2`, same pattern as this module's
+  # other federation-shaped regressions) who forks an event off an
+  # earlier point in the DAG than the local room head, then only
+  # "arrives" after several local events already advanced past it —
+  # network-partition-style. Depth-tying between the forked event's
+  # later local siblings (events 5-7) and the earlier ones (1-4) is a
+  # separate concern (see event_store_test.exs's "get_messages backwards
+  # (dir=b) depth ordering") — this test isolates the boundary/off-by-one
+  # bug by keeping the window (`from` prev_batch) to exactly the four
+  # events sent *before* the fork resolves, where depths are already
+  # strictly increasing and can't mask a boundary-exclusion bug.
+  describe "prev_batch -> /messages dir=b pagination boundary (Complement TestNetworkPartitionOrdering)" do
+    test "a backward page from sync's prev_batch includes the event right before the timeline window, not just older ones" do
+      alice = register("alice_netpart_#{System.unique_integer([:positive])}")
+      bob = register("bob_netpart_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join_room(bob.token, room_id)
+
+      remote_user = "@charlie:federated.example"
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      charlie_join_pdu = %{
+        "event_id" => "$netpart_charlie_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      {:ok, charlie_join_id} = RoomProcess.apply_remote_event(room_id, charlie_join_pdu)
+      {_, charlie_depth} = RoomProcess.get_position(room_id)
+
+      # Built by the remote server against ITS OWN known head (charlie's
+      # own join) -- it doesn't yet know about bob's local join, matching
+      # the real race: bob's join federates out asynchronously and this
+      # event is created before that transaction is guaranteed to land.
+      event1prime_pdu = %{
+        "event_id" => "$netpart_prime_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => remote_user,
+        "content" => %{"body" => "Event 1'"},
+        "depth" => charlie_depth + 1,
+        "prev_events" => [charlie_join_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      bob_since =
+        authed(bob.token)
+        |> get("/_matrix/client/v3/sync")
+        |> decode()
+        |> Map.fetch!("next_batch")
+
+      event_ids = for i <- 1..4, do: send_message(alice.token, room_id, %{"body" => "event #{i}"})
+
+      {:ok, _} = RoomProcess.apply_remote_event(room_id, event1prime_pdu)
+
+      for i <- 5..7, do: send_message(alice.token, room_id, %{"body" => "event #{i}"})
+
+      filter = Jason.encode!(%{"room" => %{"timeline" => %{"limit" => 4}}})
+
+      sync_body =
+        authed(bob.token)
+        |> get(
+          "/_matrix/client/v3/sync?since=#{URI.encode_www_form(bob_since)}&filter=#{URI.encode_www_form(filter)}"
+        )
+        |> decode()
+
+      prev_batch = get_in(sync_body, ["rooms", "join", room_id, "timeline", "prev_batch"])
+      refute is_nil(prev_batch)
+
+      conn =
+        authed(alice.token)
+        |> get(
+          "/_matrix/client/v3/rooms/#{room_id}/messages?dir=b&limit=4&from=#{URI.encode_www_form(prev_batch)}"
+        )
+
+      assert conn.status == 200
+      got_ids = decode(conn)["chunk"] |> Enum.map(& &1["event_id"])
+
+      assert got_ids == Enum.reverse(event_ids)
+    end
+  end
+
   # Regression: GET /event/{id} used the shared, unfiltered
   # AxonCore.EventStore.get_event/1 (no `rejected`/`soft_failed` check at
   # all — unlike every other client-facing query in that module), so an

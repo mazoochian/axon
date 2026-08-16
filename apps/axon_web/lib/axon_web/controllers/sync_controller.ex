@@ -376,10 +376,23 @@ defmodule AxonWeb.SyncController do
     prev =
       cond do
         limited and tl_events != [] ->
-          # There's earlier history this response didn't include —
-          # point to just before it, so backward /messages pagination
-          # picks up where this chunk left off.
-          Integer.to_string(hd(tl_events).stream_ordering - 1)
+          # There's earlier history this response didn't include — point
+          # to just before it, so backward /messages pagination picks up
+          # where this chunk left off.
+          #
+          # This must be `hd(tl_events).stream_ordering` itself, NOT
+          # `- 1` (Complement: TestNetworkPartitionOrdering). EventStore.
+          # get_messages/4's dir=b bound is `stream_ordering <
+          # from_ordering` — already exclusive of `from_ordering` — so
+          # passing the earliest timeline event's own ordering already
+          # excludes that event and admits everything strictly before
+          # it, which is exactly "pick up where this chunk left off".
+          # Subtracting 1 first over-excludes by one: it silently drops
+          # the single room event immediately preceding this timeline
+          # window off the very next backward page (a client using this
+          # prev_batch to paginate never sees that event, in `/messages`
+          # or anywhere else — /sync only handed it the newer window).
+          Integer.to_string(hd(tl_events).stream_ordering)
 
         tl_events != [] ->
           # Not limited: every event this room has is already in
@@ -446,7 +459,12 @@ defmodule AxonWeb.SyncController do
 
     prev =
       if tl_events != [] do
-        Integer.to_string(hd(tl_events).stream_ordering - 1)
+        # No `- 1` — see build_initial_room_data/4's matching branch for
+        # why: get_messages/4's dir=b bound is already exclusive of
+        # `from_ordering`, so the earliest timeline event's own ordering
+        # is already the correct "everything strictly before here"
+        # pagination boundary (Complement: TestNetworkPartitionOrdering).
+        Integer.to_string(hd(tl_events).stream_ordering)
       else
         if join_event, do: Integer.to_string(join_event.stream_ordering), else: "0"
       end
@@ -478,7 +496,12 @@ defmodule AxonWeb.SyncController do
     prev =
       cond do
         limited and tl_events != [] ->
-          Integer.to_string(hd(tl_events).stream_ordering - 1)
+          # No `- 1` — same boundary this function's own `cutoff` above
+          # already uses with a strict `<`, and the same reasoning as
+          # build_initial_room_data/4's matching branch: get_messages/4's
+          # dir=b bound is already exclusive of `from_ordering`
+          # (Complement: TestNetworkPartitionOrdering).
+          Integer.to_string(hd(tl_events).stream_ordering)
 
         tl_events != [] ->
           # Not limited: see build_initial_room_data/4's matching branch —
