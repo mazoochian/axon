@@ -52,6 +52,17 @@ if config_env() == :prod do
       account_management_url: System.get_env("OIDC_ACCOUNT_MANAGEMENT_URL")
   end
 
+  # Open self-registration (`POST /register` with no auth) — off unless
+  # explicitly turned on, matching Synapse's own `enable_registration: false`
+  # safe default (any public non-OIDC deployment left registration wide open,
+  # rate-limited only, otherwise). Set REGISTRATION_ENABLED=true to allow
+  # public self-registration; leave unset/false and AuthController rejects
+  # with 403 M_FORBIDDEN, same as when OIDC (config above) handles
+  # registration instead. The _synapse/admin/v1/register shared-secret
+  # endpoint is unaffected either way.
+  config :axon_web, :registration,
+    enabled: System.get_env("REGISTRATION_ENABLED", "false") == "true"
+
   # Optional — leave AXON_APPSERVICE_DIR unset outside Complement.
   # complement/start.sh sets this to /complement/appservice, the fixed
   # path Complement copies one Synapse-style registration YAML into per

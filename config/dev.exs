@@ -29,6 +29,12 @@ config :libcluster, topologies: []
 
 config :logger, level: :debug
 
+# Open self-registration — enabled for local `mix phx.server` so a fresh dev
+# database is usable without extra setup. Real deployments default this off
+# in prod, matching Synapse's `enable_registration: false`; see
+# config/runtime.exs.
+config :axon_web, :registration, enabled: true
+
 # Delegated OAuth2/OIDC auth (MSC3861) — only turns on if OIDC_ISSUER is set
 # in the environment, so plain `mix phx.server` still uses password login.
 if System.get_env("OIDC_ISSUER") do

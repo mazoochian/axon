@@ -11,13 +11,18 @@ defmodule AxonWeb.AuthController do
 
   # POST /_matrix/client/v3/register
   def register(conn, params) do
-    if AxonWeb.Oidc.enabled?() do
-      oidc_disabled_response(
-        conn,
-        "Registration is handled by the configured Authorization Server"
-      )
-    else
-      do_register(conn, params)
+    cond do
+      AxonWeb.Oidc.enabled?() ->
+        oidc_disabled_response(
+          conn,
+          "Registration is handled by the configured Authorization Server"
+        )
+
+      not registration_enabled?() ->
+        registration_disabled_response(conn)
+
+      true ->
+        do_register(conn, params)
     end
   end
 
@@ -93,6 +98,14 @@ defmodule AxonWeb.AuthController do
 
   # GET /_matrix/client/v3/register/available
   def register_available(conn, params) do
+    if not registration_enabled?() do
+      registration_disabled_response(conn)
+    else
+      do_register_available(conn, params)
+    end
+  end
+
+  defp do_register_available(conn, params) do
     username = params["username"]
 
     cond do
@@ -330,6 +343,19 @@ defmodule AxonWeb.AuthController do
 
   defp oidc_disabled_response(conn, message) do
     conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => message})
+  end
+
+  # config :axon_web, :registration, enabled: ... — off by default in prod
+  # (Synapse's own enable_registration: false safe default), on in dev/test.
+  # See config/config.exs, config/dev.exs, config/test.exs, config/runtime.exs.
+  defp registration_enabled?, do: Application.fetch_env!(:axon_web, :registration)[:enabled]
+
+  # Same status/errcode/message Synapse returns from both RegisterRestServlet
+  # and UsernameAvailabilityRestServlet when enable_registration is false.
+  defp registration_disabled_response(conn) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Registration has been disabled"})
   end
 
   # POST /_matrix/client/v3/logout

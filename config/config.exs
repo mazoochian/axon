@@ -17,6 +17,15 @@ config :axon_web, :oidc,
   client_auth_method: "client_secret_basic",
   account_management_url: nil
 
+# Open self-registration (`POST /register` with no auth) — off by default,
+# matching Synapse's own `enable_registration: false` safe default. When
+# disabled (and OIDC isn't handling registration instead), AuthController
+# rejects with the same 403 M_FORBIDDEN "Registration has been disabled"
+# Synapse returns. See config/runtime.exs for how a real deployment turns
+# this on via REGISTRATION_ENABLED, and config/dev.exs / config/test.exs
+# for why it's kept on there.
+config :axon_web, :registration, enabled: false
+
 # Ecto repo
 config :axon_core, AxonCore.Repo,
   adapter: Ecto.Adapters.Postgres,
