@@ -394,6 +394,9 @@ defmodule AxonWeb.Router do
       :get_relations
     )
 
+    # Threads (stable spec, formerly MSC3856)
+    get("/v1/rooms/:room_id/threads", EventController, :get_threads)
+
     # Spaces — Phase 5
     get("/v1/rooms/:room_id/hierarchy", SpaceController, :hierarchy)
     get("/v1/room_summary/:room_id_or_alias", SpaceController, :room_summary)

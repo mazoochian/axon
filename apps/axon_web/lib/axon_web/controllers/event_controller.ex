@@ -670,6 +670,59 @@ defmodule AxonWeb.EventController do
     end
   end
 
+  # GET /_matrix/client/v1/rooms/:room_id/threads
+  #
+  # Stable spec endpoint (formerly MSC3856). Thread root events, most
+  # recently active first — "active" meaning the latest reply, not the
+  # root's own position, per `EventStore.get_thread_roots/3`.
+  def get_threads(conn, %{"room_id" => room_id} = params) do
+    user_id = conn.assigns.current_user_id
+
+    cond do
+      member_or_forgotten?(room_id, user_id) ->
+        conn
+        |> put_status(403)
+        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+
+      params["include"] not in [nil, "all", "participated"] ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_INVALID_PARAM",
+          "error" => "Query parameter include must be one of \"all\" or \"participated\""
+        })
+
+      true ->
+        limit = String.to_integer(params["limit"] || "10")
+        from_token = params["from"]
+
+        from_ordering =
+          parse_token(from_token) || EventStore.room_max_stream_ordering(room_id) + 1
+
+        participated_user_id = if params["include"] == "participated", do: user_id
+
+        roots_with_activity =
+          EventStore.get_thread_roots(room_id, from_ordering, limit,
+            participated_user_id: participated_user_id
+          )
+
+        chunk =
+          roots_with_activity
+          |> Enum.map(fn {root, _activity} -> EventStore.event_to_map(root) end)
+          |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
+
+        next_batch =
+          case roots_with_activity do
+            [] -> nil
+            _ -> roots_with_activity |> List.last() |> elem(1) |> Integer.to_string()
+          end
+
+        resp = %{"chunk" => chunk}
+        resp = if next_batch, do: Map.put(resp, "next_batch", next_batch), else: resp
+        json(conn, resp)
+    end
+  end
+
   # PUT /_matrix/client/v3/rooms/:room_id/redact/:event_id/:txn_id
   def redact(
         conn,

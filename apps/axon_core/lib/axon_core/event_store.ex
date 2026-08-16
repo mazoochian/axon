@@ -699,6 +699,64 @@ defmodule AxonCore.EventStore do
   end
 
   @doc """
+  Thread root events in `room_id` — a "root" is any event that has at
+  least one other (non-rejected, non-soft-failed) event related to it via
+  an `m.thread` relation, the same notion `bundle_relations/3`'s
+  `m.thread` bundle already uses, reused here rather than reinvented.
+  Ordered by most-recently-active thread first: the *latest* child
+  event's `stream_ordering`, not the root's own position, which is why
+  this can't just reuse `get_messages/4`'s plain timeline ordering.
+
+  `from_ordering`/`limit` paginate the same way `get_messages/4` and
+  `get_relations/7` do: only threads whose latest-activity ordering is
+  strictly less than `from_ordering` are returned, so the last returned
+  activity ordering makes a valid `from` for the next page. There's no
+  `dir` param — "most-recently-active first" is the only order the
+  endpoint (`GET /rooms/:room_id/threads`) defines.
+
+  `opts[:participated_user_id]`, if given, restricts to threads where
+  that user sent at least one `m.thread`-related child event — again the
+  same participation notion `current_user_participated` already computes,
+  so the list endpoint and the per-event bundle can't drift apart on what
+  "participated" means.
+
+  Returns a list of `{root_event, latest_activity_ordering}` pairs.
+  """
+  def get_thread_roots(room_id, from_ordering, limit, opts \\ []) do
+    participated_user_id = Keyword.get(opts, :participated_user_id)
+
+    activity =
+      from(e in Event,
+        where:
+          e.room_id == ^room_id and not e.rejected and not e.soft_failed and
+            fragment("?->'m.relates_to'->>'rel_type'", e.content) == "m.thread",
+        group_by: fragment("?->'m.relates_to'->>'event_id'", e.content),
+        select: %{
+          root_event_id: fragment("?->'m.relates_to'->>'event_id'", e.content),
+          latest_ordering: max(e.stream_ordering)
+        }
+      )
+
+    activity =
+      if participated_user_id do
+        from(e in activity, having: fragment("bool_or(? = ?)", e.sender, ^participated_user_id))
+      else
+        activity
+      end
+
+    from(a in subquery(activity),
+      join: root in Event,
+      on: root.event_id == a.root_event_id,
+      where:
+        a.latest_ordering < ^from_ordering and not root.rejected and not root.soft_failed,
+      order_by: [desc: a.latest_ordering],
+      limit: ^limit,
+      select: {root, a.latest_ordering}
+    )
+    |> Repo.all()
+  end
+
+  @doc """
   Full-text search over `m.room.message` bodies across `room_ids`
   (for `POST /search`). Returns `{[{event_id, rank}], total_count}`,
   ordered by `order_by` ("rank" or "recent").
