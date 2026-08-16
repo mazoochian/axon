@@ -639,6 +639,12 @@ defmodule AxonWeb.RoomController do
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/members
+  #
+  # `at` (a sync batch token, same shape as /sync's next_batch) asks for
+  # membership *as of* that point rather than current — see
+  # EventStore.get_room_members_at/3 for why this is a real point-in-time
+  # query, not an approximation, despite axon otherwise only ever
+  # materializing current state.
   def members(conn, %{"room_id" => room_id} = params) do
     filter_memberships =
       case params["membership"] do
@@ -652,21 +658,35 @@ defmodule AxonWeb.RoomController do
         m -> List.delete(filter_memberships, m)
       end
 
-    members = EventStore.get_room_members(room_id, filter_memberships)
-
     chunk =
-      Enum.map(members, fn m ->
-        %{
-          "content" => %{"membership" => m.membership},
-          "membership" => m.membership,
-          "room_id" => m.room_id,
-          "sender" => m.sender,
-          "state_key" => m.user_id,
-          "type" => "m.room.member"
-        }
-      end)
+      case params["at"] do
+        nil ->
+          EventStore.get_room_members(room_id, filter_memberships)
+          |> Enum.map(fn m ->
+            member_chunk_entry(room_id, m.user_id, m.sender, m.membership)
+          end)
+
+        token ->
+          stream_ordering = elem(AxonWeb.SyncHelpers.parse_token(token), 0)
+
+          EventStore.get_room_members_at(room_id, stream_ordering, filter_memberships)
+          |> Enum.map(fn e ->
+            member_chunk_entry(room_id, e.state_key, e.sender, e.content["membership"])
+          end)
+      end
 
     json(conn, %{"chunk" => chunk})
+  end
+
+  defp member_chunk_entry(room_id, user_id, sender, membership) do
+    %{
+      "content" => %{"membership" => membership},
+      "membership" => membership,
+      "room_id" => room_id,
+      "sender" => sender,
+      "state_key" => user_id,
+      "type" => "m.room.member"
+    }
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/joined_members

@@ -1086,6 +1086,41 @@ defmodule AxonCore.EventStore do
     )
   end
 
+  @doc """
+  Room membership *as of* `stream_ordering` — the state a `GET
+  .../members?at=<token>` request from a client actually asks for (`at`
+  decodes to a stream_ordering boundary — see
+  `AxonWeb.SyncHelpers.parse_token/1`), as opposed to `get_room_members/2`,
+  which only ever answers with current, live membership.
+
+  `room_memberships` is a materialized *current*-state table with no
+  history — it's overwritten in place on every membership change, so it
+  structurally cannot answer this. Every event is kept forever, though
+  (append-only), so this is a real point-in-time query rather than an
+  approximation: for each user, the latest `m.room.member` event with
+  `stream_ordering <= boundary` — the same "current state, but as of an
+  earlier stream position" computation current_room_state itself would
+  have held at that moment. `DISTINCT ON` (via `distinct: [asc: ...]`
+  paired with a matching `order_by` prefix) is the direct Postgres
+  idiom for "latest row per group," not a full-room state resolution
+  replay — cheap enough to run per-request rather than needing its own
+  materialized history the way Synapse's `state_groups` do.
+  """
+  def get_room_members_at(room_id, stream_ordering, memberships \\ ["join"]) do
+    Repo.all(
+      from(e in Event,
+        where:
+          e.room_id == ^room_id and e.type == "m.room.member" and
+            not is_nil(e.state_key) and
+            e.stream_ordering <= ^stream_ordering and
+            not e.rejected and not e.soft_failed,
+        order_by: [asc: e.state_key, desc: e.stream_ordering],
+        distinct: [asc: e.state_key]
+      )
+    )
+    |> Enum.filter(&(Map.get(&1.content, "membership") in memberships))
+  end
+
   def get_membership(room_id, user_id) do
     case Repo.get_by(RoomMembership, room_id: room_id, user_id: user_id) do
       nil -> {:ok, nil}

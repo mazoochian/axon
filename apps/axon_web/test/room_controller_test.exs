@@ -198,6 +198,52 @@ defmodule AxonWeb.RoomControllerTest do
       refute bob.user_id in state_keys
     end
 
+    test "members?at=<token> returns membership as of that point, not current" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      bob = register("bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      before_bob_token =
+        authed(alice.token) |> get("/_matrix/client/v3/sync") |> decode() |> Map.fetch!("next_batch")
+
+      join(bob.token, room_id)
+
+      after_bob_token =
+        authed(alice.token) |> get("/_matrix/client/v3/sync") |> decode() |> Map.fetch!("next_batch")
+
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
+
+      # As of before bob joined: only alice.
+      before_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/members?at=#{before_bob_token}")
+
+      before_keys = decode(before_conn)["chunk"] |> Enum.map(& &1["state_key"])
+      assert alice.user_id in before_keys
+      refute bob.user_id in before_keys
+
+      # As of right after bob joined (but before the later kick): both,
+      # and bob still shows "join" even though he's since been kicked.
+      after_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/members?at=#{after_bob_token}")
+
+      after_chunk = decode(after_conn)["chunk"]
+      after_keys = Enum.map(after_chunk, & &1["state_key"])
+      assert alice.user_id in after_keys
+      assert bob.user_id in after_keys
+
+      bob_entry = Enum.find(after_chunk, &(&1["state_key"] == bob.user_id))
+      assert bob_entry["membership"] == "join"
+
+      # Current (no "at"): bob is leave, reflecting the kick.
+      current_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/members")
+      current_chunk = decode(current_conn)["chunk"]
+      current_bob = Enum.find(current_chunk, &(&1["state_key"] == bob.user_id))
+      assert current_bob["membership"] == "leave"
+    end
+
     test "joined_members requires the requester to be joined" do
       alice = register("alice_#{System.unique_integer([:positive])}")
       bob = register("bob_#{System.unique_integer([:positive])}")

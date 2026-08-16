@@ -267,10 +267,49 @@ defmodule AxonWeb.EventController do
           effective_ordering = invite_ordering || join_ordering
           effective_ordering != nil and event.stream_ordering >= effective_ordering
 
+        {_, m} when m in ["leave", "ban"] ->
+          can_access_as_past_member?(user_id, room_id, event, history_visibility, m)
+
         _ ->
           false
       end
     end
+  end
+
+  # A user who has left (or been banned from) a room doesn't lose access
+  # to what they legitimately already saw while a member — only to
+  # anything from after they left. Point-in-time state: whatever
+  # history_visibility would have granted a *joined* member is evaluated
+  # the same way here, just capped above by the user's own leave/ban
+  # ordering (their most recent one, if they cycled through
+  # join/leave/rejoin more than once — an intentional simplification, not
+  # per-cycle history). `current_membership` ("leave" or "ban") is passed
+  # in rather than re-derived, since it's already known to be whichever
+  # of the two is the user's *latest* membership transition — querying
+  # both and picking one would risk picking the older of the two.
+  defp can_access_as_past_member?(user_id, room_id, event, history_visibility, current_membership) do
+    leave_ordering = get_user_membership_ordering(user_id, room_id, current_membership)
+    join_ordering = get_user_membership_ordering(user_id, room_id, "join")
+
+    within_membership? =
+      leave_ordering != nil and event.stream_ordering <= leave_ordering
+
+    within_membership? and
+      case history_visibility do
+        "shared" ->
+          true
+
+        "joined" ->
+          join_ordering != nil and event.stream_ordering >= join_ordering
+
+        "invited" ->
+          invite_ordering = get_user_invite_before_join(user_id, room_id, join_ordering)
+          effective_ordering = invite_ordering || join_ordering
+          effective_ordering != nil and event.stream_ordering >= effective_ordering
+
+        _ ->
+          false
+      end
   end
 
   defp get_user_membership_ordering(user_id, room_id, membership) do

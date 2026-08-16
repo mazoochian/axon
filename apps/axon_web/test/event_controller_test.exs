@@ -57,6 +57,16 @@ defmodule AxonWeb.EventControllerTest do
     authed(token) |> get("/_matrix/client/v3/rooms/#{room_id}/event/#{URI.encode(event_id)}")
   end
 
+  defp join_room(token, room_id) do
+    conn = authed(token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})
+    assert conn.status == 200
+  end
+
+  defp leave_room(token, room_id) do
+    conn = authed(token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
+    assert conn.status == 200
+  end
+
   test "a user can redact their own event, and its content is stripped" do
     alice = register("alice_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token)
@@ -336,6 +346,84 @@ defmodule AxonWeb.EventControllerTest do
       event_ids = decode(conn)["chunk"] |> Enum.map(& &1["event_id"])
       assert without_url in event_ids
       refute with_url in event_ids
+    end
+  end
+
+  describe "get_event/2 history visibility for a user who has left the room" do
+    # Regression: can_access_event?/3's membership case had no branch for
+    # "leave" or "ban" at all — every non-"join" membership fell through
+    # to the catch-all `false`, so a user who left a room could never see
+    # ANY of its history via GET /event/{id} again, even a message sent
+    # while they were still a member and had every right to see it. A
+    # closed README "Known gaps" item ("history visibility for a user
+    # who's left a room" needs point-in-time state).
+    test "a left member can still see an event sent while they were joined (shared visibility)" do
+      alice = register("alice_hvleft1_#{System.unique_integer([:positive])}")
+      bob = register("bob_hvleft1_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join_room(bob.token, room_id)
+      event_id = send_message(alice.token, room_id, %{"body" => "while bob was here"})
+      leave_room(bob.token, room_id)
+
+      conn = get_event(bob.token, room_id, event_id)
+      assert conn.status == 200
+      assert decode(conn)["event_id"] == event_id
+    end
+
+    test "a left member cannot see an event sent after they left (shared visibility)" do
+      alice = register("alice_hvleft2_#{System.unique_integer([:positive])}")
+      bob = register("bob_hvleft2_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join_room(bob.token, room_id)
+      leave_room(bob.token, room_id)
+      event_id = send_message(alice.token, room_id, %{"body" => "after bob left"})
+
+      conn = get_event(bob.token, room_id, event_id)
+      assert conn.status == 404
+    end
+
+    test "a banned member can still see an event sent while they were joined" do
+      alice = register("alice_hvban_#{System.unique_integer([:positive])}")
+      bob = register("bob_hvban_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      join_room(bob.token, room_id)
+      event_id = send_message(alice.token, room_id, %{"body" => "while bob was here"})
+
+      ban_conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/ban", %{"user_id" => bob.user_id})
+
+      assert ban_conn.status == 200
+
+      conn = get_event(bob.token, room_id, event_id)
+      assert conn.status == 200
+      assert decode(conn)["event_id"] == event_id
+    end
+
+    test "a left member cannot see a pre-join event when visibility is 'joined'" do
+      alice = register("alice_hvjoined_#{System.unique_integer([:positive])}")
+      bob = register("bob_hvjoined_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      pre_join_event = send_message(alice.token, room_id, %{"body" => "before bob joined"})
+
+      vis_conn =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/m.room.history_visibility", %{
+          "history_visibility" => "joined"
+        })
+
+      assert vis_conn.status == 200
+
+      join_room(bob.token, room_id)
+      post_join_event = send_message(alice.token, room_id, %{"body" => "after bob joined"})
+      leave_room(bob.token, room_id)
+
+      refute get_event(bob.token, room_id, pre_join_event).status == 200
+      assert get_event(bob.token, room_id, post_join_event).status == 200
     end
   end
 end

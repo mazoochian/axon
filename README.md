@@ -16,7 +16,7 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
 - Third-party (3pid) invites have no actual email/SMS delivery — no identity-server integration exists, so the token has to reach the invitee out-of-band.
 - Sliding sync re-sends a full `SYNC` op per range on every request rather than diffing against a remembered session — spec-valid, just not bandwidth-optimal.
-- No point-in-time state resolution: `GET /rooms/{roomId}/members?at=<token>` and history visibility for a user who's left a room both need room state *as of* a specific moment, which nothing currently computes (only current state is tracked).
+- `/messages` and `/sync` don't enforce per-event history visibility for a room's *current* members beyond the basic "are you a member at all" gate — a joined member sees the room's entire retained history regardless of `history_visibility`'s `invited`/`joined` settings (a real gap, more permissive than spec strictly allows; `GET /event/{id}` enforces this correctly for both current and past members).
 
 See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 22 and counting — the roadmap as originally scoped is complete; ongoing phases are a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
 
