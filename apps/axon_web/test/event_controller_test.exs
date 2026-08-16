@@ -3,6 +3,8 @@ defmodule AxonWeb.EventControllerTest do
 
   use AxonWeb.ConnCase, async: false
 
+  alias AxonRoom.RoomProcess
+
   defp register(username) do
     conn =
       build_conn()
@@ -475,6 +477,101 @@ defmodule AxonWeb.EventControllerTest do
 
       refute get_event(bob.token, room_id, pre_join_event).status == 200
       assert get_event(bob.token, room_id, post_join_event).status == 200
+    end
+  end
+
+  # Regression: GET /event/{id} used the shared, unfiltered
+  # AxonCore.EventStore.get_event/1 (no `rejected`/`soft_failed` check at
+  # all — unlike every other client-facing query in that module), so an
+  # event that RoomProcess had correctly rejected (including the transitive
+  # case: a legitimate event whose auth_events reference an
+  # already-rejected/unknown ancestor, per any_rejected?/unknown_ids) was
+  # still served back to clients with a 200 instead of 404.
+  #
+  # Complement: TestInboundFederationRejectsEventsWithRejectedAuthEvents
+  # asserts exactly this — the outlier event 404s (it was simply never
+  # stored, a different code path entirely), but two ordinary events that
+  # list the outlier in their own auth_events must *also* 404, because they
+  # were transitively rejected. RoomProcess's rejection logic (covered by
+  # apps/axon_room/test/room_process_test.exs, "transitive auth rejection")
+  # already stored them correctly as `rejected: true`; this test covers the
+  # client read path that was failing to honor that flag.
+  describe "get_event/2 and transitively rejected events" do
+    test "a client GET 404s for an event whose auth_events reference an already-rejected event" do
+      alice = register("alice_txreject_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      # An outright-rejected ancestor: an unjoined remote sender's event
+      # fails auth checking and is stored with rejected: true.
+      rejected_id = "$rejected_ancestor_#{System.unique_integer([:positive])}"
+
+      rejected_pdu = %{
+        "event_id" => rejected_id,
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => "@intruder:remote.example",
+        "content" => %{"body" => "should not land"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "remote.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, rejected_pdu) == {:error, :not_joined}
+
+      # A perfectly ordinary event from the room's own creator, except it
+      # lists the rejected event as one of its auth_events — per spec this
+      # must itself be rejected regardless of what auth-checking against
+      # current state would otherwise say.
+      dependent_id = "$dependent_#{System.unique_integer([:positive])}"
+
+      dependent_pdu = %{
+        "event_id" => dependent_id,
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => alice.user_id,
+        "content" => %{"body" => "hi"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [rejected_id],
+        "origin" => "localhost",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, dependent_pdu) ==
+               {:error, :auth_event_rejected}
+
+      # The outlier itself was never stored under any key at all (a
+      # different code path — EventStore.unknown_ids/1 — from the
+      # already-rejected case above), so it 404s too, matching Complement's
+      # own first assertion.
+      never_seen_id = "$never_seen_outlier_#{System.unique_integer([:positive])}"
+
+      other_dependent_id = "$dependent2_#{System.unique_integer([:positive])}"
+
+      other_dependent_pdu = %{
+        "event_id" => other_dependent_id,
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => alice.user_id,
+        "content" => %{"body" => "hi again"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [never_seen_id],
+        "origin" => "localhost",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, other_dependent_pdu) ==
+               {:error, :unknown_auth_event}
+
+      assert get_event(alice.token, room_id, rejected_id).status == 404
+      assert get_event(alice.token, room_id, never_seen_id).status == 404
+      assert get_event(alice.token, room_id, dependent_id).status == 404
+      assert get_event(alice.token, room_id, other_dependent_id).status == 404
     end
   end
 end

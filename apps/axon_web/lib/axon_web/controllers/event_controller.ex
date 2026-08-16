@@ -205,7 +205,14 @@ defmodule AxonWeb.EventController do
   def get_event(conn, %{"room_id" => room_id, "event_id" => event_id}) do
     user_id = conn.assigns.current_user_id
 
-    with {:ok, event} <- EventStore.get_event(event_id) do
+    # `get_visible_event/1`, not the shared `get_event/1` — a rejected or
+    # soft-failed event (e.g. one whose auth_events transitively reference
+    # an already-rejected/unknown event, per RoomProcess's any_rejected?/
+    # unknown_ids checks) must 404 for a client the same as if it had never
+    # been stored at all. Federation's own GET /event/{id} intentionally
+    # keeps using get_event/1 instead, since peer servers walking an
+    # auth chain need to see rejected events too.
+    with {:ok, event} <- EventStore.get_visible_event(event_id) do
       if event.room_id != room_id do
         {:error, :not_found}
       else

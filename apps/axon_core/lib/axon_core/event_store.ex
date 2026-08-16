@@ -478,6 +478,31 @@ defmodule AxonCore.EventStore do
     end
   end
 
+  @doc """
+  Like `get_event/1`, but for client-facing reads: an event that is
+  `rejected` or `soft_failed` is treated as not found, matching the
+  `not e.rejected and not e.soft_failed` filters used throughout this
+  module's other client-facing queries (`get_events_since/2`,
+  `get_messages/2`, etc).
+
+  `get_event/1` itself must stay unfiltered — per `insert_rejected_event/2`'s
+  doc comment, federation's `GET /event/{id}` and `/event_auth` chain walks
+  need to keep seeing rejected events so peer servers can resolve auth
+  chains — so this is a separate function rather than a change to
+  `get_event/1`. Use this one from any client API path (`GET
+  /rooms/{roomId}/event/{eventId}` and friends); use `get_event/1` only for
+  federation-facing or internal callers that legitimately need to see
+  rejected/soft-failed events too.
+  """
+  def get_visible_event(event_id) do
+    case Repo.get_by(Event, event_id: event_id) do
+      nil -> {:error, :not_found}
+      %Event{rejected: true} -> {:error, :not_found}
+      %Event{soft_failed: true} -> {:error, :not_found}
+      event -> {:ok, event}
+    end
+  end
+
   @doc "Returns events in a room with stream_ordering > since, in order."
   def get_events_since(room_id, since_ordering, limit \\ 100) do
     Repo.all(
