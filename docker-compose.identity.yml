@@ -1,0 +1,37 @@
+# Optional dev/test identity server (Matrix 3pid-invite integration).
+#
+# This is matrix.org's reference identity server, Sydent — not part of the
+# production axon stack, just infrastructure to develop/test 3pid-invite
+# support against. Any spec-compliant identity server works in its place;
+# axon only ever talks to whatever URL DEFAULT_IDENTITY_SERVER points at
+# (see README.md "Identity server (3pid invites)").
+#
+# Start:   docker compose -f docker-compose.identity.yml up -d
+# Stop:    docker compose -f docker-compose.identity.yml down
+# Reachable at: http://localhost:8090
+services:
+  sydent:
+    image: matrixdotorg/sydent:latest
+    restart: unless-stopped
+    environment:
+      # Sydent's own server_name, used to sign its responses. Independent of
+      # axon's AXON_SERVER_NAME — nothing else in this compose file needs to
+      # agree with it.
+      SYDENT_SERVER_NAME: ${IDENTITY_SERVER_NAME:-sydent.localhost}
+      # SMTP is left at Sydent's default (localhost:25, unreachable in this
+      # setup) — email sending fails closed and gets logged, which is fine
+      # since nothing in axon's test coverage needs a delivered email.
+    volumes:
+      # Holds sydent.conf (incl. the auto-generated ed25519 signing key,
+      # written on first boot) and sydent.db (SQLite).
+      - axon_sydent_data:/data
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/_matrix/identity/v2')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  axon_sydent_data:

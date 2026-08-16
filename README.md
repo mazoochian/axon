@@ -131,6 +131,7 @@ The server is now listening at `http://localhost:8008`. You can point any Matrix
 | `SENTRY_DSN` | *unset* | Optional. Enables crash reporting via [Sentry](https://sentry.io) when set; the app runs normally without it |
 | `SIGNING_KEY_PATH` | *unset* | Optional. Path to persist the server's federation signing key across restarts (generated there on first boot if missing). Unset means a fresh identity every restart — fine for throwaway/dev use, not for a real deployment (invalidates cached `/_matrix/key/v2/server` responses and prior signatures). `docker-compose.yml` already mounts a volume at the default path, `/axon/data/signing.key` |
 | `REGISTRATION_ENABLED` | `false` | Whether `POST /register` accepts open self-registration. Off by default, matching Synapse's own `enable_registration: false` — set to `true` to allow public self-registration, or leave off and provision accounts via `_synapse/admin/v1/register` (shared-secret, unaffected either way) or OIDC instead. `mix phx.server`/dev and the test suite both default this on locally regardless of this table's prod default — see `config/dev.exs`/`config/test.exs`. |
+| `DEFAULT_IDENTITY_SERVER` | *unset* | Optional. Base URL of a [Matrix identity server](https://spec.matrix.org/v1.18/identity-service-api/) (e.g. `https://vector.im`) used for 3pid invites. Unset means no identity-server integration — see [Identity server (3pid invites)](#identity-server-3pid-invites) for how to run one locally with Docker. |
 
 ## Deploying with Docker
 
@@ -353,6 +354,24 @@ Each upload generates a random 24-character base64url ID (`mxc://server/ID`). Re
 ### Thumbnails
 
 `GET /_matrix/media/v3/thumbnail/...` generates real thumbnails via ImageMagick (`crop` or `scale`, any `width`/`height` up to 1600px), cached on disk next to the original so repeat requests for the same size don't re-encode. Non-image content (or a missing `convert` binary) falls back to serving the original file untouched. Remote thumbnail requests are proxied straight to the origin server's own thumbnail endpoint rather than re-encoded locally.
+
+## Identity server (3pid invites)
+
+3pid invites (inviting a user by email/phone before they have a Matrix account) need an [identity server](https://spec.matrix.org/v1.18/identity-service-api/) to bind and look up third-party identifiers. Axon doesn't ship one — point it at any spec-compliant identity server via `DEFAULT_IDENTITY_SERVER` (unset by default; leave unset if you don't need 3pid invites). This is a plain URL swap: any deployer can run their own identity server and point axon at it, with no code change required.
+
+For local development/testing, this repo includes a `docker-compose.identity.yml` running [Sydent](https://github.com/matrix-org/sydent), matrix.org's reference identity server implementation:
+
+```bash
+docker compose -f docker-compose.identity.yml up -d
+# Reachable at http://localhost:8090
+curl http://localhost:8090/_matrix/identity/v2   # {}
+```
+
+It persists its SQLite database and auto-generated ed25519 signing key in the `axon_sydent_data` volume, so both survive a restart. SMTP is left at Sydent's own default (`localhost:25`, unreachable here) — email sending fails closed and gets logged, which is fine since nothing in axon's test coverage needs a delivered email. Then, for a local axon instance:
+
+```bash
+DEFAULT_IDENTITY_SERVER=http://localhost:8090 AXON_SERVER_NAME=localhost iex -S mix
+```
 
 ## Application Services
 
