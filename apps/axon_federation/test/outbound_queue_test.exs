@@ -54,6 +54,20 @@ defmodule AxonFederation.OutboundQueueTest do
     )
   end
 
+  # Schemaless selects on a utc_datetime_usec column (backed by a
+  # timezone-less `timestamp` column) come back as NaiveDateTime, since
+  # there's no schema field type annotation to trigger Ecto's DateTime
+  # cast — same caveat OutboundQueue.to_utc_datetime/1 itself works around.
+  defp fetch_next_attempt_at(id) do
+    Repo.one(
+      from(t in "federation_outbound_transactions",
+        where: t.id == ^id,
+        select: t.next_attempt_at
+      )
+    )
+    |> DateTime.from_naive!("Etc/UTC")
+  end
+
   test "a successful delivery is not persisted afterwards" do
     FakeRemoteMatrixServer.put_response(
       @port,
@@ -125,6 +139,46 @@ defmodule AxonFederation.OutboundQueueTest do
 
     assert length(requests_for_txn) == 2
     assert List.last(requests_for_txn).body["edus"] == [%{"edu_type" => "m.test"}]
+  end
+
+  # Regression: reschedule/2 used `attempts` (already incremented to 1 on
+  # the first failure) directly as the exponent, so the delay after the
+  # *first* failure was base*2^1 instead of base*2^0 — one full doubling
+  # too long from the very first retry onward. Combined with the 30s base
+  # this was tuned from, a destination that failed exactly once (a brief
+  # blip, not a real outage) waited a full 60s before even being eligible
+  # for retry — long enough on its own to blow past Complement's
+  # ~30-50s MustSyncUntil budgets in
+  # TestToDeviceMessagesOverFederation's interrupted_connectivity/
+  # stopped_server subtests. After one failure, the next attempt must be
+  # scheduled ~base (now 5s), not ~2x base.
+  test "the delay after a single failure is ~1x the base backoff, not ~2x" do
+    FakeRemoteMatrixServer.put_response(
+      @port,
+      {"PUT", ~r{^/_matrix/federation/v1/send/}},
+      500,
+      %{"errcode" => "M_UNKNOWN", "error" => "simulated failure"}
+    )
+
+    before = DateTime.utc_now()
+
+    :ok = OutboundQueue.enqueue(@server_name, %{"pdus" => [], "edus" => []})
+
+    row =
+      wait_until(System.monotonic_time(:millisecond) + 2_000, fn ->
+        case fetch_row(@server_name) do
+          %{attempts: 1} = row -> {:ok, row}
+          _ -> :error
+        end
+      end)
+
+    next_attempt_at = fetch_next_attempt_at(row.id)
+    delay_ms = DateTime.diff(next_attempt_at, before, :millisecond)
+
+    # ~5s expected (base backoff after one failure); would be ~60s under
+    # the old 30s-base/off-by-one-exponent bug this guards against.
+    assert delay_ms > 0 and delay_ms < 15_000,
+           "expected the next attempt to be scheduled ~5s out, got #{delay_ms}ms"
   end
 
   test "an unrecognized message is ignored without crashing the process" do

@@ -204,12 +204,18 @@ defmodule AxonWeb.RoomControllerTest do
       room_id = create_room(alice.token, %{"preset" => "public_chat"})
 
       before_bob_token =
-        authed(alice.token) |> get("/_matrix/client/v3/sync") |> decode() |> Map.fetch!("next_batch")
+        authed(alice.token)
+        |> get("/_matrix/client/v3/sync")
+        |> decode()
+        |> Map.fetch!("next_batch")
 
       join(bob.token, room_id)
 
       after_bob_token =
-        authed(alice.token) |> get("/_matrix/client/v3/sync") |> decode() |> Map.fetch!("next_batch")
+        authed(alice.token)
+        |> get("/_matrix/client/v3/sync")
+        |> decode()
+        |> Map.fetch!("next_batch")
 
       authed(alice.token)
       |> jp("/_matrix/client/v3/rooms/#{room_id}/kick", %{"user_id" => bob.user_id})
@@ -460,7 +466,9 @@ defmodule AxonWeb.RoomControllerTest do
       port = 19_460
       server_name = "fake-roomjoin-alias.test"
 
-      start_supervised!({AxonFederation.FakeRemoteMatrixServer, port: port, server_name: server_name})
+      start_supervised!(
+        {AxonFederation.FakeRemoteMatrixServer, port: port, server_name: server_name}
+      )
 
       Application.put_env(:axon_federation, :server_overrides, %{
         server_name => "http://127.0.0.1:#{port}"
@@ -488,6 +496,131 @@ defmodule AxonWeb.RoomControllerTest do
         end)
 
       assert URI.decode_query(directory_request.query_string) == %{"room_alias" => full_alias}
+    end
+  end
+
+  describe "join after a bare federated invite stub (regression)" do
+    # AxonWeb.FederationController.accept_invite/4 (the inbound half of a
+    # federated invite) leaves behind exactly one "rooms" row and one
+    # m.room.member event for a room we've never actually joined — no
+    # m.room.create, no other state, no RoomProcess ever started for it.
+    # join/2 used to test EventStore.room_exists?/1 ("is there any row at
+    # all in `rooms` for this id") to decide whether a /join call should
+    # go through RoomProcess.send_event/5 (a same-server join) instead of
+    # the real make_join/send_join federation handshake — true for that
+    # bare stub too, so accepting a federated invite made /join fabricate
+    # a fake local-only join against an all-but-empty RoomProcess, one
+    # nobody else in the real room (least of all the inviting server)
+    # ever heard about. Complement: TestDeviceListsUpdateOverFederation —
+    # alice on the inviting server never saw the invitee's join at all;
+    # the invitee's own join response came back in ~20ms, far too fast to
+    # have been a real federated round trip.
+    test "doesn't skip the federation join handshake just because we have a bare invite stub" do
+      port = 19_701
+      server_name = "fake-roomjoin-afterinvite.test"
+
+      start_supervised!(
+        {AxonFederation.FakeRemoteMatrixServer, port: port, server_name: server_name}
+      )
+
+      AxonFederation.KeyCache.clear()
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        server_name => "http://127.0.0.1:#{port}"
+      })
+
+      on_exit(fn -> Application.delete_env(:axon_federation, :server_overrides) end)
+
+      bob = register("bob_bareinvite_#{System.unique_integer([:positive])}")
+      room_id = "!remote_#{System.unique_integer([:positive])}:#{server_name}"
+      inviter = "@alice:#{server_name}"
+
+      # Exactly what accept_invite/4 leaves behind for a purely federated
+      # invite — reproduced directly rather than round-tripped through the
+      # signed /_matrix/federation/v2/invite endpoint, since that delivery
+      # path already has its own dedicated coverage elsewhere.
+      now = DateTime.utc_now(:microsecond)
+
+      AxonCore.Repo.insert_all("rooms", [
+        %{
+          room_id: room_id,
+          version: "10",
+          creator: inviter,
+          is_public: false,
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+      {:ok, _} =
+        AxonCore.EventStore.insert_event(
+          %{
+            "event_id" => "$invite_#{System.unique_integer([:positive])}",
+            "room_id" => room_id,
+            "type" => "m.room.member",
+            "state_key" => bob.user_id,
+            "sender" => inviter,
+            "content" => %{"membership" => "invite"},
+            "depth" => 1,
+            "origin" => server_name,
+            "origin_server_ts" => System.os_time(:millisecond)
+          },
+          "10"
+        )
+
+      # The remote room's *real* state, served if (and only if) /join
+      # actually performs the federation handshake.
+      create =
+        AxonFederation.FakeRemoteMatrixServer.sign_event(port, %{
+          "event_id" => "$create_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "sender" => inviter,
+          "content" => %{"creator" => inviter, "room_version" => "10"},
+          "depth" => 1,
+          "origin" => server_name,
+          "origin_server_ts" => System.os_time(:millisecond),
+          "auth_events" => [],
+          "prev_events" => [],
+          "hashes" => %{"sha256" => "x"}
+        })
+
+      owner_join =
+        AxonFederation.FakeRemoteMatrixServer.sign_event(port, %{
+          "event_id" => "$ownerjoin_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => inviter,
+          "sender" => inviter,
+          "content" => %{"membership" => "join"},
+          "depth" => 2,
+          "origin" => server_name,
+          "origin_server_ts" => System.os_time(:millisecond),
+          "auth_events" => [],
+          "prev_events" => [],
+          "hashes" => %{"sha256" => "x"}
+        })
+
+      AxonFederation.FakeRemoteMatrixServer.make_join_response(port, room_id, bob.user_id, "10")
+      AxonFederation.FakeRemoteMatrixServer.send_join_response(port, [create, owner_join], [])
+
+      conn =
+        authed(bob.token)
+        |> jp("/_matrix/client/v3/join/#{URI.encode(room_id)}?server_name=#{server_name}", %{})
+
+      assert conn.status == 200, "expected 200, got #{conn.status}: #{conn.resp_body}"
+
+      # The real federation join handshake must have actually happened...
+      assert Enum.any?(AxonFederation.FakeRemoteMatrixServer.requests(port), fn r ->
+               String.contains?(r.path, "make_join")
+             end)
+
+      # ...and the real remote room state (the create event) is what we
+      # ended up with locally — not a fabricated local-only join against
+      # an all-but-empty room.
+      assert {:ok, state_events} = AxonRoom.RoomProcess.get_state(room_id)
+      assert Enum.any?(state_events, &(&1["type"] == "m.room.create"))
     end
   end
 

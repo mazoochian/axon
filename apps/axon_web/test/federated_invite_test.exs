@@ -168,6 +168,41 @@ defmodule AxonWeb.FederatedInviteTest do
     end)
   end
 
+  # Regression: AxonRoom.CreateRoom.execute/2's own invite list (the
+  # `invite` param of POST /createRoom itself, not the separate
+  # POST /rooms/:id/invite endpoint exercised by every other test in this
+  # file) sent every invitee — remote ones included — through
+  # RoomProcess.send_event/5 directly, which only ever writes local state
+  # and only fans a PDU out to servers of already-*joined* members. A
+  # brand-new remote invitee's own server never received anything at all:
+  # no v2/invite handshake, no PDU, nothing. Complement:
+  # TestDeviceListsUpdateOverFederation and TestToDeviceMessagesOverFederation
+  # both depend on a room+invite created this way and hung forever on the
+  # invitee's own MustSyncUntil(SyncInvitedTo).
+  test "createRoom's own invite list federates a remote invitee too" do
+    alice = register("fedinv_create_#{System.unique_integer([:positive])}")
+    david = "@david_#{System.unique_integer([:positive])}:#{@server_name}"
+    countersign_without_event_id()
+
+    room_id =
+      create_room(alice.token, %{
+        "preset" => "private_chat",
+        "invite" => [david]
+      })
+
+    # The invite really landed on our own side too.
+    assert AxonCore.EventStore.get_membership(room_id, david) == {:ok, "invite"}
+
+    # And the remote server actually received the v2/invite handshake —
+    # not just a locally-applied event nobody else ever heard about.
+    wait_until(System.monotonic_time(:millisecond) + 5_000, fn ->
+      Enum.any?(FakeRemoteMatrixServer.requests(@port), fn req ->
+        req.method == "PUT" and req.path =~ ~r{/_matrix/federation/v2/invite/} and
+          get_in(req.body, ["event", "state_key"]) == david
+      end)
+    end)
+  end
+
   test "a remote server that fails the invite still yields a clean 502, not a 500" do
     alice = register("fedinv_fail_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token, %{"preset" => "private_chat"})

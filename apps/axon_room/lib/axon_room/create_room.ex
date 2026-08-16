@@ -68,12 +68,27 @@ defmodule AxonRoom.CreateRoom do
       # flag is echoed onto each invite's own m.room.member content — it's
       # how the invitee's client knows to treat the room as a DM before
       # they've joined and can see any other state.
+      #
+      # Only *local* invitees are sent here. A remote invitee needs the
+      # full federation `/invite` v2 handshake (build, auth-check, PUT to
+      # their server, apply their countersigned reply) — RoomProcess's
+      # generic PDU fan-out only ever notifies servers of already-*joined*
+      # members, so a target whose own membership is the "invite" being
+      # created here would never be told at all otherwise. That handshake
+      # needs AxonWeb.SyncHelpers/AxonFederation.HttpClient, which this app
+      # can't depend on (axon_web depends on axon_room, not the reverse) —
+      # AxonWeb.RoomController.create/2 performs it for remote invitees
+      # once this function returns, the same way it already does for the
+      # standalone POST /rooms/:room_id/invite endpoint.
       invite_content =
         if opts[:is_direct],
           do: %{"membership" => "invite", "is_direct" => true},
           else: %{"membership" => "invite"}
 
-      Enum.each(opts[:invite] || [], fn invitee ->
+      opts[:invite]
+      |> List.wrap()
+      |> Enum.filter(&(AxonCore.MatrixId.server_name(&1) == server_name))
+      |> Enum.each(fn invitee ->
         RoomProcess.send_event(room_id, creator, "m.room.member", invite_content,
           state_key: invitee
         )

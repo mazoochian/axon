@@ -4,6 +4,7 @@ defmodule AxonWeb.RoomController do
   action_fallback(AxonWeb.FallbackController)
 
   import Ecto.Query, only: [from: 2]
+  require Logger
   alias AxonCore.{EventStore, Repo}
   alias AxonRoom.{AuthRules, CreateRoom, EventBuilder, RestrictedJoin, RoomProcess, RoomUpgrade}
   alias AxonSync.Typing
@@ -35,6 +36,7 @@ defmodule AxonWeb.RoomController do
       ]
 
       with {:ok, room_id} <- CreateRoom.execute(user_id, opts) do
+        invite_remote_members(room_id, user_id, opts[:invite], server_name, params["is_direct"])
         json(conn, %{"room_id" => room_id})
       else
         # These two power_level_content_override validation failures don't
@@ -92,7 +94,7 @@ defmodule AxonWeb.RoomController do
       conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
     else
       room_server = room_id |> AxonCore.MatrixId.server_name()
-      is_local_room = room_server == local_server or EventStore.room_exists?(room_id)
+      is_local_room = room_server == local_server or resident_room?(room_id)
 
       if is_local_room do
         # Local room join
@@ -167,7 +169,7 @@ defmodule AxonWeb.RoomController do
       conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
     else
       room_server = room_id |> AxonCore.MatrixId.server_name()
-      is_local_room = room_server == local_server or EventStore.room_exists?(room_id)
+      is_local_room = room_server == local_server or resident_room?(room_id)
       reason = params["reason"]
 
       content =
@@ -284,6 +286,29 @@ defmodule AxonWeb.RoomController do
       ) == "invite"
   end
 
+  # Whether we have this room's own real state locally (we created it, or
+  # have joined it before) — as opposed to merely a bare invite/knock stub
+  # (AxonWeb.FederationController.accept_invite/4 and its knock equivalent
+  # insert exactly one `rooms` row + one m.room.member event, nothing
+  # else, to track a not-yet-accepted invite/knock; no RoomProcess ever
+  # starts for one). Originally written for leave/2 above (a room known
+  # only via a bare stub has no local RoomProcess to route a leave
+  # through) — join/2 and do_knock/3 used to each run their own,
+  # weaker EventStore.room_exists?/1 check instead ("is there any row at
+  # all in `rooms` for this id", true for a bare stub too), which let a
+  # bare federated-invite stub masquerade as full residency: accepting
+  # that invite via POST /join took the "local room" branch (a fabricated
+  # local-only join against an all-but-empty RoomProcess) instead of the
+  # real make_join/send_join federation handshake, and nobody else in the
+  # real room — least of all the inviting server — ever heard about it.
+  # Complement: TestDeviceListsUpdateOverFederation (alice on the inviting
+  # server never saw the invitee's join at all; the invitee's own join
+  # response came back in ~20ms, far too fast to have been a real
+  # federated round trip). The room's own m.room.create event is never
+  # part of a bare stub (only the invite/knock's own membership event is),
+  # so checking for it specifically is what a bare stub can't fake — now
+  # shared by all three call sites instead of join/knock each trusting a
+  # signal that doesn't mean what they assumed it meant.
   defp resident_room?(room_id) do
     match?({:ok, _}, EventStore.get_state_event(room_id, "m.room.create", ""))
   end
@@ -470,17 +495,56 @@ defmodule AxonWeb.RoomController do
   # `PUT .../federation/v2/invite/...` call anywhere in the codebase, and
   # no inbound route to receive one either), so a federated invite was
   # silently a no-op from the invitee's perspective.
-  defp invite_user(room_id, sender, target_user_id) do
+  defp invite_user(room_id, sender, target_user_id, content \\ %{"membership" => "invite"}) do
     local_server = AxonCrypto.KeyServer.server_name()
     target_server = target_user_id |> AxonCore.MatrixId.server_name()
 
     if target_server == local_server do
-      RoomProcess.send_event(room_id, sender, "m.room.member", %{"membership" => "invite"},
-        state_key: target_user_id
-      )
+      RoomProcess.send_event(room_id, sender, "m.room.member", content, state_key: target_user_id)
     else
-      federate_invite(room_id, sender, target_user_id, target_server)
+      federate_invite(room_id, sender, target_user_id, target_server, content)
     end
+  end
+
+  # createRoom's own `invite` list previously only ever reached
+  # RoomProcess.send_event/5 (see AxonRoom.CreateRoom.execute/2's final
+  # loop) — the same "local-only" mistake invite_user/4's own moduledoc
+  # above describes for the standalone /invite endpoint, but for the
+  # room-creation-time invite list specifically. Two compounding problems:
+  # 1) `RoomProcess.send_event` has no notion of a remote invitee at all —
+  #    it just writes the member row into *our* state.
+  # 2) even its generic federation PDU fan-out
+  #    (RoomProcess.broadcast_for_federation/4) only notifies servers of
+  #    already-*joined* members, so a target whose own membership is the
+  #    "invite" being created is never a fan-out target either way.
+  # A brand-new remote invitee's server never heard about the room at all
+  # (Complement: TestDeviceListsUpdateOverFederation /
+  # TestToDeviceMessagesOverFederation both depend on a shared room to
+  # exist before their own EDU-delivery assertions can pass, and hung on
+  # the invitee's own MustSyncUntil(SyncInvitedTo) — the invite payload
+  # simply never arrived). AxonRoom.CreateRoom.execute/2 now only sends
+  # local invites itself; this handles the remote half the same way
+  # invite_user/4 already does for the standalone endpoint, once the room
+  # (and its creator's full state) exists to build a proper invite from.
+  defp invite_remote_members(room_id, sender, invitees, local_server, is_direct?) do
+    content =
+      if is_direct?,
+        do: %{"membership" => "invite", "is_direct" => true},
+        else: %{"membership" => "invite"}
+
+    (invitees || [])
+    |> Enum.reject(&(AxonCore.MatrixId.server_name(&1) == local_server))
+    |> Enum.each(fn target_user_id ->
+      case invite_user(room_id, sender, target_user_id, content) do
+        {:ok, _event_id} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "createRoom: failed to federate invite for #{target_user_id} to room #{room_id}: #{inspect(reason)}"
+          )
+      end
+    end)
   end
 
   # Builds and self-signs the invite event exactly like a local send would
@@ -492,13 +556,11 @@ defmodule AxonWeb.RoomController do
   # gets persisted — via RoomProcess.apply_remote_event/2, the same path
   # any other remote-originated event takes, so local /sync fan-out works
   # identically to a same-server invite.
-  defp federate_invite(room_id, sender, target_user_id, target_server) do
+  defp federate_invite(room_id, sender, target_user_id, target_server, content) do
     room_ctx = RoomProcess.get_room_ctx(room_id)
 
     invite_event =
-      EventBuilder.build(sender, "m.room.member", %{"membership" => "invite"}, room_ctx,
-        state_key: target_user_id
-      )
+      EventBuilder.build(sender, "m.room.member", content, room_ctx, state_key: target_user_id)
 
     with :ok <- AuthRules.check(invite_event, room_ctx.current_state, room_ctx.room_version) do
       body = %{

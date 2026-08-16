@@ -39,7 +39,14 @@ defmodule AxonFederation.OutboundQueue do
   alias AxonFederation.HttpClient
 
   @tick_interval :timer.seconds(5)
-  @base_backoff_ms :timer.seconds(30)
+  # 5s (not the previous 30s): a destination that's down for a while still
+  # backs off exponentially all the way up to @max_backoff_ms, but a brief
+  # blip — a container restart, a momentary network partition, exactly
+  # what Complement's own interrupted_connectivity/stopped_server test
+  # variants simulate — now gets retried within one or two sweep ticks
+  # instead of sitting queued for a minute-plus (see reschedule/2's
+  # moduledoc note on the exponent fix that rides along with this).
+  @base_backoff_ms :timer.seconds(5)
   @max_backoff_ms :timer.hours(1)
   @max_age_ms :timer.hours(24) * 7
   @sweep_batch_size 100
@@ -212,7 +219,20 @@ defmodule AxonFederation.OutboundQueue do
 
       Repo.delete_all(from(t in "federation_outbound_transactions", where: t.id == ^row.id))
     else
-      backoff_ms = min(round(@base_backoff_ms * :math.pow(2, attempts)), @max_backoff_ms)
+      # attempts is 1 after the *first* failure — the intended curve is
+      # base, base*2, base*4, ... (delay after the Nth failure = base *
+      # 2^(N-1)), but this used `attempts` itself as the exponent, so
+      # every delay was one full doubling too long from the very first
+      # retry onward (base*2, base*4, base*8, ...). With the old 30s base,
+      # that meant the first-ever retry after a single failure waited a
+      # full 60s before the sweep would even consider it due — long
+      # enough on its own to blow past Complement's ~30-50s MustSyncUntil
+      # budgets in TestToDeviceMessagesOverFederation's
+      # interrupted_connectivity/stopped_server subtests (a brief outage,
+      # recovered well within a few seconds, still had to wait out that
+      # inflated first backoff before the queued to-device EDU could even
+      # be retried).
+      backoff_ms = min(round(@base_backoff_ms * :math.pow(2, attempts - 1)), @max_backoff_ms)
       next_attempt_at = DateTime.add(DateTime.utc_now(), backoff_ms, :millisecond)
 
       Repo.update_all(
