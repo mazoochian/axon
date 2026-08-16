@@ -19,7 +19,7 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 - No point-in-time state resolution: `GET /rooms/{roomId}/members?at=<token>` and history visibility for a user who's left a room both need room state *as of* a specific moment, which nothing currently computes (only current state is tracked).
 - `soft_failed` is never set on an event — axon has rejection (an event that fails auth outright), but not the second, softer check against current state that a genuine soft-failure requires.
 
-See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 21 and counting — the roadmap as originally scoped is complete; ongoing phases are a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
+See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 22 and counting — the roadmap as originally scoped is complete; ongoing phases are a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
 
 ## Why BEAM?
 
@@ -326,10 +326,10 @@ COMPLEMENT_BASE_IMAGE=axon-complement:latest \
 
 ### Current results
 
-As of Phase 21 (see [ROADMAP.md](ROADMAP.md) for the full trail):
+As of Phase 22 (see [ROADMAP.md](ROADMAP.md) for the full trail):
 
 - **`tests/csapi` (core Client-Server API): 61/64 (~95%)**. The 3 remaining failures: one is a scenario even Synapse doesn't reliably pass (a documented upstream Synapse issue Complement skips it for); the other two need genuine point-in-time state resolution (room state/membership *as of* a given moment) — a real feature gap, not a bug.
-- **`tests/` (top-level federation/room package): 48/88 (~55%)**. The dominant blocker is a `send_join` signature-verification mismatch — confirmed, across three independent from-scratch cryptographic verifications, to **not** be an axon bug (most likely a bug in a dev-snapshot dependency Complement's own harness pins). It alone gates the entire knocking feature family and most of the restricted-rooms cluster (~13 tests). A second known gap (`soft_failed` never being set) plausibly explains a chunk of the remaining auth-chain/rejection-handling failures.
+- **`tests/` (top-level federation/room package): 53/88 (~60%)**. The dominant blocker is a `send_join` signature-verification mismatch — confirmed, across three independent from-scratch cryptographic verifications, to **not** be an axon bug (most likely a bug in a dev-snapshot dependency Complement's own harness pins). It alone gates the entire knocking feature family and most of the restricted-rooms cluster (~13 tests). A second known gap (`soft_failed` never being set) plausibly explains a chunk of the remaining auth-chain/rejection-handling failures.
 - `tests/msc*` (unstable MSCs) not run — expected failures, axon has never claimed to implement unstable MSCs.
 
 Re-run the suite above for current numbers; these will drift as both axon and Complement itself change.
