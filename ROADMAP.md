@@ -463,3 +463,31 @@ Full `mix test`: **1178 tests, 0 failures**.
 2. **`soft_failed` is still never set** (open since Phase 19) — plausibly gates the auth-chain/rejection cluster (`TestCorruptedAuthChain` — confirmed itself gated by the send_join bug specifically; `TestInboundFederationRejectsEventsWithRejectedAuthEvents`, `TestUnrejectRejectedEvents` — not yet individually root-caused this phase).
 
 Everything else in the remaining ~40 (to-device/device-list-over-federation timeouts, MSC4297 state-res v2.1, several one-off endpoint gaps) was not investigated this phase. The `csapi` package (Phase 20, separately at 61/64) and `msc*` packages were not re-run.
+
+## Phase 22 — federation package: 48/88 → 53/88
+
+Two real, independently-verified bugs found and fixed, both by tracing actual 500s/404s rather than guessing from Complement's pass/fail summary alone.
+
+- **Inbound federation invite (`PUT /_matrix/federation/v2/invite/...`) 500'd on the event-shape every real inviting server actually sends.** `accept_invite/4` signed the incoming event and inserted it without ever computing `event_id` — room versions 3+ never carry one on the wire (it's the reference hash), so `EventStore.insert_event/2` got a nil `event_id`, the changeset's `NOT NULL` violation fell through `FallbackController`'s catch-all, and the inviting server saw an opaque `500 M_UNKNOWN`. Same event_id-backfill pattern `AxonFederation.RoomJoin` already used for auth-chain storage, just missing here. This gated most invite-related federation tests, not only the `is_direct` one it was first spotted on.
+- **Every federated alias lookup (`GET /_matrix/federation/v1/query/directory?room_alias=...`) silently sent an empty `room_alias`.** Both call sites (`RoomController`'s join/knock alias resolution, `DirectoryController`'s remote alias GET) built the query string with `URI.encode/1`, which leaves `#` unescaped — and every Matrix alias starts with `#`. `Finch.build/5` re-parses the URL string with `URI.parse/1` before sending, and per RFC 3986 an unescaped `#` starts the fragment, which is never transmitted — so the alias never reached the wire, only `room_alias=` did. `FakeRemoteMatrixServer.put_response/4`'s regex-only path matching let this slip past axon's own test suite entirely (it never inspected the query string it actually received, so a canned 200 always looked like success). Fixed by switching to `URI.encode_www_form/1`, which correctly percent-encodes `#`; both regression tests now assert on `FakeRemoteMatrixServer.requests/1`'s recorded query string, not just the mocked response.
+
+**Verified via a clean before/after Complement diff** (identical image rebuild, same commit, full package re-run both times): exactly 5 tests flipped from fail to pass, zero regressions — `TestIsDirectFlagFederation`, `TestOutboundFederationSend`, `TestFederationRedactSendsWithoutEvent`, `TestJoinFederatedRoomWithUnverifiableEvents`, and `TestRemoteAliasRequestsUnderstandUnicode`. That last one closes a gap Phase 21 left open and had misattributed to "exactly how the Go test client serializes a URL path segment starting with `#`" — same character, same root cause, wrong call site (it's the *query string* built for the federation-side lookup, not path serialization on the client side).
+
+### A third lead, investigated and not confirmed as an axon bug
+
+`TestNetworkPartitionOrdering` (and by shape, plausibly `TestGetMissingEventsGapFilling`, `TestComplementCanCreateValidV12Rooms`, `TestSyncOmitsStateChangeOnFilteredEvents`) all share a symptom: a remote server creates an event early, transmits it late (after the local head has advanced several generations via unrelated events), and axon appears to never apply it — the room stops appearing in the joining user's incremental `/sync` at all. This looked like a real, high-value systemic bug (a DAG fork landing in a room axon didn't originate).
+
+Two independent local reproductions of the exact PDU shape (single `prev_events` pointing at a known-but-stale ancestor, non-state `m.room.message`) — one calling `AxonRoom.RoomProcess.apply_remote_event/2` directly, one over real HTTP through `PUT send_transaction/2` with full signature verification and `AxonFederation.Backfill`'s gap-check included — both accept and apply the event cleanly. Neither reproduces a rejection, a soft-fail, or any other anomaly. Both are kept as new regression coverage (`apps/axon_room/test/room_process_test.exs`, `apps/axon_web/test/federation_controller_test.exs`) regardless, since this exact fork shape had no prior test at all.
+
+This doesn't clear axon of the bug, but it does mean it isn't reproducible outside the real Complement/Docker network path — the same shape of dead end as the `send_join` signature mismatch (Phase 21). Not re-investigating further without either a live wire capture during an actual Complement run, or a specific new lead.
+
+### Where the federation package stands, honestly
+
+**53/88**, up from 48/88. The remaining ~35 failures are still dominated by the same two things Phase 21 identified and this phase didn't touch:
+
+1. **The send_join signature mismatch** — still gates the whole knocking family and most of the restricted-rooms cluster. Not axon's bug (Phase 21).
+2. **`soft_failed` is still never set**, and the late-arriving-fork symptom above — plausibly related, not conclusively so.
+
+Also untouched this phase: to-device/device-list-over-federation timeouts, MSC4297 state-res v2.1 (2 tests), `TestJumpToDateEndpoint`, `TestMSC4289PrivilegedRoomCreators`'s state-resolution-mainline-ordering subtest (a real, deep state-res-v2/MSC4289-interaction question, flagged but not investigated), and `TestComplementCanCreateValidV12Rooms`/`TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent` (v12 domain-less room IDs tripping something in Complement's own pinned `gomatrixserverlib` snapshot's `eventauth` package — smells like the same class of dev-dependency issue as send_join, not independently confirmed).
+
+Full `mix test`: **1181 tests, 0 failures**.
