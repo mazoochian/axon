@@ -92,7 +92,7 @@ defmodule AxonRoom.CreateRoom do
          prebuilt_create_event,
          power_levels
        ) do
-    {join_rule, history_visibility, guest_access} = preset_values(preset)
+    {join_rule, history_visibility} = preset_values(preset)
 
     # Order matters: each event references the previous as prev_event.
     # When the create event was already bootstrapped standalone (room v12 —
@@ -101,6 +101,29 @@ defmodule AxonRoom.CreateRoom do
     # second time.
     create_event_step =
       if prebuilt_create_event, do: [], else: [{"m.room.create", "", create_content}]
+
+    # Optional metadata events from initial_state (before name/topic)
+    initial_state_events =
+      (opts[:initial_state] || [])
+      |> Enum.map(fn ev ->
+        {ev["type"], ev["state_key"] || "", ev["content"] || %{}}
+      end)
+
+    # Synapse (synapse/handlers/room.py, RoomCreationHandler) only
+    # auto-generates an initial m.room.guest_access event when the preset's
+    # own config says guests are allowed (`self._presets_dict[preset]
+    # ["guest_can_join"]`) — true for private_chat/trusted_private_chat,
+    # false for public_chat — and even then, skips it if the client's own
+    # createRoom `initial_state` already supplied an m.room.guest_access
+    # entry, to avoid sending it twice. public_chat rooms therefore get no
+    # explicit guest_access state at all: guest join falls back to the
+    # room's implicit "forbidden" default rather than an explicit event.
+    guest_access_events =
+      if guest_can_join?(preset) and not has_explicit_guest_access?(initial_state_events) do
+        [{"m.room.guest_access", "", %{"guest_access" => "can_join"}}]
+      else
+        []
+      end
 
     events =
       create_event_step ++
@@ -116,17 +139,8 @@ defmodule AxonRoom.CreateRoom do
           # Join rules
           {"m.room.join_rules", "", %{"join_rule" => join_rule}},
           # History visibility
-          {"m.room.history_visibility", "", %{"history_visibility" => history_visibility}},
-          # Guest access
-          {"m.room.guest_access", "", %{"guest_access" => guest_access}}
-        ]
-
-    # Optional metadata events from initial_state (before name/topic)
-    initial_state_events =
-      (opts[:initial_state] || [])
-      |> Enum.map(fn ev ->
-        {ev["type"], ev["state_key"] || "", ev["content"] || %{}}
-      end)
+          {"m.room.history_visibility", "", %{"history_visibility" => history_visibility}}
+        ] ++ guest_access_events
 
     # Name / topic come after initial_state (topic with rich format overrides initial_state topic)
     events =
@@ -145,15 +159,32 @@ defmodule AxonRoom.CreateRoom do
     end)
   end
 
-  # guest_can_join per the createRoom preset table (Client-Server API spec):
-  # public_chat is the one preset where guests are *not* allowed in; both
-  # private chat presets allow them. This was previously backwards —
-  # public_chat granted guest access and both private presets forbade it —
-  # which axon's own preset unit tests had also locked in as "expected"
-  # rather than independently checked against spec.
-  defp preset_values("public_chat"), do: {"public", "shared", "forbidden"}
-  defp preset_values("trusted_private_chat"), do: {"invite", "shared", "can_join"}
-  defp preset_values(_), do: {"invite", "shared", "can_join"}
+  defp preset_values("public_chat"), do: {"public", "shared"}
+  defp preset_values("trusted_private_chat"), do: {"invite", "shared"}
+  defp preset_values(_), do: {"invite", "shared"}
+
+  # guest_can_join per the createRoom preset table (Client-Server API spec)
+  # and matching Synapse's `self._presets_dict[preset]["guest_can_join"]`
+  # (synapse/handlers/room.py): public_chat is the one preset where guests
+  # are *not* allowed in by default, and — unlike the two presets below —
+  # Synapse does not even emit an explicit m.room.guest_access event for it
+  # at creation time; guest join falls back to the room's implicit
+  # "forbidden" default instead. Both private chat presets allow guests and
+  # get an explicit "can_join" event. (This predicate was previously
+  # inverted — public_chat granted guest access and both private presets
+  # forbade it — which axon's own preset unit tests had also locked in as
+  # "expected" rather than independently checked against spec.)
+  defp guest_can_join?("public_chat"), do: false
+  defp guest_can_join?(_), do: true
+
+  # Mirrors Synapse's `(EventTypes.GuestAccess, "") not in initial_state`
+  # check (room.py) — don't double-send guest_access if the client's own
+  # createRoom `initial_state` already supplied one.
+  defp has_explicit_guest_access?(initial_state_events) do
+    Enum.any?(initial_state_events, fn {type, state_key, _content} ->
+      type == "m.room.guest_access" and state_key == ""
+    end)
+  end
 
   defp default_power_levels(creator, preset, version) do
     invite_level = if preset == "trusted_private_chat", do: 0, else: 50

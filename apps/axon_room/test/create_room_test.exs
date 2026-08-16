@@ -40,15 +40,37 @@ defmodule AxonRoom.CreateRoomTest do
     assert content_of(room_id, "m.room.member", creator)["membership"] == "join"
   end
 
-  test "public_chat preset: public join rule, forbidden guest access, invite power 50" do
+  test "public_chat preset: public join rule, no explicit guest_access event, invite power 50" do
     creator = new_user("alice")
 
     assert {:ok, room_id} =
              CreateRoom.execute(creator, preset: "public_chat", server_name: "localhost")
 
     assert content_of(room_id, "m.room.join_rules")["join_rule"] == "public"
-    assert content_of(room_id, "m.room.guest_access")["guest_access"] == "forbidden"
+    # Matching Synapse (RoomCreationHandler): guest_can_join is false for
+    # public_chat, so no m.room.guest_access state event is sent at all —
+    # not even one with content "forbidden". Guest join falls back to the
+    # room's implicit default instead of an explicit event.
+    assert content_of(room_id, "m.room.guest_access") == nil
     assert content_of(room_id, "m.room.power_levels")["invite"] == 50
+  end
+
+  test "explicit initial_state guest_access is honored instead of the auto-generated one" do
+    creator = new_user("alice")
+
+    assert {:ok, room_id} =
+             CreateRoom.execute(creator,
+               server_name: "localhost",
+               initial_state: [
+                 %{"type" => "m.room.guest_access", "content" => %{"guest_access" => "forbidden"}}
+               ]
+             )
+
+    # default preset is private_chat (guest_can_join true), which would
+    # normally auto-generate a "can_join" guest_access event — but the
+    # client's own initial_state already supplied one, so the auto event
+    # must be skipped rather than sent as a duplicate/overwrite.
+    assert content_of(room_id, "m.room.guest_access")["guest_access"] == "forbidden"
   end
 
   test "trusted_private_chat preset: invite join rule, invite power 0" do
