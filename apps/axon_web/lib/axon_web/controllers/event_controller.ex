@@ -224,7 +224,22 @@ defmodule AxonWeb.EventController do
   end
 
   defp can_access_event?(user_id, room_id, event) do
-    # Get history_visibility from current state
+    room_id |> visibility_bounds(user_id) |> event_visible?(event)
+  end
+
+  @doc """
+  Precomputes everything `event_visible?/2` needs to decide access for as
+  many events in `room_id` as the caller wants, in one round of queries —
+  history_visibility, the user's current membership, and (only ever
+  looked up when actually relevant to that visibility setting) their
+  join/invite/leave orderings. Splitting the "figure out the rules that
+  apply to this (user, room)" step from the "does this one event pass
+  them" step is what makes bulk filtering (a `/messages` page, a `/sync`
+  room) practical — the alternative is a handful of queries repeated
+  per event, an N+1 that's fine for `GET /event/{id}`'s single lookup
+  but not for a page of dozens.
+  """
+  def visibility_bounds(room_id, user_id) do
     history_visibility =
       Repo.one(
         from(s in "current_room_state",
@@ -236,19 +251,41 @@ defmodule AxonWeb.EventController do
         )
       ) || "shared"
 
-    if history_visibility == "world_readable" do
+    membership =
+      Repo.one(
+        from(m in "room_memberships",
+          where: m.room_id == ^room_id and m.user_id == ^user_id,
+          select: m.membership
+        )
+      )
+
+    join_ordering =
+      if history_visibility in ["joined", "invited"] or membership in ["leave", "ban"],
+        do: get_user_membership_ordering(user_id, room_id, "join")
+
+    invite_ordering =
+      if history_visibility == "invited",
+        do: get_user_invite_before_join(user_id, room_id, join_ordering)
+
+    leave_ordering =
+      if membership in ["leave", "ban"],
+        do: get_user_membership_ordering(user_id, room_id, membership)
+
+    %{
+      history_visibility: history_visibility,
+      membership: membership,
+      join_ordering: join_ordering,
+      invite_ordering: invite_ordering,
+      leave_ordering: leave_ordering
+    }
+  end
+
+  @doc "Given `visibility_bounds/2`'s output, whether `event` (needs only :stream_ordering) is visible. No DB access."
+  def event_visible?(bounds, event) do
+    if bounds.history_visibility == "world_readable" do
       true
     else
-      # Check the user's membership
-      membership =
-        Repo.one(
-          from(m in "room_memberships",
-            where: m.room_id == ^room_id and m.user_id == ^user_id,
-            select: m.membership
-          )
-        )
-
-      case {history_visibility, membership} do
+      case {bounds.history_visibility, bounds.membership} do
         {_, nil} ->
           false
 
@@ -256,60 +293,36 @@ defmodule AxonWeb.EventController do
           true
 
         {"joined", "join"} ->
-          # Only allow if event was sent AFTER the user joined
-          join_ordering = get_user_membership_ordering(user_id, room_id, "join")
-          join_ordering != nil and event.stream_ordering >= join_ordering
+          bounds.join_ordering != nil and event.stream_ordering >= bounds.join_ordering
 
         {"invited", "join"} ->
-          # Find invite stream_ordering that preceded the current join
-          join_ordering = get_user_membership_ordering(user_id, room_id, "join")
-          invite_ordering = get_user_invite_before_join(user_id, room_id, join_ordering)
-          effective_ordering = invite_ordering || join_ordering
+          effective_ordering = bounds.invite_ordering || bounds.join_ordering
           effective_ordering != nil and event.stream_ordering >= effective_ordering
 
         {_, m} when m in ["leave", "ban"] ->
-          can_access_as_past_member?(user_id, room_id, event, history_visibility, m)
+          within_membership? =
+            bounds.leave_ordering != nil and event.stream_ordering <= bounds.leave_ordering
+
+          within_membership? and
+            case bounds.history_visibility do
+              "shared" ->
+                true
+
+              "joined" ->
+                bounds.join_ordering != nil and event.stream_ordering >= bounds.join_ordering
+
+              "invited" ->
+                effective_ordering = bounds.invite_ordering || bounds.join_ordering
+                effective_ordering != nil and event.stream_ordering >= effective_ordering
+
+              _ ->
+                false
+            end
 
         _ ->
           false
       end
     end
-  end
-
-  # A user who has left (or been banned from) a room doesn't lose access
-  # to what they legitimately already saw while a member — only to
-  # anything from after they left. Point-in-time state: whatever
-  # history_visibility would have granted a *joined* member is evaluated
-  # the same way here, just capped above by the user's own leave/ban
-  # ordering (their most recent one, if they cycled through
-  # join/leave/rejoin more than once — an intentional simplification, not
-  # per-cycle history). `current_membership` ("leave" or "ban") is passed
-  # in rather than re-derived, since it's already known to be whichever
-  # of the two is the user's *latest* membership transition — querying
-  # both and picking one would risk picking the older of the two.
-  defp can_access_as_past_member?(user_id, room_id, event, history_visibility, current_membership) do
-    leave_ordering = get_user_membership_ordering(user_id, room_id, current_membership)
-    join_ordering = get_user_membership_ordering(user_id, room_id, "join")
-
-    within_membership? =
-      leave_ordering != nil and event.stream_ordering <= leave_ordering
-
-    within_membership? and
-      case history_visibility do
-        "shared" ->
-          true
-
-        "joined" ->
-          join_ordering != nil and event.stream_ordering >= join_ordering
-
-        "invited" ->
-          invite_ordering = get_user_invite_before_join(user_id, room_id, join_ordering)
-          effective_ordering = invite_ordering || join_ordering
-          effective_ordering != nil and event.stream_ordering >= effective_ordering
-
-        _ ->
-          false
-      end
   end
 
   defp get_user_membership_ordering(user_id, room_id, membership) do
@@ -362,8 +375,11 @@ defmodule AxonWeb.EventController do
 
       from_ordering = parse_token(from_token) || EventStore.room_max_stream_ordering(room_id) + 1
 
+      bounds = visibility_bounds(room_id, user_id)
+
       events =
         EventStore.get_messages(room_id, from_ordering, dir, limit)
+        |> Enum.filter(&event_visible?(bounds, &1))
         |> filter_contains_url(filter)
 
       start_token = if from_token, do: from_token, else: Integer.to_string(from_ordering)

@@ -349,6 +349,57 @@ defmodule AxonWeb.EventControllerTest do
     end
   end
 
+  describe "get_messages/2 history visibility" do
+    # Regression: get_messages/2 fetched a page purely by stream_ordering
+    # and applied no history_visibility filtering at all — a joined
+    # member saw the room's entire retained history regardless of
+    # history_visibility's invited/joined settings. Shares its rules with
+    # GET /event/{id} via EventController.visibility_bounds/2 +
+    # event_visible?/2, computed once per request rather than per event.
+    test "a member sees only events sent after they joined when visibility is 'joined'" do
+      alice = register("alice_msgvis_#{System.unique_integer([:positive])}")
+      bob = register("bob_msgvis_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      pre_join_event = send_message(alice.token, room_id, %{"body" => "before bob joined"})
+
+      vis_conn =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/rooms/#{room_id}/state/m.room.history_visibility", %{
+          "history_visibility" => "joined"
+        })
+
+      assert vis_conn.status == 200
+
+      join_room(bob.token, room_id)
+      post_join_event = send_message(alice.token, room_id, %{"body" => "after bob joined"})
+
+      conn =
+        authed(bob.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/messages?dir=b&limit=20")
+
+      event_ids = decode(conn)["chunk"] |> Enum.map(& &1["event_id"])
+      assert post_join_event in event_ids
+      refute pre_join_event in event_ids
+    end
+
+    test "a member sees the full history when visibility is 'shared' (the default)" do
+      alice = register("alice_msgvisshared_#{System.unique_integer([:positive])}")
+      bob = register("bob_msgvisshared_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      pre_join_event = send_message(alice.token, room_id, %{"body" => "before bob joined"})
+      join_room(bob.token, room_id)
+
+      conn =
+        authed(bob.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/messages?dir=b&limit=20")
+
+      event_ids = decode(conn)["chunk"] |> Enum.map(& &1["event_id"])
+      assert pre_join_event in event_ids
+    end
+  end
+
   describe "get_event/2 history visibility for a user who has left the room" do
     # Regression: can_access_event?/3's membership case had no branch for
     # "leave" or "ban" at all — every non-"join" membership fell through
