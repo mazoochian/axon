@@ -711,6 +711,114 @@ defmodule AxonRoom.RoomProcessTest do
       refute stored.soft_failed
       refute stored.rejected
     end
+
+    # Regression: insert_event/2's on_conflict clause used to unconditionally
+    # reset soft_failed to false, and RoomProcess had no guard against
+    # re-running the full auth pipeline for an event_id it had already
+    # soft-failed — so a retried/backfilled resend of the exact same PDU,
+    # arriving after room state had moved on enough to make it pass
+    # AuthRules.check a second time, got silently promoted: applied to
+    # current_state, advanced the room head, and shown to /sync. Per
+    # EventStore.insert_soft_failed_event/2's own doc, soft-failure is a
+    # permanent, one-time determination — this must stay soft-failed no
+    # matter what state does afterward.
+    test "a soft-failed event stays soft-failed forever, even if resent after state evolves to where it would now pass" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      remote_user = "@remote6:federated.example"
+      {joined_at_id, joined_at_depth} = RoomProcess.get_position(room_id)
+
+      join_pdu = %{
+        "event_id" => "$softfailsticky_join_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => joined_at_depth + 1,
+        "prev_events" => [joined_at_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, _} = RoomProcess.apply_remote_event(room_id, join_pdu)
+      {fork_point_id, fork_depth} = RoomProcess.get_position(room_id)
+
+      # Other branch wins: creator bans remote_user.
+      assert {:ok, _} =
+               RoomProcess.send_event(room_id, creator, "m.room.member", %{"membership" => "ban"},
+                 state_key: remote_user
+               )
+
+      message_pdu = %{
+        "event_id" => "$softfailsticky_msg_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => remote_user,
+        "content" => %{"body" => "sent before I knew I was banned"},
+        "depth" => fork_depth + 1,
+        "prev_events" => [fork_point_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, message_pdu) == {:error, :soft_failed}
+
+      # State moves on further: creator lifts the ban and remote_user
+      # rejoins, so the room's *current* state once again has them as a
+      # member — the exact condition that would let the identical PDU pass
+      # AuthRules.check against current_state a second time.
+      assert {:ok, _} =
+               RoomProcess.send_event(
+                 room_id,
+                 creator,
+                 "m.room.member",
+                 %{"membership" => "leave"},
+                 state_key: remote_user
+               )
+
+      {rejoin_prev_id, rejoin_depth} = RoomProcess.get_position(room_id)
+
+      rejoin_pdu = %{
+        "event_id" => "$softfailsticky_rejoin_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => rejoin_depth + 1,
+        "prev_events" => [rejoin_prev_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, _} = RoomProcess.apply_remote_event(room_id, rejoin_pdu)
+
+      # Resend the exact same message PDU. It would now legitimately pass
+      # AuthRules.check against current_state (remote_user is a member
+      # again) — but it must stay buried.
+      assert RoomProcess.apply_remote_event(room_id, message_pdu) == {:error, :soft_failed}
+
+      {:ok, stored} = AxonCore.EventStore.get_event(message_pdu["event_id"])
+      assert stored.soft_failed, "must remain soft-failed"
+      refute stored.rejected
+
+      {last_event_id, _depth} = RoomProcess.get_position(room_id)
+      refute last_event_id == message_pdu["event_id"], "must not become the room head"
+
+      by_room =
+        AxonCore.EventStore.get_user_events_since(creator, 0)
+        |> Map.get(room_id, [])
+
+      refute Enum.any?(by_room, &(&1.event_id == message_pdu["event_id"])),
+             "must never leak into /sync, even after the resend"
+    end
   end
 
   describe "stop_if_running/1" do

@@ -232,6 +232,20 @@ defmodule AxonRoom.RoomProcess do
     auth_event_ids = pdu["auth_events"] || []
 
     cond do
+      # Soft-failure is a permanent, one-time determination (see
+      # EventStore.insert_soft_failed_event/2) — if this exact event_id was
+      # already soft-failed (a retried /send transaction, or the same event
+      # re-surfacing via get_missing_events/backfill), it must never be
+      # reconsidered, even if it would legitimately pass AuthRules.check
+      # against *this* call's state.current_state. Without this short
+      # circuit, that re-check would pass, apply_authorized_event would
+      # call EventStore.insert_event/2, and the event would be silently
+      # promoted — resurrecting exactly what soft-failure is supposed to
+      # bury for good. Checked first: cheapest of these guards, and the one
+      # whose verdict can never be overridden by anything below it.
+      already_soft_failed?(pdu["event_id"]) ->
+        {:reply, {:error, :soft_failed}, state}
+
       # Transitive rejection: per spec, an event whose auth_events list
       # references an already-rejected event must itself be rejected,
       # regardless of what AuthRules.check would otherwise say (it never
@@ -453,6 +467,16 @@ defmodule AxonRoom.RoomProcess do
     end
 
     {:reply, {:error, :soft_failed}, state}
+  end
+
+  # See the soft-failure guard at the top of handle_call({:apply_remote_event,
+  # ...}) — nil event_id (shouldn't happen for a real wire PDU, but some
+  # test/internal callers build one without) can never already be stored,
+  # so short-circuits to false rather than querying.
+  defp already_soft_failed?(nil), do: false
+
+  defp already_soft_failed?(event_id) do
+    match?({:ok, %{soft_failed: true}}, EventStore.get_event(event_id))
   end
 
   defp load_room(room_id) do
