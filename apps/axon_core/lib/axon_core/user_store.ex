@@ -227,9 +227,7 @@ defmodule AxonCore.UserStore do
 
     except_device_id =
       except_hash &&
-        Repo.one(
-          from(t in AccessToken, where: t.token_hash == ^except_hash, select: t.device_id)
-        )
+        Repo.one(from(t in AccessToken, where: t.token_hash == ^except_hash, select: t.device_id))
 
     q = from(t in AccessToken, where: t.user_id == ^user_id and t.valid == true)
     q = if except_hash, do: from(t in q, where: t.token_hash != ^except_hash), else: q
