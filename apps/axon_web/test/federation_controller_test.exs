@@ -882,7 +882,10 @@ defmodule AxonWeb.FederationControllerTest do
     # coverage of the same fork): a remote event whose single prev_event is
     # a known, already-applied ancestor several generations behind the
     # current head (not missing — a genuine DAG fork, not a gap) must still
-    # be accepted, not silently soft-failed.
+    # be accepted, not silently soft-failed. No "event_id" on the wire —
+    # exactly what a real room v11 PDU looks like, and exactly what let the
+    # send_transaction/2 event_id-attachment bug above hide behind this
+    # test until it stopped hand-supplying a fake one.
     test "a PDU whose single prev_event is a known ancestor several generations behind our head is accepted, not soft-failed" do
       owner = new_local_user("owner")
       {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
@@ -898,7 +901,6 @@ defmodule AxonWeb.FederationControllerTest do
 
       late_pdu =
         signed_remote_event(%{
-          "event_id" => "$netpartition_#{System.unique_integer([:positive])}",
           "room_id" => room_id,
           "type" => "m.room.message",
           "sender" => remote_member,
@@ -907,13 +909,16 @@ defmodule AxonWeb.FederationControllerTest do
           "prev_events" => [fork_point_id],
           "origin_server_ts" => System.os_time(:millisecond)
         })
+        |> Map.delete("event_id")
+
+      expected_event_id = EventHash.reference_hash(late_pdu, "11")
 
       txn_id = "txn_#{System.unique_integer([:positive])}"
       conn = signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [late_pdu]})
 
       assert conn.status == 200
 
-      {:ok, stored} = EventStore.get_event(late_pdu["event_id"])
+      {:ok, stored} = EventStore.get_event(expected_event_id)
       refute stored.rejected, "late-arriving forked PDU was rejected instead of applied"
       refute stored.soft_failed, "late-arriving forked PDU was soft-failed instead of applied"
     end
@@ -1026,6 +1031,67 @@ defmodule AxonWeb.FederationControllerTest do
 
       requests = FakeRemoteMatrixServer.requests(@port)
       assert Enum.any?(requests, &(&1.path =~ "/get_missing_events/"))
+    end
+
+    # Regression: room versions 3+ never carry "event_id" on the wire, so a
+    # gap-triggering PDU received this way has none either. The outbound
+    # get_missing_events request's "latest_events" must be the PDU's
+    # *computed* reference hash, not a literal null from reading a wire
+    # field that was never there (Complement:
+    # TestOutboundFederationEventSizeGetMissingEvents caught this — "got
+    # latest_events [null] want [$real_event_id]").
+    test "the outbound get_missing_events request's latest_events is the PDU's computed event_id, not null" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      missing_event =
+        signed_remote_event(%{
+          "event_id" => "$gapmissing2_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "the missing one"},
+          "depth" => depth + 1,
+          "prev_events" => [last_event_id],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"POST", ~r{^/_matrix/federation/v1/get_missing_events/}},
+        200,
+        %{"events" => [missing_event]}
+      )
+
+      # No "event_id" — exactly what a real room v11 wire PDU looks like.
+      pdu =
+        signed_remote_event(%{
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "the one that arrived"},
+          "depth" => depth + 2,
+          "prev_events" => [missing_event["event_id"]],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+        |> Map.delete("event_id")
+
+      expected_event_id = EventHash.reference_hash(pdu, "11")
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      conn = signed_put("/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [pdu], "edus" => []})
+
+      assert conn.status == 200
+      assert {:ok, _} = EventStore.get_event(expected_event_id)
+
+      [gap_request] =
+        Enum.filter(FakeRemoteMatrixServer.requests(@port), &(&1.path =~ "/get_missing_events/"))
+
+      assert gap_request.body["latest_events"] == [expected_event_id]
     end
 
     test "falls back to backfill when get_missing_events comes back empty" do

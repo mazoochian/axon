@@ -497,7 +497,19 @@ defmodule AxonWeb.FederationController do
       # Process each PDU
       pdu_results =
         Enum.into(pdus, %{}, fn pdu ->
+          # Room versions 3+ never carry "event_id" on the wire (it's the
+          # reference hash) — event_id was computed here for the response
+          # map's key, but the *pdu itself* went on to process_inbound_pdu/2
+          # still missing it, all the way down through
+          # AxonFederation.Backfill and AxonRoom.RoomProcess to
+          # AxonCore.EventStore.insert_event/2, which got a nil event_id
+          # and NOT-NULL-violated on every single such PDU. Every axon test
+          # covering this path hand-supplied a fake "event_id" on its test
+          # PDUs (a convenience that happens to also paper over this
+          # exact bug), which is why this went uncaught until traced from
+          # a real Complement failure that sends a spec-correct wire PDU.
           event_id = pdu["event_id"] || compute_event_id(pdu)
+          pdu = Map.put(pdu, "event_id", event_id)
           result = process_inbound_pdu(pdu, origin)
 
           {event_id,
