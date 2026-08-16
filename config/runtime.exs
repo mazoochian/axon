@@ -52,6 +52,13 @@ if config_env() == :prod do
       account_management_url: System.get_env("OIDC_ACCOUNT_MANAGEMENT_URL")
   end
 
+  # Optional — leave AXON_APPSERVICE_DIR unset outside Complement.
+  # complement/start.sh sets this to /complement/appservice, the fixed
+  # path Complement copies one Synapse-style registration YAML into per
+  # configured application service — see AxonWeb.AppService.Manager and
+  # AxonWeb.AppService.RegistrationYaml.
+  config :axon_web, :appservice_dir, System.get_env("AXON_APPSERVICE_DIR")
+
   # Optional — leave SENTRY_DSN unset to run without error tracking.
   config :sentry, dsn: System.get_env("SENTRY_DSN")
 

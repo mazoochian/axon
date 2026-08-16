@@ -46,6 +46,13 @@ export SECRET_KEY_BASE=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 64 | he
 # limits by design — see config/runtime.exs.
 export RELAXED_RATE_LIMITS=true
 
+# Fixed path Complement copies one Synapse-style registration YAML into
+# per application service configured on this homeserver in the blueprint
+# (present even if the blueprint defines none — the directory just won't
+# exist then, which AxonWeb.AppService.Manager tolerates the same way it
+# tolerates a missing appservices.json).
+export AXON_APPSERVICE_DIR=/complement/appservice
+
 # Complement talks to the federation port over real TLS (accepting any
 # self-signed cert, so this alone would be enough for Complement's own
 # federation.Server client — see config/runtime.exs). But server-to-server

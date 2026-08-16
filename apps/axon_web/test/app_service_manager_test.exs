@@ -58,6 +58,48 @@ defmodule AxonWeb.AppService.ManagerTest do
     end
   end
 
+  describe "owns_user?/2" do
+    setup do
+      previous = Application.get_env(:axon_web, :server_name)
+      Application.put_env(:axon_web, :server_name, "test.local")
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:axon_web, :server_name, previous),
+          else: Application.delete_env(:axon_web, :server_name)
+      end)
+
+      :ok
+    end
+
+    test "always owns its own sender_localpart user, regardless of namespace" do
+      reg = %{
+        "sender_localpart" => "the-bridge-user",
+        "namespaces" => %{"users" => []}
+      }
+
+      assert Manager.owns_user?(reg, "@the-bridge-user:test.local")
+    end
+
+    test "owns a user matching one of its registered namespace regexes" do
+      reg = %{
+        "sender_localpart" => "the-bridge-user",
+        "namespaces" => %{"users" => [%{"regex" => "@bridge_.*", "exclusive" => true}]}
+      }
+
+      assert Manager.owns_user?(reg, "@bridge_ghost1:test.local")
+    end
+
+    test "does not own a user matching no namespace and not its own sender user" do
+      reg = %{
+        "sender_localpart" => "the-bridge-user",
+        "namespaces" => %{"users" => [%{"regex" => "@bridge_.*", "exclusive" => true}]}
+      }
+
+      refute Manager.owns_user?(reg, "@someone_else:test.local")
+    end
+  end
+
   describe "event dispatch (handle_info {:new_event, ...})" do
     setup do
       port = 18_900 + :erlang.unique_integer([:positive, :monotonic])
