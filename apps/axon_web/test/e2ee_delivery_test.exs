@@ -390,6 +390,69 @@ defmodule AxonWeb.E2EEDeliveryTest do
              end)
     end
 
+    # Regression: AxonFederation.DeviceListFanout's scan cursor used to
+    # live only in the GenServer's own memory, starting at 0 on every
+    # init/1 — indistinguishable, at the Elixir level, from a genuine
+    # process/container restart (not just an in-app crash). A restart
+    # re-scanned the *entire* device_list_updates table from the
+    # beginning and re-fanned every historical change any local user ever
+    # had, all over again — landing as spurious duplicate
+    # "m.device_list_update" EDUs for changes a remote peer already
+    # correctly knew about (Complement:
+    # TestDeviceListsUpdateOverFederation's interrupted_connectivity/
+    # stopped_server subtests, which restart a homeserver container
+    # mid-test — indistinguishable from a fresh boot here). The cursor is
+    # now persisted (device_list_fanout_cursor) and reloaded on restart
+    # instead of defaulting back to 0.
+    test "a restart of the fanout process does not re-announce an already-fanned-out change" do
+      alice = register("alice_dlfed_restart_#{System.unique_integer([:positive])}")
+      bob = remote_user_id("bob")
+
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+      join_remote_member(room_id, bob)
+
+      KeyStore.record_device_list_update(alice.user_id)
+
+      wait_until(System.monotonic_time(:millisecond) + 3_000, fn ->
+        FakeRemoteMatrixServer.requests(@port)
+        |> Enum.flat_map(&(&1.body["edus"] || []))
+        |> Enum.find(fn edu ->
+          edu["edu_type"] == "m.device_list_update" and
+            edu["content"]["user_id"] == alice.user_id
+        end)
+        |> case do
+          nil -> :error
+          edu -> {:ok, edu}
+        end
+      end)
+
+      FakeRemoteMatrixServer.clear_requests(@port)
+
+      # Simulates a process/container restart — the supervisor (:one_for_one)
+      # brings it straight back up, calling init/1 fresh.
+      pid_before = Process.whereis(AxonFederation.DeviceListFanout)
+      Process.exit(pid_before, :kill)
+
+      wait_until(System.monotonic_time(:millisecond) + 3_000, fn ->
+        case Process.whereis(AxonFederation.DeviceListFanout) do
+          nil -> :error
+          pid when pid != pid_before -> {:ok, pid}
+          _ -> :error
+        end
+      end)
+
+      # Give the restarted poller several ticks (500ms interval) to
+      # (incorrectly) re-announce alice's already-fanned-out change.
+      Process.sleep(1_500)
+
+      refute FakeRemoteMatrixServer.requests(@port)
+             |> Enum.flat_map(&(&1.body["edus"] || []))
+             |> Enum.any?(fn edu ->
+               edu["edu_type"] == "m.device_list_update" and
+                 edu["content"]["user_id"] == alice.user_id
+             end)
+    end
+
     test "an inbound m.device_list_update EDU surfaces the remote sender in the local room-mate's device_lists.changed" do
       alice = register("alice_dlfed_in_#{System.unique_integer([:positive])}")
       bob = remote_user_id("bob")

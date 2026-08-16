@@ -47,23 +47,36 @@ defmodule AxonFederation.DeviceListFanout do
   could subscribe to that covers every user who might ever change. A short
   poll interval keeps propagation latency low without one.
 
-  The scan cursor (`last_id`) lives only in this process's memory and
-  starts at 0 on every `init/1` — deliberately, not "the current watermark
-  at boot": this `GenServer` restarting (a `one_for_one` supervisor
-  restart from a transient crash, not just a fresh application boot) must
-  not silently skip whatever row was pending right when it crashed, since
-  nothing else remembers "was this one already sent" on its behalf.
-  Re-scanning from 0 costs a full-table read on every restart and can
-  re-enqueue rows already delivered — both cheap and harmless here: the
-  table is a small append-only signal log (not device-list content
-  itself), `local_user?/2` immediately drops most of it (every row
-  recorded for a *remote* user, e.g. by the inbound EDU handler below),
-  and re-sending is the same idempotent "something changed, go re-query"
-  signal a recipient already has to tolerate out-of-order or duplicated.
-  Durability of a change already noticed, across a crash/restart of *this*
-  server, is `AxonFederation.OutboundQueue`'s job, not this module's — by
-  the time `OutboundQueue.enqueue/2` returns, the transaction is already
-  persisted there.
+  The scan cursor (`last_id`) is persisted in `device_list_fanout_cursor`
+  (a single-row table) and written back after every batch, not just kept
+  in this process's memory. It used to be memory-only, starting at 0 on
+  every `init/1` unconditionally — reasoned as safe because a re-scan
+  just re-sends the same idempotent "something changed, go re-query"
+  signal a recipient already has to tolerate out-of-order or duplicated
+  (durability of a change already noticed, across a crash/restart of
+  *this* server, is `AxonFederation.OutboundQueue`'s job, not this
+  module's — by the time `OutboundQueue.enqueue/2` returns, the
+  transaction is already persisted there). That's true in isolation, but
+  "harmless duplicate" stops being harmless the moment a *genuinely new*
+  change and a *redundant re-fan of ancient history* land close enough
+  together that an observer sees both in the same window and can't tell
+  them apart — e.g. Complement's TestDeviceListsUpdateOverFederation
+  restarts a homeserver container mid-test (`interrupted_connectivity`/
+  `stopped_server`), which is indistinguishable from a fresh boot at the
+  Elixir level; every historical device-list change any local user ever
+  had got silently re-announced on top of the specific new change the
+  test was asserting on, breaking its exact-set check. Persisting the
+  cursor fixes that without giving up the original crash-safety property:
+  the write happens *after* a batch's rows have already been durably
+  handed to `OutboundQueue.enqueue/2`, so a crash between "read the rows"
+  and "persist the new cursor" just re-scans that same small batch next
+  time — same "at least once, cheaply" guarantee as before, minus the
+  unbounded full-history replay on an ordinary restart. Loading the
+  cursor happens lazily on the first `:poll` tick, not synchronously in
+  `init/1` — same reason `init/1` still does no DB work: a `Repo` call
+  before anything has checked out a sandboxed connection (test) or before
+  the pool has finished starting (prod) would crash this whole app's
+  *supervisor* start, not just get this one GenServer restarted.
   """
 
   use GenServer
@@ -88,12 +101,13 @@ defmodule AxonFederation.DeviceListFanout do
     # or before the DB connection pool has finished starting (in prod);
     # raising here would crash this whole app's *supervisor* start (every
     # sibling, not just this child), not just get this one GenServer
-    # restarted the way a crash from `handle_info/2` does. `last_id: 0` is
-    # a literal, not a query, so it's safe to set synchronously here — see
-    # moduledoc for why 0 (not "current watermark") is the right start
-    # point on every init, restart included.
+    # restarted the way a crash from `handle_info/2` does. `last_id: nil`
+    # is a sentinel poll/1 recognizes as "cursor not loaded from
+    # device_list_fanout_cursor yet" — the actual load is deferred to the
+    # first scheduled `:poll` tick alongside the rest of this module's DB
+    # work, not done synchronously here.
     schedule_poll()
-    {:ok, %{last_id: 0}}
+    {:ok, %{last_id: nil}}
   end
 
   @impl true
@@ -125,6 +139,13 @@ defmodule AxonFederation.DeviceListFanout do
 
   defp schedule_poll, do: Process.send_after(self(), :poll, @poll_interval_ms)
 
+  # Cursor not loaded yet (fresh process, first tick since init/1) — load
+  # it (or seed it, on a genuine first-ever boot) before doing the real
+  # scan below, on this same tick.
+  defp poll(%{last_id: nil} = state) do
+    poll(%{state | last_id: load_or_seed_cursor()})
+  end
+
   defp poll(state) do
     rows =
       Repo.all(
@@ -147,8 +168,43 @@ defmodule AxonFederation.DeviceListFanout do
         |> Enum.uniq()
         |> Enum.each(&maybe_fan_out(&1, local_server))
 
-        %{state | last_id: rows |> List.last() |> Map.fetch!(:id)}
+        new_last_id = rows |> List.last() |> Map.fetch!(:id)
+        # Persisted *after* every row in this batch has already been
+        # durably handed to OutboundQueue.enqueue/2 (inside maybe_fan_out
+        # above) — a crash between those two steps just re-scans this
+        # same small batch on the next tick, not the entire table's
+        # history. See moduledoc for why this replaced a memory-only,
+        # always-starts-at-0 cursor.
+        persist_cursor(new_last_id)
+        %{state | last_id: new_last_id}
     end
+  end
+
+  defp load_or_seed_cursor do
+    case Repo.one(from(c in "device_list_fanout_cursor", where: c.id == 1, select: c.last_id)) do
+      nil ->
+        # Genuine first-ever boot (no cursor row yet): seed to the
+        # current max id, not 0, so this doesn't retroactively re-fan
+        # every device-list change that predates this cursor's own
+        # existence — matches what a memory-only `last_id: 0` start
+        # would have (wrongly) done on every restart forever, just
+        # exactly once now.
+        seed = Repo.one(from(u in "device_list_updates", select: max(u.id))) || 0
+        persist_cursor(seed)
+        seed
+
+      last_id ->
+        last_id
+    end
+  end
+
+  defp persist_cursor(last_id) do
+    Repo.insert_all(
+      "device_list_fanout_cursor",
+      [%{id: 1, last_id: last_id}],
+      on_conflict: {:replace, [:last_id]},
+      conflict_target: [:id]
+    )
   end
 
   defp maybe_fan_out(user_id, local_server) do
