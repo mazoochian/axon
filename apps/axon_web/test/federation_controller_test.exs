@@ -1296,7 +1296,7 @@ defmodule AxonWeb.FederationControllerTest do
       assert length(pdus) == 2
     end
 
-    test "get_missing_events walks prev_events from latest_events back to (not including) earliest_events, oldest first",
+    test "get_missing_events walks the prev_events of latest_events, excluding both boundaries, oldest first",
          %{room_id: room_id, owner: owner} do
       {:ok, earliest} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "e"})
       {:ok, e1} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "one"})
@@ -1313,7 +1313,11 @@ defmodule AxonWeb.FederationControllerTest do
       assert conn.status == 200
       event_ids = decode(conn)["events"] |> Enum.map(& &1["event_id"])
 
-      assert event_ids == [e1, e2, latest]
+      # Per spec this is "a breadth first walk of the prev_events for
+      # latest_events" — latest_events are events the requester already
+      # has, so `latest` itself must NOT come back, only its ancestors
+      # strictly between it and `earliest` (also excluded).
+      assert event_ids == [e1, e2]
     end
 
     test "get_missing_events respects limit", %{room_id: room_id, owner: owner} do
@@ -1333,6 +1337,56 @@ defmodule AxonWeb.FederationControllerTest do
         })
 
       assert length(decode(conn)["events"]) == 2
+    end
+
+    # Regression for the Complement TestInboundCanReturnMissingEvents
+    # failure: latest_events was being seeded straight into the walk's
+    # queue, so it got returned as an extra trailing event the caller
+    # never asked for (it already has it — that's the point of naming it
+    # as the near boundary). Mirrors the Complement test's own shape: a
+    # membership event as latest_events, with a content-bearing message
+    # event as the true last item that should come back.
+    test "get_missing_events excludes latest_events itself even though it's found locally", %{
+      room_id: room_id,
+      owner: owner
+    } do
+      {:ok, earliest} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "e"})
+
+      {:ok, msg} =
+        RoomProcess.send_event(room_id, owner, "m.room.message", %{
+          "body" => "hello",
+          "msgtype" => "m.text"
+        })
+
+      # A member of the requesting origin server (@server_name) — not a
+      # local user — so origin_visibility_bounds/2 finds them as the
+      # origin's own room member and judges "shared" visibility (the
+      # room's default) against their (very much still current) join,
+      # same as any other resident member.
+      joiner = remote_user("joiner")
+
+      {:ok, join_event} =
+        RoomProcess.send_event(room_id, joiner, "m.room.member", %{"membership" => "join"},
+          state_key: joiner
+        )
+
+      conn =
+        signed_post("/_matrix/federation/v1/get_missing_events/#{URI.encode(room_id)}", %{
+          "earliest_events" => [earliest],
+          "latest_events" => [join_event],
+          "limit" => 10
+        })
+
+      assert conn.status == 200
+      events = decode(conn)["events"]
+      event_ids = Enum.map(events, & &1["event_id"])
+
+      refute join_event in event_ids
+      assert msg in event_ids
+
+      msg_event = Enum.find(events, &(&1["event_id"] == msg))
+      assert msg_event["content"]["msgtype"] == "m.text"
+      assert msg_event["content"]["body"] == "hello"
     end
   end
 
@@ -1532,7 +1586,10 @@ defmodule AxonWeb.FederationControllerTest do
       request = %{"one_time_keys" => %{local_user => %{"DEV1" => "curve25519"}}}
 
       conn1 = signed_post("/_matrix/federation/v1/user/keys/claim", request)
-      assert decode(conn1)["one_time_keys"][local_user]["DEV1"] == %{"curve25519:AAAAAA" => key_json}
+
+      assert decode(conn1)["one_time_keys"][local_user]["DEV1"] == %{
+               "curve25519:AAAAAA" => key_json
+             }
 
       conn2 = signed_post("/_matrix/federation/v1/user/keys/claim", request)
       refute Map.has_key?(decode(conn2)["one_time_keys"], local_user)

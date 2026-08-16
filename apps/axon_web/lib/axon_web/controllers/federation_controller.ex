@@ -13,6 +13,7 @@ defmodule AxonWeb.FederationController do
   alias AxonCrypto.{EventHash, KeyServer}
   alias AxonRoom.{RestrictedJoin, RoomProcess, ServerAcl}
   alias AxonFederation.{Backfill, EventVerification}
+  alias AxonWeb.EventController
   require Logger
 
   # ---------------------------------------------------------------------------
@@ -792,18 +793,63 @@ defmodule AxonWeb.FederationController do
       latest_events = params["latest_events"] || []
       limit = params["limit"] || 10
 
-      events = walk_missing_events(room_id, latest_events, earliest_events, limit)
+      # Per spec: "a breadth first walk of the prev_events for
+      # latest_events" — latest_events are events the requester already
+      # has (that's the whole reason it's naming them as the near edge of
+      # the gap it wants filled), so the walk starts at *their*
+      # prev_events, not at latest_events themselves. Seeding the queue
+      # with latest_events directly (as this used to do) made every
+      # latest_event get emitted as part of the response — an extra,
+      # already-known event tacked onto the end that the requester never
+      # asked for and (per the Complement inbound-missing-events suite)
+      # breaks index-based assertions on what comes back.
+      seed_prev_events =
+        latest_events
+        |> Enum.flat_map(fn event_id ->
+          case Repo.get_by(Event, event_id: event_id, room_id: room_id) do
+            nil -> []
+            event -> event.prev_event_ids
+          end
+        end)
 
-      json(conn, %{
-        "events" => Enum.map(events, &EventStore.event_to_pdu/1)
-      })
+      # latest_events go into `seen` up front (not just as a queue seed)
+      # so that if the walk reaches one of them again via some other path
+      # (a diamond in the DAG), it's still skipped rather than emitted.
+      seen = MapSet.new(latest_events)
+
+      events = walk_missing_events(room_id, seed_prev_events, earliest_events, limit, seen)
+
+      # get_missing_events fills gaps in a REMOTE server's copy of the DAG,
+      # so — same as any other backfill-shaped federation response — each
+      # event's history_visibility applies, judged against that origin
+      # server (was any of *its* users in the room, visible-enough, at the
+      # point of this event?), not against the local room membership. An
+      # event outside what the origin may see comes back redacted, never
+      # omitted: dropping it instead would break prev_events continuity
+      # for whichever room member on the other end can't fill the gap any
+      # other way.
+      room_version = EventStore.get_room_version(room_id)
+      origin_bounds = origin_visibility_bounds(room_id, origin)
+
+      pdus =
+        Enum.map(events, fn event ->
+          pdu = EventStore.event_to_pdu(event)
+
+          if Enum.any?(origin_bounds, &EventController.event_visible?(&1, event)) do
+            pdu
+          else
+            AxonCrypto.Redaction.redact(pdu, room_version)
+          end
+        end)
+
+      json(conn, %{"events" => pdus})
     else
       acl_forbidden(conn)
     end
   end
 
-  # Per spec: walk backward from latest_events via prev_events, collecting
-  # up to `limit` events, without stepping past earliest_events (the
+  # Per spec: walk backward from latest_events' prev_events, collecting up
+  # to `limit` events, without stepping past earliest_events (the
   # requester's own fork point — excluded from the result, and its
   # ancestors are never visited, since the requester already has those
   # too). Not a stream_ordering range scan: the caller's earliest/latest
@@ -815,7 +861,7 @@ defmodule AxonWeb.FederationController do
   # *last*-visited event (the one deepest in the walk, i.e. chronologically
   # earliest) ends up first in the list — which is exactly the order the
   # spec wants back: earliest to latest, without an explicit reverse.
-  defp walk_missing_events(room_id, queue, earliest_events, limit, seen \\ MapSet.new(), acc \\ [])
+  defp walk_missing_events(room_id, queue, earliest_events, limit, seen, acc \\ [])
 
   defp walk_missing_events(_room_id, [], _earliest, _limit, _seen, acc), do: acc
 
@@ -845,6 +891,37 @@ defmodule AxonWeb.FederationController do
         end
     end
   end
+
+  # `AxonWeb.EventController.visibility_bounds/2` was built for a single
+  # local user (GET /event, /messages, /sync). Federation needs the same
+  # decision made for a whole *server*: history_visibility is per-event,
+  # but "can this origin see it" has to be judged against whichever of the
+  # origin's own users has been in the room the longest, since any one of
+  # them having visibility is enough (mirrors the reference
+  # `filter_events_for_server` shape — union of visibility over the
+  # server's own members, not just its "current" one).
+  #
+  # Bounds are computed once per request, not once per event: same reason
+  # `visibility_bounds/2` itself split "figure out the rules" from
+  # "apply them" — an O(events) fan-out of membership queries here would
+  # undo exactly the batching that function exists for.
+  #
+  # A synthetic never-a-member id is always included alongside any real
+  # members found, so a `world_readable` room answers correctly even for
+  # an origin with no member in the room at all (its bounds carry
+  # `membership: nil`, which `event_visible?/2` only cares about once
+  # `world_readable` has already short-circuited to `true`).
+  defp origin_visibility_bounds(room_id, origin) do
+    real_member_ids =
+      Repo.all(from(m in "room_memberships", where: m.room_id == ^room_id, select: m.user_id))
+      |> Enum.filter(&(AxonCore.MatrixId.server_name(&1) == origin))
+
+    ([synthetic_non_member_id(origin)] ++ real_member_ids)
+    |> Enum.uniq()
+    |> Enum.map(&EventController.visibility_bounds(room_id, &1))
+  end
+
+  defp synthetic_non_member_id(origin), do: "@_get_missing_events_probe:#{origin}"
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/timestamp_to_event/:room_id

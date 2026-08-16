@@ -133,6 +133,100 @@ defmodule AxonRoom.RoomProcessTest do
     end
   end
 
+  describe "send_event/5 — duplicate state event suppression" do
+    # Mirrors Synapse's `deduplicate_state_event`: re-setting a piece of
+    # room state to exactly the content it already has is a no-op that
+    # hands back the existing event_id rather than minting a second,
+    # indistinguishable event. Complement's TestInboundCanReturnMissingEvents
+    # "shared visibility" subtest depends on this: a room's preset already
+    # sets history_visibility=shared, and the test then explicitly PUTs
+    # history_visibility=shared again — a spec-compliant peer must not grow
+    # the DAG by one event for that.
+    test "re-sending identical state content returns the existing event_id, not a new one" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      {:ok, first_id} =
+        RoomProcess.send_event(
+          room_id,
+          creator,
+          "m.room.history_visibility",
+          %{"history_visibility" => "shared"},
+          state_key: ""
+        )
+
+      {before_last_event_id, before_depth} = RoomProcess.get_position(room_id)
+
+      {:ok, second_id} =
+        RoomProcess.send_event(
+          room_id,
+          creator,
+          "m.room.history_visibility",
+          %{"history_visibility" => "shared"},
+          state_key: ""
+        )
+
+      assert second_id == first_id
+      # No new event was persisted: the room's position is untouched.
+      assert RoomProcess.get_position(room_id) == {before_last_event_id, before_depth}
+    end
+
+    test "re-sending identical content from a different sender is NOT deduplicated" do
+      creator = new_user("alice")
+      bob = new_user("bob")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      {:ok, _} =
+        RoomProcess.send_event(room_id, bob, "m.room.member", %{"membership" => "join"},
+          state_key: bob
+        )
+
+      {:ok, _} =
+        RoomProcess.send_event(
+          room_id,
+          creator,
+          "m.room.name",
+          %{"name" => "Same Name"},
+          state_key: ""
+        )
+
+      # bob lacks power to actually change the name, but that's exactly the
+      # point: a different sender must go through the normal auth check
+      # rather than being silently deduplicated against creator's event.
+      assert RoomProcess.send_event(
+               room_id,
+               bob,
+               "m.room.name",
+               %{"name" => "Same Name"},
+               state_key: ""
+             ) ==
+               {:error, :insufficient_power}
+    end
+
+    test "changed content is never deduplicated" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      {:ok, first_id} =
+        RoomProcess.send_event(room_id, creator, "m.room.topic", %{"topic" => "a"}, state_key: "")
+
+      {:ok, second_id} =
+        RoomProcess.send_event(room_id, creator, "m.room.topic", %{"topic" => "b"}, state_key: "")
+
+      refute second_id == first_id
+
+      assert RoomProcess.get_state_event(room_id, "m.room.topic", "")["content"] == %{
+               "topic" => "b"
+             }
+    end
+  end
+
   describe "apply_remote_event/2 — auth rejection" do
     test "a PDU that fails auth is rejected, not applied, but IS stored as rejected" do
       creator = new_user("alice")
