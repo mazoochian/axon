@@ -37,6 +37,7 @@ defmodule AxonWeb.RoomController do
 
       with {:ok, room_id} <- CreateRoom.execute(user_id, opts) do
         invite_remote_members(room_id, user_id, opts[:invite], server_name, params["is_direct"])
+        invite_3pid_members(room_id, user_id, params["invite_3pid"])
         json(conn, %{"room_id" => room_id})
       else
         # These two power_level_content_override validation failures don't
@@ -606,25 +607,212 @@ defmodule AxonWeb.RoomController do
     end
   end
 
-  # Third-party (3pid) invite: no Matrix user ID is known yet, so unlike a
-  # normal invite this creates an m.room.third_party_invite state event
-  # (AuthRules rule 7) rather than an m.room.member one — the eventual
-  # invitee only gets a real membership row once they present the signed
-  # proof this generates back through /join (see AuthRules.valid_third_party_invite?/3
-  # and AxonRoom.EventBuilder for the join-side wiring).
+  # Third-party (3pid) invite: no Matrix user ID is known yet, so unless
+  # the 3pid turns out to already be bound to one (checked below via a
+  # real identity-server hash lookup), this creates an
+  # m.room.third_party_invite state event (AuthRules rule 7) rather than
+  # an m.room.member one — the eventual invitee only gets a real
+  # membership row once they present the signed proof this generates
+  # back through /join (see AuthRules.valid_third_party_invite?/3 and
+  # AxonRoom.EventBuilder for the join-side wiring).
   #
-  # axon has no identity-server integration, so there's no third party to
-  # delegate delivery to — for medium "email" this server sends the
-  # notification itself, best-effort, via AxonWeb.Mailer (a no-op unless
-  # SMTP is configured, same as before it existed). Any other medium
-  # (e.g. "msisdn"/SMS, which would need a paid third-party API this
-  # project has no account for) is still out-of-band only — the room-state
-  # mechanics and cryptographic proof are fully real and spec-shaped
-  # either way (self-signed with this server's own key, since there's no
-  # external identity server to delegate to).
+  # Real identity-server-mediated delegation (spec
+  # https://spec.matrix.org/latest/identity-service-api/), replacing the
+  # previous always-self-signed shim:
+  #
+  #   1. Resolve id_server (client param, else DEFAULT_IDENTITY_SERVER)
+  #      and id_access_token (client param, else a self-registered one —
+  #      only for DEFAULT_IDENTITY_SERVER, see
+  #      AxonWeb.IdentityServer.resolve_id_access_token/3) — M_MISSING_PARAM
+  #      if neither is available, matching Synapse's own rejection.
+  #   2. Hashed lookup (hash_details + lookup — the privacy-preserving
+  #      flow, not the deprecated plaintext one) to see whether the 3pid
+  #      is already bound to a real user; if so this is just a normal
+  #      invite to that user; see invite_user/4.
+  #   3. Otherwise, for medium "email", store-invite delegates delivery
+  #      and hands back the real public_key(s)/key_validity_url/
+  #      display_name/token this server's m.room.third_party_invite
+  #      content uses (rather than self-signing). "msisdn" has no
+  #      store-invite equivalent per spec (email-only) — see
+  #      AxonWeb.IdentityServer.request_msisdn_token/3's moduledoc.
+  #
+  # AxonWeb.Mailer's best-effort direct-SMTP send (commit d169469) is
+  # kept as an *additional* notification only, never the primary
+  # mechanism — the identity server's own delivery (real for Sydent,
+  # since it has its own SMTP-sending logic) is what a real deployment
+  # relies on.
   defp invite_3pid(conn, room_id, user_id, params) do
+    case do_invite_3pid(room_id, user_id, params) do
+      :ok ->
+        json(conn, %{})
+
+      {:error, :missing_id_server} ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_MISSING_PARAM",
+          "error" => "id_server is required for 3pid invites (no DEFAULT_IDENTITY_SERVER configured)"
+        })
+
+      {:error, :missing_id_access_token} ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_MISSING_PARAM",
+          "error" => "id_access_token is required for 3pid invites"
+        })
+
+      {:error, :unsupported_medium} ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Unsupported 3pid medium"})
+
+      {:error, {:identity_server, reason}} ->
+        Logger.warning("3pid invite to room #{room_id} failed: #{inspect(reason)}")
+
+        conn
+        |> put_status(502)
+        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to contact identity server: #{inspect(reason)}"})
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # createRoom's own `invite_3pid` list (spec: array of
+  # {id_server, id_access_token, medium, address}) — same delegation as
+  # the standalone /invite endpoint (do_invite_3pid/3), but fire-and-
+  # forget/best-effort like invite_remote_members/5 right above: a
+  # per-invitee identity-server hiccup shouldn't fail room creation
+  # itself, which has already succeeded by the time this runs.
+  defp invite_3pid_members(_room_id, _sender, nil), do: :ok
+
+  defp invite_3pid_members(room_id, sender, invites) when is_list(invites) do
+    Enum.each(invites, fn invite ->
+      case do_invite_3pid(room_id, sender, invite) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "createRoom: 3pid invite (medium=#{inspect(invite["medium"])}) failed for room #{room_id}: #{inspect(reason)}"
+          )
+      end
+    end)
+  end
+
+  defp invite_3pid_members(_room_id, _sender, _invalid), do: :ok
+
+  # Real identity-server-mediated delegation (spec
+  # https://spec.matrix.org/latest/identity-service-api/), replacing the
+  # previous always-self-signed shim:
+  #
+  #   1. Resolve id_server (client param, else DEFAULT_IDENTITY_SERVER)
+  #      and id_access_token (client param, else a self-registered one —
+  #      only for DEFAULT_IDENTITY_SERVER, see
+  #      AxonWeb.IdentityServer.resolve_id_access_token/3) — an error if
+  #      neither is available, matching Synapse's own "id_server and
+  #      id_access_token are required" rejection.
+  #   2. Hashed lookup (hash_details + lookup — the privacy-preserving
+  #      flow, not the deprecated plaintext one) to see whether the 3pid
+  #      is already bound to a real user; if so this is just a normal
+  #      invite to that user (invite_user/4) rather than a third-party one.
+  #   3. Otherwise, for medium "email", store-invite delegates delivery
+  #      and hands back the real public_key(s)/key_validity_url/
+  #      display_name/token this server's m.room.third_party_invite
+  #      content uses (rather than self-signing). "msisdn" has no
+  #      store-invite equivalent per spec (email-only) — see
+  #      AxonWeb.IdentityServer.request_msisdn_token/3's moduledoc.
+  #
+  # AxonWeb.Mailer's best-effort direct-SMTP send (commit d169469) is
+  # kept as an *additional* notification only, never the primary
+  # mechanism — the identity server's own delivery (real for Sydent,
+  # since it has its own SMTP-sending logic) is what a real deployment
+  # relies on.
+  defp do_invite_3pid(room_id, user_id, params) do
     medium = params["medium"]
     address = params["address"]
+
+    with {:ok, id_server} <- AxonWeb.IdentityServer.resolve_id_server(params),
+         {:ok, id_access_token} <-
+           AxonWeb.IdentityServer.resolve_id_access_token(params, id_server, user_id) do
+      case AxonWeb.IdentityServer.hash_lookup(id_server, id_access_token, medium, address) do
+        {:ok, mxid} when is_binary(mxid) ->
+          with {:ok, _event_id} <- invite_user(room_id, user_id, mxid), do: :ok
+
+        # {:ok, nil} (not bound) and {:error, _} (lookup itself failed —
+        # proceed as unbound rather than block the invite on a lookup
+        # hiccup) both fall through to delegating a fresh invite.
+        _ ->
+          create_third_party_invite(room_id, user_id, medium, address, id_server, id_access_token)
+      end
+    end
+  end
+
+  defp create_third_party_invite(room_id, user_id, "email", address, id_server, id_access_token) do
+    current_state = EventStore.get_current_state_map(room_id)
+    room_name = get_in(current_state[{"m.room.name", ""}], ["content", "name"])
+    sender_display_name = get_in(current_state[{"m.room.member", user_id}], ["content", "displayname"])
+
+    store_params =
+      %{
+        "medium" => "email",
+        "address" => address,
+        "room_id" => room_id,
+        "sender" => user_id
+      }
+      |> maybe_put("room_name", room_name)
+      |> maybe_put("sender_display_name", sender_display_name)
+
+    case AxonWeb.IdentityServer.store_invite(id_server, id_access_token, store_params) do
+      {:ok, %{"token" => token} = response} when is_binary(token) ->
+        content = third_party_invite_content(response, id_server)
+
+        with {:ok, _event_id} <-
+               RoomProcess.send_event(room_id, user_id, "m.room.third_party_invite", content,
+                 state_key: token
+               ) do
+          AxonWeb.Mailer.deliver_3pid_invite(address, %{
+            inviter_id: user_id,
+            room_id: room_id,
+            token: token
+          })
+
+          :ok
+        end
+
+      {:ok, other} ->
+        {:error, {:identity_server, {:malformed_store_invite_response, other}}}
+
+      {:error, reason} ->
+        {:error, {:identity_server, reason}}
+    end
+  end
+
+  defp create_third_party_invite(room_id, user_id, "msisdn" = medium, address, id_server, id_access_token) do
+    # No store-invite equivalent for msisdn (spec restricts it to email) —
+    # see AxonWeb.IdentityServer.request_msisdn_token/3's moduledoc. Still
+    # a real, spec-shaped call: opens an actual SMS validation session on
+    # the identity server (best-effort — Sydent's dev instance has no SMS
+    # provider configured and is expected to reject this, which is fine;
+    # what matters is axon genuinely asks rather than hardcoding a no-op).
+    client_secret = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
+
+    case AxonWeb.IdentityServer.request_msisdn_token(id_server, id_access_token, %{
+           "client_secret" => client_secret,
+           "phone_number" => address,
+           "country" => "US",
+           "send_attempt" => 1
+         }) do
+      {:ok, _sid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.info(
+          "identity server #{id_server} msisdn validation session request failed (expected without a real SMS provider configured): #{inspect(reason)}"
+        )
+    end
+
     token = :crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false)
     server_name = AxonCrypto.KeyServer.server_name()
     %{public_key_b64: public_key_b64} = AxonCrypto.KeyServer.server_key_info()
@@ -640,18 +828,55 @@ defmodule AxonWeb.RoomController do
     with {:ok, _event_id} <-
            RoomProcess.send_event(room_id, user_id, "m.room.third_party_invite", content,
              state_key: token
-           ) do
-      if medium == "email" do
-        AxonWeb.Mailer.deliver_3pid_invite(address, %{
-          inviter_id: user_id,
-          room_id: room_id,
-          token: token
-        })
-      end
+           ),
+         do: :ok
+  end
 
-      json(conn, %{})
+  defp create_third_party_invite(_room_id, _user_id, _medium, _address, _id_server, _id_access_token) do
+    {:error, :unsupported_medium}
+  end
+
+  # Builds m.room.third_party_invite content straight from the identity
+  # server's real store-invite response — the public_keys array (and, for
+  # legacy joiners, the single public_key/key_validity_url pair, taken
+  # from the first entry same as Synapse does) are THEIRS, not axon's own
+  # signing key.
+  #
+  # A real identity server's key_validity_url can be relative (confirmed
+  # against a live Sydent: it returns bare paths like
+  # "/_matrix/identity/api/v1/pubkey/isvalid") — resolved against
+  # `id_server` here so what actually lands in room state is always an
+  # absolute, independently-fetchable URL, since any server in the room
+  # (not just axon) needs to be able to call it at join time.
+  defp third_party_invite_content(%{"token" => _} = response, id_server) do
+    public_keys =
+      (response["public_keys"] || [])
+      |> Enum.map(fn entry -> Map.update(entry, "key_validity_url", nil, &resolve_url(id_server, &1)) end)
+
+    first = List.first(public_keys) || %{}
+
+    %{
+      "display_name" => response["display_name"] || "",
+      "public_key" => first["public_key"],
+      "key_validity_url" => first["key_validity_url"],
+      "public_keys" => public_keys
+    }
+    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+    |> Map.new()
+  end
+
+  defp resolve_url(_base_url, nil), do: nil
+
+  defp resolve_url(base_url, url) do
+    if String.starts_with?(url, "http://") or String.starts_with?(url, "https://") do
+      url
+    else
+      base_url <> (if String.starts_with?(url, "/"), do: url, else: "/" <> url)
     end
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp obfuscate_3pid(_medium, address) do
     case String.split(address, "@", parts: 2) do
@@ -863,21 +1088,66 @@ defmodule AxonWeb.RoomController do
         end
 
       with {:ok, content} <- result do
-        {:ok, maybe_attach_third_party_invite(content, third_party_signed)}
+        {:ok, maybe_attach_third_party_invite(content, third_party_signed, current_state)}
       end
     end
   end
 
   # A client that obtained proof of 3pid ownership (mxid/token/signatures —
-  # see AuthRules.valid_third_party_invite?/3 for how it's verified)
-  # attaches it here; harmless to attach speculatively when absent/invalid —
-  # AuthRules just won't treat it as an authorization escape hatch, and the
-  # join falls through to the room's normal join_rule check instead.
-  defp maybe_attach_third_party_invite(content, %{"mxid" => _, "token" => _} = signed) do
-    Map.put(content, "third_party_invite", %{"signed" => signed})
+  # see AuthRules.valid_third_party_invite?/3 for how the signature itself
+  # is verified) attaches it here; harmless to attach speculatively when
+  # absent/malformed — AuthRules just won't treat it as an authorization
+  # escape hatch, and the join falls through to the room's normal
+  # join_rule check instead.
+  #
+  # Beyond the signature check AuthRules does on every event (including
+  # remote/replayed ones, where a network call would be inappropriate —
+  # see AxonWeb.IdentityServer's moduledoc), spec also recommends the
+  # *initiating* homeserver additionally confirm the identity server
+  # hasn't since revoked the key it signed with, via the
+  # m.room.third_party_invite event's own key_validity_url — genuinely
+  # real for a delegated invite (Sydent's ephemeral key), a no-op self-
+  # check for a legacy self-signed one. Only ever done here, once, for a
+  # join this server is originating — never inside AuthRules itself.
+  defp maybe_attach_third_party_invite(content, %{"mxid" => _, "token" => token} = signed, current_state)
+       when is_binary(token) do
+    invite_content = get_in(current_state[{"m.room.third_party_invite", token}], ["content"]) || %{}
+
+    if third_party_invite_pubkey_live?(invite_content) do
+      Map.put(content, "third_party_invite", %{"signed" => signed})
+    else
+      content
+    end
   end
 
-  defp maybe_attach_third_party_invite(content, _), do: content
+  defp maybe_attach_third_party_invite(content, _, _current_state), do: content
+
+  # Each public_keys entry carries its *own* key_validity_url (the
+  # long-term and ephemeral keys a real store-invite response returns are
+  # validated at different endpoints) — falls back to the legacy
+  # top-level public_key/key_validity_url pair too, for a
+  # pre-public_keys-array invite.
+  defp third_party_invite_pubkey_live?(invite_content) do
+    from_list =
+      (invite_content["public_keys"] || [])
+      |> Enum.map(&{&1["public_key"], &1["key_validity_url"]})
+
+    pairs =
+      [{invite_content["public_key"], invite_content["key_validity_url"]} | from_list]
+      |> Enum.uniq()
+      |> Enum.filter(fn {key, url} -> is_binary(key) and is_binary(url) end)
+
+    case pairs do
+      [] ->
+        # No key_validity_url to check against at all (shouldn't happen
+        # for a well-formed invite) — fall back to "signature check
+        # alone decides", same as before this liveness check existed.
+        true
+
+      pairs ->
+        Enum.any?(pairs, fn {key, url} -> AxonWeb.IdentityServer.pubkey_valid?(url, key) end)
+    end
+  end
 
   defp check_room_not_blocked(room_id) do
     if EventStore.room_blocked?(room_id), do: {:error, :room_blocked}, else: :ok

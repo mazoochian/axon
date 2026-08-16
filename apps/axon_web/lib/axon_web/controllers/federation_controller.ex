@@ -1244,6 +1244,32 @@ defmodule AxonWeb.FederationController do
   end
 
   # ---------------------------------------------------------------------------
+  # GET /_matrix/federation/v1/openid/userinfo
+  #
+  # Deliberately outside the X-Matrix-authenticated `:federation` scope
+  # (see router.ex, same reasoning as `federation_version/2` above) — the
+  # caller here is typically an identity server, not another Matrix
+  # server, verifying an OpenID token a client (or, for
+  # `AxonWeb.IdentityServer.ensure_access_token/2`'s self-registration
+  # fallback, this server acting on a client's behalf) minted via
+  # `POST /_matrix/client/v3/user/:user_id/openid/request_token` and
+  # handed to it. Per spec this is the *only* check identity servers do
+  # before trusting `sub` as this user's real Matrix ID.
+  # ---------------------------------------------------------------------------
+
+  def openid_userinfo(conn, params) do
+    case params["access_token"] && AxonWeb.OpenidTokens.verify(params["access_token"]) do
+      {:ok, user_id} ->
+        json(conn, %{"sub" => user_id})
+
+      _ ->
+        conn
+        |> put_status(401)
+        |> json(%{"errcode" => "M_UNKNOWN_TOKEN", "error" => "Invalid or expired OpenID token"})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Helpers — event validation & application
   # ---------------------------------------------------------------------------
 

@@ -13,6 +13,19 @@ services:
   sydent:
     image: matrixdotorg/sydent:latest
     restart: unless-stopped
+    # Host networking (Linux-only) rather than the usual bridge+published-port
+    # setup: real 3pid-invite delegation needs this to work *both* ways —
+    # axon (running on the host for `mix test`/`mix phx.server`, not
+    # containerized) reaches Sydent at localhost:8090 either way, but Sydent
+    # itself also needs to reach *axon's* federation endpoint
+    # (`GET /_matrix/federation/v1/openid/userinfo`) when verifying an
+    # OpenID token via `POST account/register` — see
+    # `AxonWeb.IdentityServer.ensure_access_token/2` and
+    # `apps/axon_web/test/e2e/identity_server_3pid_test.exs`. On the default
+    # bridge network Sydent has no route back to the host's "localhost" at
+    # all; host networking makes axon's own "localhost" visible to it, the
+    # same way it's visible to axon.
+    network_mode: host
     environment:
       # Sydent's own server_name, used to sign its responses. Independent of
       # axon's AXON_SERVER_NAME — nothing else in this compose file needs to
@@ -23,10 +36,12 @@ services:
       # since nothing in axon's test coverage needs a delivered email.
     volumes:
       # Holds sydent.conf (incl. the auto-generated ed25519 signing key,
-      # written on first boot) and sydent.db (SQLite).
+      # written on first boot) and sydent.db (SQLite). Also where
+      # `federation.verifycerts = False` gets set by hand once (see
+      # README.md) — the real dev axon instance federation-verifying tests
+      # talk to serves a self-signed cert, which Sydent's default (real CA
+      # chain required) would otherwise reject.
       - axon_sydent_data:/data
-    ports:
-      - "8090:8090"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/_matrix/identity/v2')"]
       interval: 10s

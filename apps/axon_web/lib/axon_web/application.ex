@@ -16,6 +16,12 @@ defmodule AxonWeb.Application do
       {Finch, name: Axon.Finch, pools: finch_pools()},
       # Caches the delegated OIDC Authorization Server's discovery document
       AxonWeb.Oidc.Discovery,
+      # Short-lived OpenID tokens (C-S API user/openid/request_token) used
+      # to prove a user's identity to an identity server
+      AxonWeb.OpenidTokens,
+      # Identity-server client: hash lookup / store-invite / pubkey validity
+      # cache for 3pid invites (AxonWeb.RoomController.invite_3pid/4)
+      AxonWeb.IdentityServer,
       # Task supervisor for async federation work
       {Task.Supervisor, name: Axon.TaskSupervisor},
       # Federation outbound fan-out (subscribes to PubSub, sends PDUs to remote servers)

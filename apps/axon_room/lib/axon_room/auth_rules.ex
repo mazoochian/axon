@@ -218,6 +218,14 @@ defmodule AxonRoom.AuthRules do
   # authorized regardless of the room's normal join_rule — the 3pid invite
   # itself is the authorization, exactly like a direct m.room.member invite
   # would be.
+  #
+  # The public keys checked against come entirely from the room's own
+  # m.room.third_party_invite state content (third_party_invite_public_keys/1)
+  # — whichever server actually produced them (axon's own key for a
+  # legacy self-signed invite, or a real identity server's long-term/
+  # ephemeral key for a delegated one, see
+  # AxonWeb.RoomController.third_party_invite_content/1) verifies exactly
+  # the same way; nothing here assumes it's always axon's own key.
   defp valid_third_party_invite?(event, sender, current_state) do
     with %{"signed" => %{"mxid" => mxid, "token" => token} = signed}
          when is_binary(token) <- get_in(event, ["content", "third_party_invite"]),
@@ -230,10 +238,17 @@ defmodule AxonRoom.AuthRules do
     end
   end
 
+  # Verifies `signed` exactly as `AxonCrypto.EventHash.sign_json/4` would
+  # have produced it: signed over *all* of its own fields other than
+  # "signatures"/"unsigned" (delegated to verify_json_signature/4 itself,
+  # not reconstructed here). A real identity server's sign-ed25519 (e.g.
+  # Sydent's) signs `{mxid, sender, token}` — an extra "sender" field
+  # beyond the two spec names for the payload — so hardcoding a
+  # `Map.take(signed, ["mxid", "token"])` allowlist here would silently
+  # fail every real-identity-server-produced signature; matching whatever
+  # fields are actually present is what makes this identity-server-agnostic.
   defp third_party_signature_valid?(signed, invite_content) do
-    payload = Map.take(signed, ["mxid", "token"])
     sig_map = signed["signatures"] || %{}
-    to_verify = Map.put(payload, "signatures", sig_map)
     keys = third_party_invite_public_keys(invite_content)
 
     Enum.any?(sig_map, fn {issuer, key_sigs} ->
@@ -241,7 +256,7 @@ defmodule AxonRoom.AuthRules do
         Enum.any?(keys, fn pubkey_b64 ->
           case Base.decode64(pubkey_b64, padding: false) do
             {:ok, pubkey_bytes} ->
-              AxonCrypto.EventHash.verify_json_signature(to_verify, issuer, key_id, pubkey_bytes) ==
+              AxonCrypto.EventHash.verify_json_signature(signed, issuer, key_id, pubkey_bytes) ==
                 :ok
 
             :error ->
