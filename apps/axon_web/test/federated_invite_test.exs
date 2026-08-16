@@ -33,6 +33,22 @@ defmodule AxonWeb.FederatedInviteTest do
     :ok
   end
 
+  # AxonFederation.OutboundQueue delivers asynchronously (a spawned Task,
+  # not inline with enqueue/2) — a relay assertion checked synchronously
+  # right after the triggering HTTP call is a race, not a real check.
+  defp wait_until(deadline_ms, fun) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        flunk("condition not met before deadline")
+      else
+        Process.sleep(20)
+        wait_until(deadline_ms, fun)
+      end
+    end
+  end
+
   # Mirrors Complement's federation.HandleInviteRequests and any real
   # homeserver: countersign the event we were given and hand it straight back
   # — crucially *without* re-adding an event_id, which the wire format for
@@ -78,6 +94,78 @@ defmodule AxonWeb.FederatedInviteTest do
       # The invite really landed: the remote user is now an invited member.
       assert AxonCore.EventStore.get_membership(room_id, david) == {:ok, "invite"}
     end
+  end
+
+  # Regression: a cross-server invite's final signed event was applied via
+  # RoomProcess.apply_remote_event/2 with no relay_exclude, so it only ever
+  # reached this server's own DB/sync — never any *other* server already
+  # resident in the room. Same shape as the send_join/leave/knock relay gap
+  # (RoomProcess.apply_remote_event/3's moduledoc): our server is the only
+  # party that can tell a room's other resident servers about a brand-new
+  # invite, since they were never part of this make/send-style round trip
+  # with the invitee's server. Complement: TestFederationRejectInvite (the
+  # first of its two waits — Delia's server never sees Charlie's invite).
+  test "a remote invite is relayed to the room's other resident server, not just applied locally" do
+    bob_port = 19_641
+    bob_server = "fake-fedinvite-bob.test"
+    start_supervised!({FakeRemoteMatrixServer, port: bob_port, server_name: bob_server})
+
+    Application.put_env(
+      :axon_federation,
+      :server_overrides,
+      Map.put(
+        Application.get_env(:axon_federation, :server_overrides, %{}),
+        bob_server,
+        "http://127.0.0.1:#{bob_port}"
+      )
+    )
+
+    alice = register("fedinv_relay_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+    # Bob (a different remote server) is already a resident member.
+    bob = "@bob_#{System.unique_integer([:positive])}:#{bob_server}"
+    {last_event_id, depth} = AxonRoom.RoomProcess.get_position(room_id)
+
+    bob_join_pdu = %{
+      "event_id" => "$bobjoin_#{System.unique_integer([:positive])}",
+      "room_id" => room_id,
+      "type" => "m.room.member",
+      "state_key" => bob,
+      "sender" => bob,
+      "content" => %{"membership" => "join"},
+      "depth" => depth + 1,
+      "prev_events" => [last_event_id],
+      "auth_events" => [],
+      "origin" => bob_server,
+      "origin_server_ts" => System.os_time(:millisecond)
+    }
+
+    {:ok, _} = AxonRoom.RoomProcess.apply_remote_event(room_id, bob_join_pdu)
+
+    # Charlie's own server countersigns and hands the invite back, same as
+    # the ordinary invite tests above.
+    david = "@david_relay_#{System.unique_integer([:positive])}:#{@server_name}"
+    countersign_without_event_id()
+
+    conn = invite(alice.token, room_id, david)
+    assert conn.status == 200, "expected 200, got #{conn.status}: #{conn.resp_body}"
+
+    assert AxonCore.EventStore.get_membership(room_id, david) == {:ok, "invite"}
+
+    # Bob's server must have received a /send transaction carrying david's
+    # invite via relay — not just applied locally on our own side.
+    # Delivery is async (AxonFederation.OutboundQueue spawns a Task), so
+    # poll rather than asserting synchronously.
+    wait_until(System.monotonic_time(:millisecond) + 5_000, fn ->
+      Enum.any?(FakeRemoteMatrixServer.requests(bob_port), fn req ->
+        req.method == "PUT" and req.path =~ "/_matrix/federation/v1/send/" and
+          Enum.any?(req.body["pdus"] || [], fn pdu ->
+            pdu["type"] == "m.room.member" and pdu["state_key"] == david and
+              get_in(pdu, ["content", "membership"]) == "invite"
+          end)
+      end)
+    end)
   end
 
   test "a remote server that fails the invite still yields a clean 502, not a 500" do
