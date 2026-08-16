@@ -184,6 +184,43 @@ defmodule AxonRoom.RoomProcess do
       EventBuilder.build(sender, type, content, room_ctx, opts)
       |> with_prev_content(Keyword.get(opts, :state_key), state.current_state)
 
+    case duplicate_state_event(sender, event, state.current_state) do
+      {:ok, existing_event_id} ->
+        {:reply, {:ok, existing_event_id}, state}
+
+      :not_duplicate ->
+        do_send_event(event, state)
+    end
+  end
+
+  # Mirrors Synapse's own `deduplicate_state_event`: re-setting a piece of
+  # room state to exactly the content it already has (same sender, same
+  # content) is a no-op — the existing event is handed back rather than
+  # minting (and auth-checking, persisting, federating) a pointless
+  # duplicate that would sit right next to it in the DAG with nothing to
+  # distinguish them but a timestamp. This is not a guess: Complement's
+  # TestInboundCanReturnMissingEvents "shared visibility" subtest fails
+  # without it — an explicit PUT of history_visibility=shared onto a room
+  # whose preset already set it to shared must not add a second event,
+  # or a server walking that gap sees one more state change than a
+  # spec-compliant peer would.
+  defp duplicate_state_event(
+         sender,
+         %{"state_key" => state_key, "type" => type} = event,
+         current_state
+       ) do
+    case Map.get(current_state, {type, state_key}) do
+      %{"sender" => ^sender, "content" => content, "event_id" => event_id} ->
+        if event["content"] == content, do: {:ok, event_id}, else: :not_duplicate
+
+      _ ->
+        :not_duplicate
+    end
+  end
+
+  defp duplicate_state_event(_sender, _event, _current_state), do: :not_duplicate
+
+  defp do_send_event(event, state) do
     case AuthRules.check(event, state.current_state, state.room_version) do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
