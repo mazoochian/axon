@@ -14,7 +14,7 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 ### Known gaps
 
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
-- Third-party (3pid) invites have no actual email/SMS delivery — no identity-server integration exists, so the token has to reach the invitee out-of-band.
+- Third-party (3pid) invites deliver over email when `SMTP_HOST` is configured (`AxonWeb.Mailer`, best-effort, fire-and-forget); SMS still has no delivery path — no identity-server or SMS-provider integration exists, so without SMTP configured the token has to reach the invitee out-of-band.
 - Sliding sync re-sends a full `SYNC` op per range on every request rather than diffing against a remembered session — spec-valid, just not bandwidth-optimal.
 - `/sync` doesn't enforce per-event history visibility for a room's *current* members beyond the basic "are you a member at all" gate — a joined member's initial timeline can include events from before they joined a room whose `history_visibility` is `invited`/`joined` (`GET /event/{id}` and `/messages` both enforce this correctly, for current and past members alike).
 

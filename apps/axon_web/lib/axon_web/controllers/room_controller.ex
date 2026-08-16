@@ -551,13 +551,15 @@ defmodule AxonWeb.RoomController do
   # proof this generates back through /join (see AuthRules.valid_third_party_invite?/3
   # and AxonRoom.EventBuilder for the join-side wiring).
   #
-  # Known gap: axon has no identity-server integration, so nothing actually
-  # delivers this invite to the 3pid address (no email/SMS is sent) — the
-  # room-state mechanics and cryptographic proof are fully real and
-  # spec-shaped (self-signed with this server's own key, since there's no
-  # external identity server to delegate to), but getting the token to the
-  # invitee is left to an out-of-band channel until a real mail/identity
-  # integration exists.
+  # axon has no identity-server integration, so there's no third party to
+  # delegate delivery to — for medium "email" this server sends the
+  # notification itself, best-effort, via AxonWeb.Mailer (a no-op unless
+  # SMTP is configured, same as before it existed). Any other medium
+  # (e.g. "msisdn"/SMS, which would need a paid third-party API this
+  # project has no account for) is still out-of-band only — the room-state
+  # mechanics and cryptographic proof are fully real and spec-shaped
+  # either way (self-signed with this server's own key, since there's no
+  # external identity server to delegate to).
   defp invite_3pid(conn, room_id, user_id, params) do
     medium = params["medium"]
     address = params["address"]
@@ -577,6 +579,14 @@ defmodule AxonWeb.RoomController do
            RoomProcess.send_event(room_id, user_id, "m.room.third_party_invite", content,
              state_key: token
            ) do
+      if medium == "email" do
+        AxonWeb.Mailer.deliver_3pid_invite(address, %{
+          inviter_id: user_id,
+          room_id: room_id,
+          token: token
+        })
+      end
+
       json(conn, %{})
     end
   end
