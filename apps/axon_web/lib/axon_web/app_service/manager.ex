@@ -46,6 +46,22 @@ defmodule AxonWeb.AppService.Manager do
     if result, do: {:ok, result}, else: :error
   end
 
+  @doc """
+  Whether `registration` is allowed to act as `user_id` — either its own
+  `sender_localpart` user (always implicitly owned, regardless of
+  namespace, per the AS spec) or a user matching one of its registered
+  `namespaces.users` regexes (impersonation via `?user_id=`).
+  """
+  def owns_user?(registration, user_id) do
+    sender_user_id = "@#{registration["sender_localpart"]}:#{server_name()}"
+
+    user_id == sender_user_id or
+      (get_in(registration, ["namespaces", "users"]) || [])
+      |> Enum.any?(fn ns -> regex_match?(ns["regex"], user_id) end)
+  end
+
+  defp server_name, do: Application.get_env(:axon_web, :server_name, "localhost")
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -86,6 +102,10 @@ defmodule AxonWeb.AppService.Manager do
   end
 
   defp load_registrations do
+    load_json_registrations() ++ load_yaml_registrations()
+  end
+
+  defp load_json_registrations do
     path = Application.get_env(:axon_web, :appservice_config_path, "appservices.json")
 
     case File.read(path) do
@@ -106,6 +126,40 @@ defmodule AxonWeb.AppService.Manager do
       {:error, reason} ->
         Logger.warning("Failed to read #{path}: #{inspect(reason)}")
         []
+    end
+  end
+
+  # Complement writes one Synapse-style registration YAML per configured
+  # application service into every homeserver container it deploys, at a
+  # fixed path (`/complement/appservice/<id>.yaml`) — set via
+  # AXON_APPSERVICE_DIR in complement/start.sh. Without this, those files
+  # existed in the container but nothing ever read them, so any
+  # Complement test registering an appservice via a blueprint silently
+  # had no working appservice at all (Complement:
+  # TestJoinFederatedRoomFromApplicationServiceBridgeUser and others).
+  # Config-driven (not hardcoded to that path) so it's a no-op — not an
+  # error — outside a Complement run, same tolerance as the JSON loader
+  # above having no file at all.
+  defp load_yaml_registrations do
+    case Application.get_env(:axon_web, :appservice_dir) do
+      nil ->
+        []
+
+      dir ->
+        dir
+        |> Path.join("*.yaml")
+        |> Path.wildcard()
+        |> Enum.flat_map(fn path ->
+          with {:ok, contents} <- File.read(path),
+               {:ok, registration} <- AxonWeb.AppService.RegistrationYaml.parse(contents) do
+            Logger.info("Loaded app service registration #{inspect(registration["id"])} from #{path}")
+            [registration]
+          else
+            {:error, reason} ->
+              Logger.warning("Failed to load app service registration from #{path}: #{inspect(reason)}")
+              []
+          end
+        end)
     end
   end
 

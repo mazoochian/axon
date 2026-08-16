@@ -224,6 +224,51 @@ defmodule AxonCore.UserStore do
     end
   end
 
+  @doc """
+  Resolves an application service's own `sender_localpart` user, creating
+  the local account on first use — an appservice authenticates with a
+  fixed `as_token` (verified by the caller against its registrations, not
+  here), not a per-device access token, so there's no separate "login"
+  step to have provisioned this user earlier the way a real registration
+  would. `device_id` is a stable, caller-chosen id (not per-session): the
+  same appservice reusing the same as_token should always resolve to the
+  same device row, not accumulate a new one per request.
+  """
+  def authenticate_via_appservice(localpart, device_id, server_name) do
+    user_id = "@#{localpart}:#{server_name}"
+
+    with {:ok, user_id} <- find_or_create_local_user(user_id, localpart) do
+      ensure_device(user_id, device_id, nil)
+      {:ok, {user_id, device_id}}
+    end
+  end
+
+  defp find_or_create_local_user(user_id, localpart) do
+    case Repo.get(User, user_id) do
+      %User{deactivated: true} ->
+        {:error, :deactivated}
+
+      %User{} ->
+        {:ok, user_id}
+
+      nil ->
+        %User{}
+        |> User.changeset(%{user_id: user_id, localpart: localpart})
+        |> Repo.insert()
+        |> case do
+          {:ok, user} ->
+            Repo.insert(
+              UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: localpart})
+            )
+
+            {:ok, user.user_id}
+
+          {:error, _changeset} ->
+            {:error, :provisioning_failed}
+        end
+    end
+  end
+
   defp find_or_create_oidc_user(subject, localpart, server_name) do
     case Repo.get_by(User, oidc_subject: subject) do
       %User{deactivated: true} ->
