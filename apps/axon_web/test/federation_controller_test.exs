@@ -15,6 +15,7 @@ defmodule AxonWeb.FederationControllerTest do
 
   alias AxonFederation.{FakeRemoteMatrixServer, KeyCache}
   alias AxonCore.{EventStore, Repo}
+  alias AxonCrypto.EventHash
   alias AxonRoom.{CreateRoom, RoomProcess}
 
   @port 18_900
@@ -320,6 +321,82 @@ defmodule AxonWeb.FederationControllerTest do
         )
 
       assert conn.status == 403
+    end
+  end
+
+  describe "PUT invite/2" do
+    # Room versions 3+ never carry "event_id" on the wire (it's derived from
+    # the reference hash) — this is the shape a real inviting server (and
+    # Complement) actually sends. Regression for a 500 that hit every
+    # invite-related Complement test (TestIsDirectFlagFederation, most of
+    # TestFederationRoomsInvite): EventStore.insert_event/2 got a nil
+    # event_id and the changeset's NOT NULL violation fell through
+    # FallbackController's catch-all as an opaque 500 M_UNKNOWN.
+    test "accepts an invite for a room we've never seen, with no event_id on the wire" do
+      room_id = "!invite_#{System.unique_integer([:positive])}:#{@server_name}"
+      inviter = remote_user("inviter")
+      invitee = new_local_user("invitee")
+
+      event =
+        signed_remote_event(%{
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => invitee,
+          "sender" => inviter,
+          "content" => %{"membership" => "invite", "is_direct" => true},
+          "depth" => 1,
+          "prev_events" => [],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+        |> Map.delete("event_id")
+
+      refute Map.has_key?(event, "event_id")
+
+      conn =
+        signed_put(
+          "/_matrix/federation/v2/invite/#{URI.encode(room_id)}/#{URI.encode(EventHash.reference_hash(event, "11"))}",
+          %{"room_version" => "11", "event" => event, "invite_room_state" => []}
+        )
+
+      assert conn.status == 200, "expected 200, got #{conn.status}: #{conn.resp_body}"
+
+      returned_event = decode(conn)["event"]
+      assert is_binary(returned_event["event_id"])
+      assert returned_event["content"]["is_direct"] == true
+      assert EventStore.get_membership(room_id, invitee) == {:ok, "invite"}
+    end
+
+    test "still works when the wire event already carries an event_id (older room versions)" do
+      room_id = "!invite_#{System.unique_integer([:positive])}:#{@server_name}"
+      inviter = remote_user("inviter")
+      invitee = new_local_user("invitee")
+      event_id = "$invite_#{System.unique_integer([:positive])}"
+
+      event =
+        signed_remote_event(
+          %{
+            "event_id" => event_id,
+            "room_id" => room_id,
+            "type" => "m.room.member",
+            "state_key" => invitee,
+            "sender" => inviter,
+            "content" => %{"membership" => "invite"},
+            "depth" => 1,
+            "prev_events" => [],
+            "origin_server_ts" => System.os_time(:millisecond)
+          },
+          "6"
+        )
+
+      conn =
+        signed_put(
+          "/_matrix/federation/v2/invite/#{URI.encode(room_id)}/#{URI.encode(event_id)}",
+          %{"room_version" => "6", "event" => event, "invite_room_state" => []}
+        )
+
+      assert conn.status == 200, "expected 200, got #{conn.status}: #{conn.resp_body}"
+      assert decode(conn)["event"]["event_id"] == event_id
+      assert EventStore.get_membership(room_id, invitee) == {:ok, "invite"}
     end
   end
 
