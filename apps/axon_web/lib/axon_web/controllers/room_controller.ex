@@ -524,7 +524,16 @@ defmodule AxonWeb.RoomController do
               AxonCrypto.EventHash.reference_hash(signed_event, room_ctx.room_version)
             end)
 
-          RoomProcess.apply_remote_event(room_id, signed_event)
+          # relay_exclude: target_server — same reasoning as the
+          # send_join/leave/knock relay case (AxonRoom.RoomProcess.apply_remote_event/3):
+          # our server is the only one that can tell this room's *other*
+          # already-joined remote servers about this brand-new invite (they
+          # were never a party to this make/send-style round trip), and
+          # relaying back to target_server itself would just be an
+          # unnecessary echo of the event it already handed back to us.
+          # Without this, a room with 3+ servers never converges on an
+          # invite — Complement: TestFederationRejectInvite.
+          RoomProcess.apply_remote_event(room_id, signed_event, relay_exclude: target_server)
 
         {:ok, _malformed} ->
           {:error, :remote_invite_failed}
