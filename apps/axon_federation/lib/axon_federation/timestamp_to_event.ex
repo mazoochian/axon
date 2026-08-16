@@ -2,12 +2,18 @@ defmodule AxonFederation.TimestampToEvent do
   @moduledoc """
   Outbound federation half of "jump to date" (MSC3030,
   GET /_matrix/client/v1/rooms/:room_id/timestamp_to_event) — used by
-  `AxonWeb.EventController.timestamp_to_event/2` when the local search
-  (`AxonCore.EventStore.find_event_by_timestamp/3`) comes up empty. That
-  happens whenever this server's own history doesn't reach far enough
-  back (or forward) to cover the requested timestamp — most commonly a
-  member who joined the room after the target time and was only ever
-  handed the room's *current* state, never the older timeline.
+  `AxonWeb.EventController.timestamp_to_event/2` (via its
+  `timestamp_answer/3`) whenever the local search
+  (`AxonCore.EventStore.find_event_by_timestamp/3`) either comes up empty,
+  or comes back with an answer that isn't trustworthy
+  (`AxonCore.EventStore.trustworthy_local_timestamp_answer?/2`). Either
+  happens whenever this server's own history doesn't reach far enough back
+  (or forward) to cover the requested timestamp — most commonly a member
+  who joined the room after the target time and was only ever handed the
+  room's *current* state, never the older timeline: a local search for a
+  timestamp from before the join can't tell that apart from a genuine
+  answer, since the join event (or whatever else sits at the edge of what
+  this server knows) still technically satisfies the timestamp comparison.
 
   Asks the room's other resident servers, via the server-server
   counterpart of this same endpoint
