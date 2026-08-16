@@ -493,7 +493,31 @@ defmodule AxonCore.EventStore do
     )
   end
 
-  @doc "Paginate room history (for GET /rooms/:id/messages)."
+  @doc """
+  Paginate room history (for GET /rooms/:id/messages).
+
+  `dir == "b"` orders by `depth` (the event's true DAG position) first,
+  breaking ties with `stream_ordering` (insertion order). `stream_ordering`
+  alone is assigned at local DB-insert time, not at DAG-creation time — a
+  remote event can be created early (low `depth`, computed from its real
+  `prev_events`) but only transmitted/inserted locally late (after the local
+  room head has already advanced), landing it a high `stream_ordering`. A
+  backward page ordered purely by `desc: stream_ordering` would surface that
+  event near the top of the page — looking "recent" — even though it
+  topologically belongs much further back. Ordering by `depth` first fixes
+  that; the `stream_ordering` tiebreak only disambiguates events that share a
+  depth (concurrent/forked events), mirroring Synapse's topological+stream
+  ordering.
+
+  The `WHERE e.stream_ordering < ^from_ordering` bound (windowing/pagination)
+  is intentionally left as `stream_ordering`-based — only the ordering of
+  events within that window changes, not which events are eligible for the
+  page.
+
+  `dir == "f"` (forward) is unaffected: it still orders by `stream_ordering`
+  alone, since forward pagination has no analogous bug (it walks strictly in
+  local insertion order, which is what a `since`-token-based cursor needs).
+  """
   def get_messages(room_id, from_ordering, dir, limit \\ 10) do
     base =
       from(e in Event,
@@ -505,7 +529,7 @@ defmodule AxonCore.EventStore do
         "b" ->
           from(e in base,
             where: e.stream_ordering < ^from_ordering,
-            order_by: [desc: e.stream_ordering],
+            order_by: [desc: e.depth, desc: e.stream_ordering],
             limit: ^limit
           )
 
