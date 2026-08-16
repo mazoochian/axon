@@ -145,9 +145,15 @@ defmodule AxonRoom.CreateRoom do
     end)
   end
 
-  defp preset_values("public_chat"), do: {"public", "shared", "can_join"}
-  defp preset_values("trusted_private_chat"), do: {"invite", "shared", "forbidden"}
-  defp preset_values(_), do: {"invite", "shared", "forbidden"}
+  # guest_can_join per the createRoom preset table (Client-Server API spec):
+  # public_chat is the one preset where guests are *not* allowed in; both
+  # private chat presets allow them. This was previously backwards —
+  # public_chat granted guest access and both private presets forbade it —
+  # which axon's own preset unit tests had also locked in as "expected"
+  # rather than independently checked against spec.
+  defp preset_values("public_chat"), do: {"public", "shared", "forbidden"}
+  defp preset_values("trusted_private_chat"), do: {"invite", "shared", "can_join"}
+  defp preset_values(_), do: {"invite", "shared", "can_join"}
 
   defp default_power_levels(creator, preset, version) do
     invite_level = if preset == "trusted_private_chat", do: 0, else: 50

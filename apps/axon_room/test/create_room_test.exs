@@ -26,25 +26,28 @@ defmodule AxonRoom.CreateRoomTest do
     end
   end
 
-  test "default preset is private_chat: invite join rule, forbidden guest access" do
+  # guest_can_join per the createRoom preset table (Client-Server API spec):
+  # public_chat is the one preset that does NOT allow guests; both private
+  # presets do.
+  test "default preset is private_chat: invite join rule, guests can join" do
     creator = new_user("alice")
     assert {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost")
 
     assert content_of(room_id, "m.room.join_rules")["join_rule"] == "invite"
-    assert content_of(room_id, "m.room.guest_access")["guest_access"] == "forbidden"
+    assert content_of(room_id, "m.room.guest_access")["guest_access"] == "can_join"
     assert content_of(room_id, "m.room.history_visibility")["history_visibility"] == "shared"
     assert content_of(room_id, "m.room.create")["creator"] == creator
     assert content_of(room_id, "m.room.member", creator)["membership"] == "join"
   end
 
-  test "public_chat preset: public join rule, can_join guest access, invite power 50" do
+  test "public_chat preset: public join rule, forbidden guest access, invite power 50" do
     creator = new_user("alice")
 
     assert {:ok, room_id} =
              CreateRoom.execute(creator, preset: "public_chat", server_name: "localhost")
 
     assert content_of(room_id, "m.room.join_rules")["join_rule"] == "public"
-    assert content_of(room_id, "m.room.guest_access")["guest_access"] == "can_join"
+    assert content_of(room_id, "m.room.guest_access")["guest_access"] == "forbidden"
     assert content_of(room_id, "m.room.power_levels")["invite"] == 50
   end
 
