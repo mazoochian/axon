@@ -367,11 +367,32 @@ docker compose -f docker-compose.identity.yml up -d
 curl http://localhost:8090/_matrix/identity/v2   # {}
 ```
 
-It persists its SQLite database and auto-generated ed25519 signing key in the `axon_sydent_data` volume, so both survive a restart. SMTP is left at Sydent's own default (`localhost:25`, unreachable here) — email sending fails closed and gets logged, which is fine since nothing in axon's test coverage needs a delivered email. Then, for a local axon instance:
+It persists its SQLite database and auto-generated ed25519 signing key in the `axon_sydent_data` volume, so both survive a restart, and runs with `network_mode: host` (Linux) rather than a published port — real 3pid-invite delegation needs Sydent to reach *axon* too (see below), not just the other way around. Then, for a local axon instance:
 
 ```bash
 DEFAULT_IDENTITY_SERVER=http://localhost:8090 AXON_SERVER_NAME=localhost iex -S mix
 ```
+
+This is enough for `apps/axon_web/test/third_party_invite_test.exs` (uses `AxonWeb.FakeIdentityServer`, no real Sydent needed) and for hash-lookup/store-invite calls in general. `apps/axon_web/test/e2e/identity_server_3pid_test.exs` additionally exercises the *real* end-to-end flow — an unbound invite delegated to this real Sydent, the invitee proving 3pid ownership through Sydent's own real email-validation flow, and a join using the real signed proof that produces — which needs one-time, by-hand `sydent.conf` patches Sydent has no environment variable for (edit the file directly inside the running container, then `docker restart axon-sydent-1`):
+
+```bash
+docker exec axon-sydent-1 sed -i \
+  -e 's/^ip.whitelist = $/ip.whitelist = 127.0.0.0\/8,::1\/128/' \
+  -e 's/federation.verifycerts = True/federation.verifycerts = False/' \
+  -e 's#^templates.path = res#templates.path = /home/sydent/src/res#' \
+  -e 's/^email.smtpport = 25$/email.smtpport = 2525/' \
+  /data/sydent.conf
+docker restart axon-sydent-1
+```
+
+What each one is for:
+
+* `ip.whitelist` — Sydent refuses to let its outbound federation client connect to loopback/private addresses by default (SSRF hardening); its real `POST account/register` needs to call back to axon's own `GET /_matrix/federation/v1/openid/userinfo` on `localhost`, so loopback needs to be allow-listed for this dev setup.
+* `federation.verifycerts = False` — that same callback is real TLS (matrix federation is TLS-only); axon's federation endpoint in the test run serves a throwaway self-signed cert (`apps/axon_web/test/support/fixtures/`), which a normal cert-chain check would reject.
+* `templates.path` — the Sydent Docker image's `general.templates.path` default (`res`, relative) doesn't resolve from Sydent's actual working directory; without this, `store-invite`'s real invite email fails with `FileNotFoundError` before it ever gets to the SMTP step.
+* `email.smtpport` — Sydent's default (`localhost:25`) needs root and isn't running here; the e2e test starts its own `AxonWeb.FakeSmtpServer` on `2525` and captures the real mail Sydent sends (both the invite notice and the validation-code email), parsing the real code out of it the same way a person reading their inbox would.
+
+Without these, `identity_server_3pid_test.exs` skips itself (logged, not a failure) rather than failing the suite — `third_party_invite_test.exs` and the rest of axon's test coverage don't need any of this.
 
 ## Application Services
 

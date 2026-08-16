@@ -256,6 +256,7 @@ defmodule AxonWeb.Router do
     pipe_through(:api)
 
     get("/v1/version", VersionController, :federation_version)
+    get("/v1/openid/userinfo", FederationController, :openid_userinfo)
   end
 
   scope "/_matrix/federation", AxonWeb do
@@ -323,6 +324,7 @@ defmodule AxonWeb.Router do
     get("/v3/account/whoami", AuthController, :whoami)
     post("/v3/account/password", AuthController, :change_password)
     post("/v3/account/deactivate", AuthController, :deactivate)
+    post("/v3/user/:user_id/openid/request_token", AuthController, :openid_request_token)
 
     # Profile
     put("/v3/profile/:user_id/displayname", ProfileController, :set_displayname)

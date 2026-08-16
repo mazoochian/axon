@@ -4,6 +4,14 @@ import Config
 config :axon_web,
   server_name: System.get_env("AXON_SERVER_NAME", "localhost")
 
+# Identity server for 3pid invites (see AxonWeb.IdentityServer,
+# AxonWeb.RoomController.invite_3pid/4, and README.md's "Identity server
+# (3pid invites)"). A plain base URL, e.g. "https://vector.im" or a local
+# dev Sydent at "http://localhost:8090" — unset means no identity-server
+# integration beyond what the inviting client supplies itself via
+# id_server/id_access_token.
+config :axon_web, :default_identity_server, System.get_env("DEFAULT_IDENTITY_SERVER")
+
 # Delegated OAuth 2.0 / OIDC auth (MSC3861 / MSC2965) — off by default.
 # When enabled, this homeserver acts purely as an OAuth2 resource server:
 # it does not mint its own access tokens or accept m.login.password/register;

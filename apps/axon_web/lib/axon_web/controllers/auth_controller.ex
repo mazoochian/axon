@@ -426,6 +426,31 @@ defmodule AxonWeb.AuthController do
     })
   end
 
+  # POST /_matrix/client/v3/user/:user_id/openid/request_token
+  #
+  # Mints a short-lived OpenID token the caller can hand to a third party
+  # (an identity server, typically) to prove their Matrix user ID — the
+  # third party verifies it via
+  # `GET /_matrix/federation/v1/openid/userinfo` (see
+  # `AxonWeb.FederationController.openid_userinfo/2`). Per spec, only the
+  # user themself may request a token for their own `user_id`.
+  def openid_request_token(conn, %{"user_id" => user_id}) do
+    if user_id != conn.assigns.current_user_id do
+      conn
+      |> put_status(403)
+      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot request an OpenID token for another user"})
+    else
+      {token, expires_in} = AxonWeb.OpenidTokens.issue(user_id)
+
+      json(conn, %{
+        "access_token" => token,
+        "token_type" => "Bearer",
+        "matrix_server_name" => server_name(),
+        "expires_in" => expires_in
+      })
+    end
+  end
+
   defp server_name, do: Application.fetch_env!(:axon_web, :server_name)
 
   defp valid_localpart?(localpart), do: Regex.match?(~r/^[a-z0-9._\-=\/]+$/i, localpart)
