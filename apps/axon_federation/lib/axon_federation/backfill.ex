@@ -28,6 +28,7 @@ defmodule AxonFederation.Backfill do
   require Logger
 
   alias AxonCore.EventStore
+  alias AxonCrypto.EventHash
   alias AxonFederation.{EventVerification, HttpClient}
   alias AxonRoom.RoomProcess
 
@@ -132,12 +133,19 @@ defmodule AxonFederation.Backfill do
   # rather than from the one we do) and fails a well-formed-request check
   # against any strict server (Complement's `TestGetMissingEventsGapFilling`
   # and `TestCorruptedAuthChain` both assert on this request's shape).
+  #
+  # `pdu["event_id"]` alone isn't enough, either: room versions 3+ never
+  # carry "event_id" on the wire (it's the reference hash), so for any
+  # modern room this sent a literal `null` as `latest_events` — a
+  # well-formed-looking but content-wrong request no strict server accepts
+  # (Complement: TestOutboundFederationEventSizeGetMissingEvents caught
+  # this — "got latest_events [null] want [$real_event_id]").
   defp fetch_get_missing_events(room_id, origin, pdu) do
     path = "/_matrix/federation/v1/get_missing_events/#{URI.encode(room_id)}"
 
     body = %{
       "earliest_events" => known_head_ids(room_id),
-      "latest_events" => [pdu["event_id"]],
+      "latest_events" => [pdu_event_id(pdu, room_id)],
       "limit" => @get_missing_events_limit,
       "min_depth" => 0
     }
@@ -157,6 +165,17 @@ defmodule AxonFederation.Backfill do
         err
     end
   end
+
+  # event_id as-is when the wire carried one (room v1/v2), otherwise the
+  # reference hash room versions 3+ derive it from — same pattern
+  # AxonWeb.FederationController.compute_event_id/1 and
+  # AxonFederation.RoomJoin use for the same wire-format gap.
+  defp pdu_event_id(pdu, room_id) do
+    pdu_event_id(pdu, room_id, EventStore.get_room_version(room_id))
+  end
+
+  defp pdu_event_id(%{"event_id" => id}, _room_id, _room_version) when is_binary(id), do: id
+  defp pdu_event_id(pdu, _room_id, room_version), do: EventHash.reference_hash(pdu, room_version)
 
   # Our own resident room process's current head, as a single-element
   # `earliest_events` boundary — best-effort: an empty list here just means
@@ -193,8 +212,18 @@ defmodule AxonFederation.Backfill do
   # are already persisted locally by the time RoomProcess auth-checks it
   # (matters when get_missing_events/backfill return a multi-event chain,
   # not just a single missing event).
+  #
+  # event_id must be backfilled onto each event *before* uniq_by/1 — same
+  # room-versions-3+-omit-it-on-the-wire issue as fetch_get_missing_events/3
+  # above, but with a worse failure mode here: every such event in this
+  # batch collapses to the same `nil` key, so uniq_by silently drops every
+  # one but whichever happened to sort first, rather than just sending one
+  # malformed request.
   defp apply_oldest_first(room_id, origin, events) do
+    room_version = EventStore.get_room_version(room_id)
+
     events
+    |> Enum.map(&Map.put(&1, "event_id", pdu_event_id(&1, room_id, room_version)))
     |> Enum.uniq_by(& &1["event_id"])
     |> Enum.sort_by(&(&1["depth"] || 0))
     |> Enum.each(&verify_and_apply(room_id, origin, &1))
