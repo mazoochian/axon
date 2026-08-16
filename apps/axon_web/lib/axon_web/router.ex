@@ -48,6 +48,7 @@ defmodule AxonWeb.Router do
     post("/v3/login", AuthController, :login)
     post("/v3/register", AuthController, :register)
     get("/v3/register/available", AuthController, :register_available)
+    post("/v3/refresh", AuthController, :refresh)
 
     # OAuth2/OIDC discovery (MSC2965) — returns the AS's metadata when
     # delegated auth is configured, else 404 M_UNRECOGNIZED
