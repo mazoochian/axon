@@ -46,6 +46,11 @@ export SECRET_KEY_BASE=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 64 | he
 # limits by design — see config/runtime.exs.
 export RELAXED_RATE_LIMITS=true
 
+# Complement creates every test user via plain POST /register, which prod
+# now rejects by default (see config/runtime.exs) — open it back up here or
+# the whole suite fails at user creation.
+export REGISTRATION_ENABLED=true
+
 # Fixed path Complement copies one Synapse-style registration YAML into
 # per application service configured on this homeserver in the blueprint
 # (present even if the blueprint defines none — the directory just won't

@@ -99,6 +99,75 @@ defmodule AxonWeb.AuthControllerTest do
     assert taken_conn.status == 400
   end
 
+  describe "registration_enabled gate" do
+    setup do
+      original = Application.get_env(:axon_web, :registration)
+      on_exit(fn -> Application.put_env(:axon_web, :registration, original) end)
+      :ok
+    end
+
+    test "register is rejected with Synapse's 403 M_FORBIDDEN shape when registration is disabled" do
+      Application.put_env(:axon_web, :registration, enabled: false)
+
+      conn =
+        build_conn()
+        |> put_req_header("content-type", "application/json")
+        |> post(
+          "/_matrix/client/v3/register",
+          Jason.encode!(%{
+            "username" => "shouldbeblocked_#{System.unique_integer([:positive])}",
+            "password" => "Test1234!",
+            "kind" => "user",
+            "auth" => %{"type" => "m.login.dummy"}
+          })
+        )
+
+      assert conn.status == 403
+      body = decode(conn)
+      assert body["errcode"] == "M_FORBIDDEN"
+      assert body["error"] == "Registration has been disabled"
+    end
+
+    test "register/available is rejected the same way when registration is disabled" do
+      Application.put_env(:axon_web, :registration, enabled: false)
+
+      conn =
+        build_conn()
+        |> get("/_matrix/client/v3/register/available?username=whatever_#{System.unique_integer([:positive])}")
+
+      assert conn.status == 403
+      body = decode(conn)
+      assert body["errcode"] == "M_FORBIDDEN"
+      assert body["error"] == "Registration has been disabled"
+    end
+
+    test "register succeeds normally when registration is enabled" do
+      Application.put_env(:axon_web, :registration, enabled: true)
+
+      alice = register("regenabled_#{System.unique_integer([:positive])}")
+      assert alice.user_id
+      assert alice.token
+    end
+
+    test "OIDC's own registration response takes precedence over the registration flag" do
+      Application.put_env(:axon_web, :registration, enabled: true)
+      original_oidc = Application.get_env(:axon_web, :oidc)
+      Application.put_env(:axon_web, :oidc, enabled: true, issuer: "https://as.example.com")
+      on_exit(fn -> Application.put_env(:axon_web, :oidc, original_oidc) end)
+
+      conn =
+        build_conn()
+        |> put_req_header("content-type", "application/json")
+        |> post(
+          "/_matrix/client/v3/register",
+          Jason.encode!(%{"username" => "oidcblocked", "kind" => "user"})
+        )
+
+      assert conn.status == 403
+      assert decode(conn)["error"] =~ "Authorization Server"
+    end
+  end
+
   describe "synapse-admin shared-secret registration" do
     test "register with a correct HMAC succeeds" do
       nonce_conn = build_conn() |> get("/_synapse/admin/v1/register")

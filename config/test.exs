@@ -22,6 +22,11 @@ config :axon_web, AxonWeb.FederationEndpoint,
 
 config :libcluster, topologies: []
 
+# Open self-registration — the test suite creates users via
+# POST /register throughout, so keep it enabled here regardless of prod's
+# safe (disabled) default. See config/runtime.exs.
+config :axon_web, :registration, enabled: true
+
 # High enough that the test suite's normal traffic (many
 # registrations/logins/sends from the same loopback IP across many test
 # files) never trips these — the limiter's own behavior is covered by
