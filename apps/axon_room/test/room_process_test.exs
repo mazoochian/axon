@@ -678,6 +678,99 @@ defmodule AxonRoom.RoomProcessTest do
       assert {:ok, _} =
                RoomProcess.send_event(room_id, creator, "m.room.message", %{"body" => "after"})
     end
+
+    # Regression: apply_and_advance/3 used to unconditionally overwrite
+    # state.depth/state.last_event_id with whatever event it had just
+    # applied, even when that event's own depth was *lower* than the room's
+    # already-known head — exactly what a forked/late-arriving remote event
+    # (like late_pdu above) has. That regressed the tracked head, so the
+    # next locally-created event derived its depth from the stale, lower
+    # value and could land at (or below) a depth an earlier local event
+    # already occupies. Flagged, not fixed, during the TestNetworkPartitionOrdering
+    # investigation (ROADMAP Phase 27) — this is the permanent regression
+    # test for that gap: the tracked head must be monotonically
+    # non-decreasing, and a local send issued after a lower-depth fork
+    # applies must never collide in depth with a local event sent before it.
+    test "a lower-depth forked remote event never regresses the tracked head, and a later local send never collides in depth with an earlier one" do
+      creator = new_user("alice")
+
+      {:ok, room_id} =
+        CreateRoom.execute(creator, server_name: "localhost", preset: "public_chat")
+
+      remote_user = "@remote8:federated.example"
+      {joined_at_id, joined_at_depth} = RoomProcess.get_position(room_id)
+
+      join_pdu = %{
+        "event_id" => "$forkregress_join_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => joined_at_depth + 1,
+        "prev_events" => [joined_at_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert {:ok, _} = RoomProcess.apply_remote_event(room_id, join_pdu)
+      {fork_point_id, fork_depth} = RoomProcess.get_position(room_id)
+
+      # Build up a real head via several ordinary local sends, recording
+      # each one's actual persisted depth — these are the depths a
+      # regression must never let a later event collide with.
+      local_depths =
+        for i <- 1..4 do
+          {:ok, event_id} =
+            RoomProcess.send_event(room_id, creator, "m.room.message", %{"body" => "local #{i}"})
+
+          {:ok, stored} = AxonCore.EventStore.get_event(event_id)
+          stored.depth
+        end
+
+      {head_before_fork_id, head_before_fork_depth} = RoomProcess.get_position(room_id)
+      assert head_before_fork_depth == Enum.max(local_depths)
+
+      # A remote event forked off well before any of the local sends above
+      # — its own depth is far lower than the room's current head, exactly
+      # the "late-arriving fork" shape TestNetworkPartitionOrdering exercises.
+      late_pdu = %{
+        "event_id" => "$forkregress_late_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => remote_user,
+        "content" => %{"body" => "arrived late, forked early"},
+        "depth" => fork_depth + 1,
+        "prev_events" => [fork_point_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      assert fork_depth + 1 < head_before_fork_depth
+
+      assert {:ok, _} = RoomProcess.apply_remote_event(room_id, late_pdu)
+
+      # The tracked head must not have regressed to the forked event's
+      # lower depth or event_id — it must still reflect the room's real
+      # (higher) head from before the fork applied.
+      {head_after_fork_id, head_after_fork_depth} = RoomProcess.get_position(room_id)
+      assert head_after_fork_depth == head_before_fork_depth
+      assert head_after_fork_id == head_before_fork_id
+
+      # A subsequent local send must derive its depth from the real head,
+      # not from the forked event — its depth must be strictly beyond every
+      # prior local event's depth, never equal to (colliding with) or below
+      # any of them.
+      {:ok, after_event_id} =
+        RoomProcess.send_event(room_id, creator, "m.room.message", %{"body" => "after fork"})
+
+      {:ok, after_stored} = AxonCore.EventStore.get_event(after_event_id)
+
+      assert after_stored.depth > Enum.max(local_depths)
+      refute after_stored.depth in local_depths
+    end
   end
 
   describe "apply_remote_event/2 — soft failure" do
