@@ -530,6 +530,79 @@ defmodule AxonCore.EventStoreTest do
     end
   end
 
+  # Regression for TestJumpToDateEndpoint's "can paginate backwards" federation
+  # subtests: `get_context/2` (GET /rooms/:id/context/:event_id) used to
+  # reuse `get_messages/4` with the *target* event's own `stream_ordering` as
+  # the pivot. That bound is `stream_ordering`-only — appropriate for
+  # `get_messages/4`'s real callers, whose pivot is a pagination token
+  # already established relative to a known-good window, but wrong here: the
+  # target itself can be a federation-backfilled event, so a `stream_ordering`
+  # comparison against *its own* value doesn't reflect DAG position any
+  # better than one event's `stream_ordering` reflects another's.
+  #
+  # `get_context_neighbors/4` fixes this by comparing the full
+  # `{depth, stream_ordering}` tuple against the target's own, not just
+  # `stream_ordering`. This test reproduces the shape that broke `/context`:
+  # a target event backfilled in *after* a topologically-later event was
+  # already known locally (so the later event has a *lower* stream_ordering
+  # than the target, despite being deeper in the DAG) — mirroring
+  # `remoteCharlie`'s own join landing before the backfilled message it
+  # joined after.
+  describe "get_context_neighbors" do
+    @context_room "!context-order:localhost"
+
+    setup do
+      insert_user(@creator)
+      {:ok, _room} = EventStore.insert_room(@context_room, @creator, "10", false)
+      :ok
+    end
+
+    test "bounds by depth (not stream_ordering) against the pivot event, on both sides" do
+      # Insertion order (ascending stream_ordering):
+      #   root (depth 1) -> future_event (depth 5, like a remote member's own
+      #   join) -> ancestor (depth 2) -> target (depth 3) -- ancestor and
+      #   target both backfill in *after* future_event was already known
+      #   locally, exactly like Message A/B backfilling in after
+      #   remoteCharlie's own join.
+      root = event(%{"room_id" => @context_room, "content" => %{"body" => "root"}, "depth" => 1})
+
+      future_event =
+        event(%{"room_id" => @context_room, "content" => %{"body" => "future"}, "depth" => 5})
+
+      ancestor =
+        event(%{"room_id" => @context_room, "content" => %{"body" => "ancestor"}, "depth" => 2})
+
+      target =
+        event(%{"room_id" => @context_room, "content" => %{"body" => "target"}, "depth" => 3})
+
+      {:ok, p_root} = EventStore.insert_event(root, "10")
+      {:ok, p_future} = EventStore.insert_event(future_event, "10")
+      {:ok, p_ancestor} = EventStore.insert_event(ancestor, "10")
+      {:ok, p_target} = EventStore.insert_event(target, "10")
+
+      # future_event is topologically after target (depth 5 > depth 3) but
+      # was inserted locally *before* it, so it carries a lower
+      # stream_ordering despite that -- the exact skew that broke the old
+      # stream_ordering-only bound.
+      assert p_future.stream_ordering < p_target.stream_ordering
+      assert p_future.depth > p_target.depth
+
+      before = EventStore.get_context_neighbors(@context_room, p_target, "b", 10)
+      after_ = EventStore.get_context_neighbors(@context_room, p_target, "f", 10)
+
+      # "before" is bounded by depth < target's depth: ancestor (depth 2)
+      # then root (depth 1). future_event (depth 5) must NOT appear here
+      # despite its lower stream_ordering -- the bug this regression pins.
+      assert Enum.map(before, & &1.event_id) == [p_ancestor.event_id, p_root.event_id]
+
+      # "after" is bounded by depth > target's depth: future_event, found
+      # via its depth even though its stream_ordering is *lower* than
+      # target's own -- a stream_ordering-only bound would have missed it
+      # entirely.
+      assert Enum.map(after_, & &1.event_id) == [p_future.event_id]
+    end
+  end
+
   describe "search_messages" do
     test "finds a message by body text and reports a total count" do
       {:ok, _} =
@@ -1296,7 +1369,10 @@ defmodule AxonCore.EventStoreTest do
       # "this event": once the missing predecessor is backfilled in, the
       # same event becomes trustworthy.
       {:ok, _backfilled} =
-        EventStore.insert_event(event(%{"event_id" => missing_id, "prev_events" => [first.event_id]}), "10")
+        EventStore.insert_event(
+          event(%{"event_id" => missing_id, "prev_events" => [first.event_id]}),
+          "10"
+        )
 
       assert EventStore.trustworthy_local_timestamp_answer?(@room, gappy, "f") == true
     end

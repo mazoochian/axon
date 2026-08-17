@@ -650,25 +650,51 @@ defmodule AxonWeb.EventController do
             limit = String.to_integer(params["limit"] || "10")
             half = max(div(limit, 2), 1)
 
+            # get_context_neighbors/4, not get_messages/4: `event` is the
+            # pivot here, and it can itself be a federation-backfilled event
+            # whose stream_ordering reflects local insertion time rather
+            # than DAG position (Complement: TestJumpToDateEndpoint "can
+            # paginate backwards" — see get_context_neighbors/4's doc).
             before_events =
-              EventStore.get_messages(room_id, event.stream_ordering, "b", half)
+              EventStore.get_context_neighbors(room_id, event, "b", half)
 
             after_events =
-              EventStore.get_messages(room_id, event.stream_ordering, "f", half)
+              EventStore.get_context_neighbors(room_id, event, "f", half)
 
-            # get_messages/4 returns "b" newest-first, which is already the
-            # reverse-chronological order the spec wants for events_before.
+            # get_context_neighbors/4 returns "b" newest-first, which is
+            # already the reverse-chronological order the spec wants for
+            # events_before.
+            #
+            # `start`/`end` still have to be plain stream_ordering values —
+            # they're consumed by /messages's dir=b, whose own WHERE bound
+            # is stream_ordering-only (see get_messages/4's doc) — so they
+            # can't just borrow the boundary event's stream_ordering the way
+            # a non-skewed room would suggest. Any event on the "before" or
+            # "after" side (including `event` itself, on the "after" side)
+            # can carry a stream_ordering *higher* than events nominally
+            # further into the room's history, exactly because it may have
+            # backfilled in later than they did. The only bound guaranteed
+            # not to silently drop one of them is one strictly past the
+            # *highest* stream_ordering among everything that boundary needs
+            # to keep reachable — never just the depth-nearest one's.
+            #
+            # `start` only has to keep `before_events` reachable: `event`
+            # itself is deliberately excluded (it's already returned
+            # separately, and dir=b pagination from `start` isn't expected
+            # to reproduce it).
             start_ordering =
-              case List.last(before_events) do
-                nil -> event.stream_ordering
-                e -> e.stream_ordering
+              case before_events do
+                [] -> event.stream_ordering
+                events -> 1 + (events |> Enum.map(& &1.stream_ordering) |> Enum.max())
               end
 
+            # `end` has to keep both `after_events` *and* `event` itself
+            # reachable — a subsequent dir=b page from `end` is exactly how
+            # a client walks back through `event` and beyond (there's no
+            # forward-from-`end` call in play), so `event` can't be left
+            # out here the way it is for `start`.
             end_ordering =
-              case List.last(after_events) do
-                nil -> event.stream_ordering
-                e -> e.stream_ordering
-              end
+              1 + ([event | after_events] |> Enum.map(& &1.stream_ordering) |> Enum.max())
 
             json(conn, %{
               "start" => Integer.to_string(start_ordering),

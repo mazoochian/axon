@@ -140,7 +140,11 @@ defmodule AxonCore.EventStore do
 
       repo.update_all(
         from(e in Event, where: e.event_id == ^target_id),
-        set: [content: redacted_content, redacted: true, redacted_because: redaction_event.event_id]
+        set: [
+          content: redacted_content,
+          redacted: true,
+          redacted_because: redaction_event.event_id
+        ]
       )
     end
 
@@ -596,6 +600,58 @@ defmodule AxonCore.EventStore do
   end
 
   @doc """
+  Events strictly on one side of `event` in true DAG order — powers GET
+  /rooms/:id/context's `events_before`/`events_after` windowing.
+
+  Unlike `get_messages/4`, whose `WHERE` bound is deliberately
+  `stream_ordering`-only (appropriate there because its `from_ordering` comes
+  from a pagination *token* whose own position was already established
+  relative to a known-good window), here the pivot is `event` itself — and
+  `event` can be a federation-backfilled event, where `stream_ordering`
+  means nothing about DAG position (see `get_messages/4`'s doc). Bounding
+  purely by `event.stream_ordering`, as `get_context/2` used to (by reusing
+  `get_messages/4` with `event.stream_ordering` as `from_ordering`), silently
+  gets both sides wrong for such an event: a member who joined *after*
+  `event` but got inserted locally *before* it backfilled in (low
+  `stream_ordering`, high `depth`) wrongly counts as "before" `event`; an
+  ancestor of `event` that only backfills in *after* `event` was already
+  known (high `stream_ordering`, low `depth`) wrongly counts as "after" it.
+
+  Comparing the full `{depth, stream_ordering}` tuple against `event`'s own
+  fixes both: `dir == "b"` wants strictly lower `depth` (ties on `depth`
+  broken by lower `stream_ordering`), `dir == "f"` the mirror image.
+  """
+  def get_context_neighbors(room_id, %Event{} = event, dir, limit) do
+    base =
+      from(e in Event,
+        where: e.room_id == ^room_id and not e.rejected and not e.soft_failed
+      )
+
+    query =
+      case dir do
+        "b" ->
+          from(e in base,
+            where:
+              e.depth < ^event.depth or
+                (e.depth == ^event.depth and e.stream_ordering < ^event.stream_ordering),
+            order_by: [desc: e.depth, desc: e.stream_ordering],
+            limit: ^limit
+          )
+
+        _ ->
+          from(e in base,
+            where:
+              e.depth > ^event.depth or
+                (e.depth == ^event.depth and e.stream_ordering > ^event.stream_ordering),
+            order_by: [asc: e.depth, asc: e.stream_ordering],
+            limit: ^limit
+          )
+      end
+
+    Repo.all(query)
+  end
+
+  @doc """
   The event closest to `ts` (ms since the epoch) in `dir` — `"f"` for the
   earliest event at or after it, `"b"` for the latest at or before it. Backs
   GET /rooms/:id/timestamp_to_event.
@@ -830,8 +886,7 @@ defmodule AxonCore.EventStore do
     from(a in subquery(activity),
       join: root in Event,
       on: root.event_id == a.root_event_id,
-      where:
-        a.latest_ordering < ^from_ordering and not root.rejected and not root.soft_failed,
+      where: a.latest_ordering < ^from_ordering and not root.rejected and not root.soft_failed,
       order_by: [desc: a.latest_ordering],
       limit: ^limit,
       select: {root, a.latest_ordering}

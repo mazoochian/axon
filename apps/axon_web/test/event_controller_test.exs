@@ -261,6 +261,126 @@ defmodule AxonWeb.EventControllerTest do
 
       assert conn.status == 403
     end
+
+    # Regression (Complement TestJumpToDateEndpoint's federation "can
+    # paginate backwards after getting remote event from timestamp to event
+    # endpoint" subtests, both (start) and (end)): `get_context/2` used to
+    # window `events_before`/`events_after` via `get_messages/4`, bounding
+    # purely on the *target* event's own `stream_ordering`. That's wrong
+    # when the target is itself a federation-backfilled event, whose
+    # `stream_ordering` reflects local insertion time, not DAG position —
+    # exactly `AxonCore.EventStore.get_context_neighbors/4`'s bug (see its
+    # doc). This reproduces the shape live over HTTP: a remote member joins
+    # the room (getting a *low* stream_ordering, inserted early) before two
+    # older-in-the-DAG events backfill in after it (getting *higher*
+    # stream_ordering despite lower depth) — the same skew a real
+    # `timestamp_to_event`-triggered backfill produces once a remote server
+    # has already joined a room before asking about its older history.
+    test "start/end tokens stay correct when the context target is a backfilled event with skewed stream_ordering" do
+      alice = register("ctx_skew_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+      remote_user = "@charlie:federated.example"
+
+      # Applied FIRST (like a remote member's own join): low stream_ordering,
+      # but the deepest event in the room once A and B land.
+      future_pdu = %{
+        "event_id" => "$ctxskew_future_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.member",
+        "state_key" => remote_user,
+        "sender" => remote_user,
+        "content" => %{"membership" => "join"},
+        "depth" => depth + 3,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      {:ok, _future_id} = RoomProcess.apply_remote_event(room_id, future_pdu)
+
+      # Applied SECOND, backfilling in after the "future" event above: gets
+      # a higher stream_ordering than it despite a lower depth. Chained off
+      # `last_event_id` (not the "future" join) and sent by `alice`, who's
+      # already a joined member -- like the real scenario, where A/B are
+      # alice's own messages, sent (and locally causally ordered) before
+      # the remote member ever joined; only *this* server's local insertion
+      # order (via the simulated late-backfill below) is skewed relative to
+      # that.
+      event_a_pdu = %{
+        "event_id" => "$ctxskew_a_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => alice.user_id,
+        "content" => %{"body" => "Event A"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      {:ok, event_a_id} = RoomProcess.apply_remote_event(room_id, event_a_pdu)
+
+      # Applied LAST: the /context target. Highest stream_ordering in the
+      # room, but a lower depth than the "future" event.
+      event_b_pdu = %{
+        "event_id" => "$ctxskew_b_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => alice.user_id,
+        "content" => %{"body" => "Event B"},
+        "depth" => depth + 2,
+        "prev_events" => [event_a_id],
+        "auth_events" => [],
+        "origin" => "federated.example",
+        "origin_server_ts" => System.os_time(:millisecond)
+      }
+
+      {:ok, event_b_id} = RoomProcess.apply_remote_event(room_id, event_b_pdu)
+
+      context_body =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/context/#{URI.encode(event_b_id)}?limit=0")
+        |> decode()
+
+      start_token = context_body["start"]
+      end_token = context_body["end"]
+      assert is_binary(start_token) and is_binary(end_token)
+
+      # Paginating backwards from "start" (the boundary just before B) must
+      # still surface A, even though A's stream_ordering is higher than the
+      # future event's that the old, stream_ordering-only bound would have
+      # wrongly anchored "start" to.
+      from_start =
+        authed(alice.token)
+        |> get(
+          "/_matrix/client/v3/rooms/#{room_id}/messages?dir=b&limit=100&from=#{URI.encode_www_form(start_token)}"
+        )
+        |> decode()
+        |> Map.fetch!("chunk")
+        |> Enum.map(& &1["event_id"])
+
+      assert event_a_id in from_start
+
+      # Paginating backwards from "end" (the boundary just after B) must
+      # surface both A and B themselves — B's own stream_ordering is the
+      # highest in the room, so a boundary that merely equals it (rather
+      # than exceeding it) would silently exclude B.
+      from_end =
+        authed(alice.token)
+        |> get(
+          "/_matrix/client/v3/rooms/#{room_id}/messages?dir=b&limit=100&from=#{URI.encode_www_form(end_token)}"
+        )
+        |> decode()
+        |> Map.fetch!("chunk")
+        |> Enum.map(& &1["event_id"])
+
+      assert event_a_id in from_end
+      assert event_b_id in from_end
+    end
   end
 
   # `filter={"lazy_load_members":true}` on /messages — previously always
