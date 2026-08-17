@@ -557,15 +557,51 @@ defmodule AxonRoom.RoomProcess do
     end)
   end
 
+  # Advances the room's tracked head — but only forward. `event_map` here is
+  # always something that already passed auth (a fresh local send, or a
+  # remote PDU apply_remote_event/2 has just decided to apply) — the DAG
+  # itself is not required to be a single chain: a remote event can
+  # legitimately fork off an ancestor well behind the room's current head
+  # (StateResolver.needs_resolution?/2 is exactly what detects that and
+  # routes it through real state resolution instead of a blind overlay), and
+  # such a fork's own `depth` is whatever its ancestry earned it — lower
+  # than depth the room's already-known head sits at.
+  #
+  # Blindly overwriting state.depth/state.last_event_id with *whatever
+  # event was just applied*, fork or not, regresses the tracked head. The
+  # next locally-created event (EventBuilder.build/5) then computes its own
+  # depth as `room_ctx.depth + 1` off that regressed value and points
+  # prev_events at the regressed last_event_id — silently rewinding the
+  # room's forward progress and risking a new local event landing at (or
+  # below) a depth some earlier, already-persisted local event already
+  # occupies. Confirmed reproducible: build up a real head via several local
+  # sends, apply a remote fork whose own depth is lower, send once more —
+  # the post-fork send's depth collided with one already used above it.
+  #
+  # This does not attempt real forward-extremity tracking (multiple
+  # concurrent heads, each contributing to the next event's prev_events —
+  # see Synapse) — grep confirms nothing in this codebase has that concept
+  # today, and building it is a materially larger change than this bug
+  # needs. It only guarantees depth/last_event_id are monotonically
+  # non-decreasing: a fork that resolves behind the current head leaves the
+  # tracked head exactly where it already was, so every subsequent local
+  # send keeps deriving from the room's real high-water mark.
   defp apply_and_advance(state, event_map, stream_ordering) do
     new_current_state = StateApplicator.apply(event_map, state.current_state)
     counter = state.snapshot_counter + 1
 
+    {new_last_event_id, new_depth} =
+      if event_map["depth"] >= state.depth do
+        {event_map["event_id"], event_map["depth"]}
+      else
+        {state.last_event_id, state.depth}
+      end
+
     new_state = %{
       state
       | current_state: new_current_state,
-        last_event_id: event_map["event_id"],
-        depth: event_map["depth"],
+        last_event_id: new_last_event_id,
+        depth: new_depth,
         snapshot_counter: counter
     }
 
