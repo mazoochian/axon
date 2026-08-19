@@ -32,3 +32,5 @@ e2e-client/playwright-report/
 
 # Dialyzer PLT cache
 /priv/plts/
+
+CLAUDE.md
