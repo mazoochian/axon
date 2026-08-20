@@ -182,6 +182,7 @@ defmodule AxonWeb.Router do
     delete("/media/quarantine/:server_name/:media_id", AdminController, :unquarantine_media)
 
     get("/event_reports", AdminController, :list_reports)
+    delete("/event_reports/:report_id", AdminController, :delete_report)
 
     post("/send_server_notice", AdminController, :send_server_notice)
     put("/send_server_notice/:txn_id", AdminController, :send_server_notice)
