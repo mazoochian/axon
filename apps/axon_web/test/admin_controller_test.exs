@@ -2,7 +2,8 @@ defmodule AxonWeb.AdminControllerTest do
   @moduledoc """
   Regression tests for Phase 13's admin API (`/_synapse/admin/v1/...`):
   the `RequireAdmin` gate, user management (list/get/deactivate/shadow-ban),
-  room management (list/get/purge), media quarantine, and the report queue.
+  room management (list/get/purge), media quarantine, and the report queue
+  (list, and Phase 29's delete).
   """
 
   use AxonWeb.ConnCase, async: false
@@ -197,6 +198,48 @@ defmodule AxonWeb.AdminControllerTest do
                body["event_reports"],
                &(&1["event_id"] == event_id and &1["reason"] == "spam")
              )
+    end
+
+    test "delete_report removes the report and returns an empty object" do
+      admin = register("admin_reports_del_#{System.unique_integer([:positive])}")
+      make_admin(admin.user_id)
+      alice = register("admin_reports_del_alice_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+
+      event_id =
+        send_event(alice.token, room_id, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => "spam"
+        })
+
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/report/#{event_id}", %{"reason" => "spam"})
+
+      list_conn = authed(admin.token) |> get("/_synapse/admin/v1/event_reports")
+      report = Enum.find(decode(list_conn)["event_reports"], &(&1["event_id"] == event_id))
+      refute is_nil(report)
+
+      delete_conn =
+        authed(admin.token) |> delete("/_synapse/admin/v1/event_reports/#{report["id"]}")
+
+      assert delete_conn.status == 200
+      assert decode(delete_conn) == %{}
+
+      after_conn = authed(admin.token) |> get("/_synapse/admin/v1/event_reports")
+
+      refute Enum.any?(
+               decode(after_conn)["event_reports"],
+               &(&1["id"] == report["id"])
+             )
+    end
+
+    test "delete_report 404s for an unknown report id" do
+      admin = register("admin_reports_del_404_#{System.unique_integer([:positive])}")
+      make_admin(admin.user_id)
+
+      conn = authed(admin.token) |> delete("/_synapse/admin/v1/event_reports/999999999")
+      assert conn.status == 404
+      assert decode(conn)["errcode"] == "M_NOT_FOUND"
     end
   end
 end
