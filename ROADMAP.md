@@ -721,3 +721,9 @@ Failing (22), grouped by known cause rather than left as a flat list:
 Both `csapi` and federation numbers above are from actual full-package live runs against a freshly rebuilt image at this phase's `HEAD` — not estimates, not individually-run subsets stitched together. They **replace** the stale `63/64` (itself a scoped-subset number, not the real 106-test `csapi` package) and `61/88` (stale since Phase 22, already flagged stale-on-the-low-side by Phase 27 itself) figures everywhere they appeared in this document and in README.
 
 Full `mix test`, solo run: **1 doctest, 646 tests, 0 failures** — up from Phase 27's 645 by exactly the one new `RoomProcess` regression test this phase added; no other change in count.
+
+## Phase 29 — Resolve/dismiss a report
+
+Closes a gap the sibling Axe frontend's own roadmap had flagged as "Blocked on Axon": Phase 13's report queue (`GET /event_reports`) had no way to act on an entry once reviewed — reports just accumulated forever. Added `DELETE /_synapse/admin/v1/event_reports/:report_id`, matching real Synapse's admin API: reviewing a report means deleting its row outright, there's no `resolved`/`dismissed` status column to set instead. Deletes the matching row from `reports` and returns `200 {}`; an unknown or already-deleted `report_id` returns the standard `404 M_NOT_FOUND` via `FallbackController`.
+
+Regression coverage in `apps/axon_web/test/admin_controller_test.exs`: a successful delete (report gone from a subsequent `list_reports`, `200 {}` response) and a 404 on an unknown id.

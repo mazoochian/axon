@@ -233,6 +233,22 @@ defmodule AxonWeb.AdminController do
     json(conn, %{"event_reports" => reports, "total" => total, "next_token" => next_token})
   end
 
+  # DELETE /_synapse/admin/v1/event_reports/:report_id
+  #
+  # Real Synapse has no "resolved/dismissed" status on a report — reviewing
+  # one just means deleting it, permanently, from the queue. Matches that:
+  # no status column, no soft-delete.
+  def delete_report(conn, %{"report_id" => report_id}) do
+    case Integer.parse(report_id) do
+      {id, ""} ->
+        {n, _} = Repo.delete_all(from(r in "reports", where: r.id == ^id))
+        if n > 0, do: json(conn, %{}), else: {:error, :not_found}
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Server notices
   # ---------------------------------------------------------------------------
