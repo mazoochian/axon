@@ -41,6 +41,13 @@ defmodule AxonWeb.KeyController do
     one_time_keys = params["one_time_keys"] || %{}
     fallback_keys = params["fallback_keys"] || %{}
 
+    case validate_device_keys(device_keys, user_id, device_id) do
+      :ok -> upload_keys(conn, user_id, device_id, device_keys, one_time_keys, fallback_keys)
+      :error -> bad_json(conn, "Invalid device_keys")
+    end
+  end
+
+  defp upload_keys(conn, user_id, device_id, device_keys, one_time_keys, fallback_keys) do
     # Store device keys and record that this user's device list changed
     if device_keys do
       upsert_device_keys(user_id, device_id, device_keys)
@@ -58,9 +65,40 @@ defmodule AxonWeb.KeyController do
     json(conn, %{"one_time_key_counts" => counts})
   end
 
+  defp validate_device_keys(nil, _user_id, _device_id), do: :ok
+
+  defp validate_device_keys(device_keys, user_id, device_id) when is_map(device_keys) do
+    required_fields = ["user_id", "device_id", "algorithms", "keys", "signatures"]
+
+    if Enum.all?(required_fields, &Map.has_key?(device_keys, &1)) and
+         device_keys["user_id"] == user_id and device_keys["device_id"] == device_id and
+         is_list(device_keys["algorithms"]) and
+         Enum.all?(device_keys["algorithms"], &is_binary/1) and
+         map_values?(device_keys["keys"], &is_binary/1) and
+         map_values?(device_keys["signatures"], fn signatures ->
+           map_values?(signatures, &is_binary/1)
+         end),
+       do: :ok,
+       else: :error
+  end
+
+  defp validate_device_keys(_device_keys, _user_id, _device_id), do: :error
+
+  defp map_values?(value, validator) when is_map(value) do
+    Enum.all?(value, fn {_key, nested_value} -> validator.(nested_value) end)
+  end
+
+  defp map_values?(_value, _validator), do: false
+
   # POST /_matrix/client/v3/keys/query
   def query(conn, params) do
-    device_keys_req = params["device_keys"] || %{}
+    case normalize_device_keys_query(params["device_keys"]) do
+      {:ok, device_keys_req} -> query_device_keys(conn, device_keys_req)
+      :error -> bad_json(conn, "device_keys values must be arrays of device ID strings")
+    end
+  end
+
+  defp query_device_keys(conn, device_keys_req) do
     user_ids = Map.keys(device_keys_req)
     current_user_id = conn.assigns.current_user_id
     local_server = Application.fetch_env!(:axon_web, :server_name)
@@ -74,6 +112,7 @@ defmodule AxonWeb.KeyController do
         devices =
           queried_user_id
           |> KeyStore.device_keys_for_user()
+          |> filter_requested_devices(device_keys_req[queried_user_id])
           |> Map.new(fn {device_id, key_json} ->
             {device_id,
              KeyStore.merge_signatures(key_json, queried_user_id, device_id, sigs_by_target)}
@@ -104,6 +143,27 @@ defmodule AxonWeb.KeyController do
       "user_signing_keys" => user_signing_keys,
       "failures" => failures
     })
+  end
+
+  defp normalize_device_keys_query(device_keys_req) when is_map(device_keys_req) do
+    if Enum.all?(device_keys_req, fn {user_id, device_ids} ->
+         is_binary(user_id) and is_list(device_ids) and Enum.all?(device_ids, &is_binary/1)
+       end) do
+      {:ok, device_keys_req}
+    else
+      :error
+    end
+  end
+
+  defp normalize_device_keys_query(_device_keys_req), do: :error
+
+  defp filter_requested_devices(devices, []), do: devices
+  defp filter_requested_devices(devices, device_ids), do: Map.take(devices, device_ids)
+
+  defp bad_json(conn, message) do
+    conn
+    |> put_status(400)
+    |> json(%{"errcode" => "M_BAD_JSON", "error" => message})
   end
 
   # Splits a %{user_id => device_ids} request map into local user_ids and a

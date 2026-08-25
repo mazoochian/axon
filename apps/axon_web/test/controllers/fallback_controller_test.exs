@@ -25,6 +25,7 @@ defmodule AxonWeb.FallbackControllerTest do
     {{:error, :restricted_join_denied}, 403, "M_FORBIDDEN"},
     {{:error, :knocking_not_allowed}, 403, "M_FORBIDDEN"},
     {{:error, :already_in_room}, 403, "M_FORBIDDEN"},
+    {{:error, :already_joined}, 403, "M_FORBIDDEN"},
     {{:error, :cannot_knock_for_another}, 400, "M_INVALID_PARAM"},
     {{:error, :target_banned}, 403, "M_FORBIDDEN"},
     {{:error, :target_not_in_room}, 403, "M_FORBIDDEN"},

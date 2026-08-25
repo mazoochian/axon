@@ -6,8 +6,9 @@ defmodule AxonWeb.EventController do
   plug(AxonWeb.Plug.RateLimit, [bucket: :send_event, key_by: :user] when action == :send_event)
 
   import Ecto.Query, only: [from: 2]
-  alias AxonCore.{EventStore, Repo}
+  alias AxonCore.{ClientTransactionStore, EventStore, Repo}
   alias AxonRoom.RoomProcess
+  alias AxonWeb.TransactionIdProjection
 
   @max_event_size 65_535
 
@@ -33,6 +34,7 @@ defmodule AxonWeb.EventController do
       # otherwise-harmless extra query param.
       content = Map.drop(params, ~w(room_id event_type txn_id ts))
       send_opts = send_event_opts(conn, params["ts"])
+      request_scope = ClientTransactionStore.request_scope("send", [room_id, event_type])
 
       # Reject events exceeding 65535 bytes
       case check_event_size(content) do
@@ -42,17 +44,17 @@ defmodule AxonWeb.EventController do
           |> json(%{"errcode" => "M_TOO_LARGE", "error" => "Event too large"})
 
         :ok ->
-          # Idempotency check
-          case check_txn_idempotency(user_id, device_id, txn_id) do
-            {:already_sent, event_id} ->
-              json(conn, %{"event_id" => event_id})
+          transaction = transaction(user_id, device_id, txn_id, request_scope)
 
-            :new ->
-              with {:ok, event_id} <-
-                     RoomProcess.send_event(room_id, user_id, event_type, content, send_opts) do
-                record_txn(user_id, device_id, txn_id, event_id)
-                json(conn, %{"event_id" => event_id})
-              end
+          with {:ok, event_id} <-
+                 RoomProcess.send_event(
+                   room_id,
+                   user_id,
+                   event_type,
+                   content,
+                   Keyword.put(send_opts, :transaction, transaction)
+                 ) do
+            json(conn, %{"event_id" => event_id})
           end
       end
     end
@@ -268,7 +270,14 @@ defmodule AxonWeb.EventController do
               user_id: user_id
             )
 
-          json(conn, bundled)
+          json(
+            conn,
+            TransactionIdProjection.project(
+              bundled,
+              user_id,
+              conn.assigns.current_device_id
+            )
+          )
         else
           {:error, :not_found}
         end
@@ -475,12 +484,17 @@ defmodule AxonWeb.EventController do
         |> Enum.map(&EventStore.event_to_map/1)
         |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
 
-      json(conn, %{
+      response = %{
         "start" => start_token,
         "end" => Integer.to_string(end_ordering),
         "chunk" => chunk,
         "state" => lazy_loaded_member_state(room_id, chunk, filter)
-      })
+      }
+
+      json(
+        conn,
+        TransactionIdProjection.project(response, user_id, conn.assigns.current_device_id)
+      )
     end
   end
 
@@ -696,7 +710,7 @@ defmodule AxonWeb.EventController do
             end_ordering =
               1 + ([event | after_events] |> Enum.map(& &1.stream_ordering) |> Enum.max())
 
-            json(conn, %{
+            response = %{
               "start" => Integer.to_string(start_ordering),
               "end" => Integer.to_string(end_ordering),
               "events_before" => Enum.map(before_events, &EventStore.event_to_map/1),
@@ -704,7 +718,12 @@ defmodule AxonWeb.EventController do
               "events_after" => Enum.map(after_events, &EventStore.event_to_map/1),
               "state" =>
                 room_id |> EventStore.get_current_state() |> Enum.map(&EventStore.event_to_map/1)
-            })
+            }
+
+            json(
+              conn,
+              TransactionIdProjection.project(response, user_id, conn.assigns.current_device_id)
+            )
 
           _ ->
             conn
@@ -736,7 +755,10 @@ defmodule AxonWeb.EventController do
       dir = params["dir"] || "b"
       limit = String.to_integer(params["limit"] || "10")
       from_token = params["from"]
-      from_ordering = parse_token(from_token) || EventStore.room_max_stream_ordering(room_id) + 1
+
+      from_ordering =
+        parse_token(from_token) ||
+          if(dir == "f", do: 0, else: EventStore.room_max_stream_ordering(room_id) + 1)
 
       events =
         EventStore.get_relations(
@@ -762,7 +784,7 @@ defmodule AxonWeb.EventController do
 
       resp = %{"chunk" => chunk}
       resp = if next_batch, do: Map.put(resp, "next_batch", next_batch), else: resp
-      json(conn, resp)
+      json(conn, TransactionIdProjection.project(resp, user_id, conn.assigns.current_device_id))
     end
   end
 
@@ -831,16 +853,20 @@ defmodule AxonWeb.EventController do
     content = %{"redacts" => redacts_event_id}
     content = if reason, do: Map.put(content, "reason", reason), else: content
 
-    case check_txn_idempotency(user_id, device_id, txn_id) do
-      {:already_sent, event_id} ->
-        json(conn, %{"event_id" => event_id})
+    request_scope =
+      ClientTransactionStore.request_scope("redact", [
+        room_id,
+        "m.room.redaction",
+        redacts_event_id
+      ])
 
-      :new ->
-        with {:ok, event_id} <-
-               RoomProcess.send_event(room_id, user_id, "m.room.redaction", content) do
-          record_txn(user_id, device_id, txn_id, event_id)
-          json(conn, %{"event_id" => event_id})
-        end
+    transaction = transaction(user_id, device_id, txn_id, request_scope)
+
+    with {:ok, event_id} <-
+           RoomProcess.send_event(room_id, user_id, "m.room.redaction", content,
+             transaction: transaction
+           ) do
+      json(conn, %{"event_id" => event_id})
     end
   end
 
@@ -848,37 +874,8 @@ defmodule AxonWeb.EventController do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp check_txn_idempotency(user_id, device_id, txn_id) do
-    import Ecto.Query
-
-    case Repo.one(
-           from(t in "client_txns",
-             where:
-               t.user_id == ^user_id and
-                 t.device_id == ^device_id and
-                 t.txn_id == ^txn_id,
-             select: t.event_id
-           )
-         ) do
-      nil -> :new
-      event_id -> {:already_sent, event_id}
-    end
-  end
-
-  defp record_txn(user_id, device_id, txn_id, event_id) do
-    Repo.insert_all(
-      "client_txns",
-      [
-        %{
-          user_id: user_id,
-          device_id: device_id,
-          txn_id: txn_id,
-          event_id: event_id,
-          inserted_at: DateTime.utc_now(:microsecond)
-        }
-      ],
-      on_conflict: :nothing
-    )
+  defp transaction(user_id, device_id, txn_id, request_scope) do
+    %{user_id: user_id, device_id: device_id, txn_id: txn_id, request_scope: request_scope}
   end
 
   defp parse_token(nil), do: nil

@@ -8,8 +8,105 @@ defmodule AxonRoom.RoomProcessTest do
 
   use AxonRoom.DataCase, async: false
 
-  alias AxonCore.UserStore
+  alias AxonCore.{ClientTransactionStore, UserStore}
   alias AxonRoom.{CreateRoom, RoomProcess}
+
+  describe "send_event/5 — atomic client transaction" do
+    test "request scopes cannot collide across component boundaries" do
+      refute ClientTransactionStore.request_scope("send", ["ab", "c"]) ==
+               ClientTransactionStore.request_scope("send", ["a", "bc"])
+
+      refute ClientTransactionStore.request_scope("send", ["room", "m.room.redaction:x"]) ==
+               ClientTransactionStore.request_scope("redact", ["room", "m.room.redaction", "x"])
+    end
+
+    test "failure after event insertion rolls back every durable and in-memory effect" do
+      creator = new_user("atomic")
+      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost")
+      before_position = RoomProcess.get_position(room_id)
+
+      txn = %{
+        user_id: creator,
+        device_id: "DEVICE",
+        txn_id: "rollback",
+        request_scope: "#{byte_size(room_id)}:#{room_id}m.room.topic",
+        after_event_insert: fn -> {:error, :injected_after_event_insert} end
+      }
+
+      assert RoomProcess.send_event(
+               room_id,
+               creator,
+               "m.room.topic",
+               %{"topic" => "must roll back"},
+               state_key: "",
+               transaction: txn
+             ) == {:error, :injected_after_event_insert}
+
+      assert RoomProcess.get_position(room_id) == before_position
+      refute RoomProcess.get_state_event(room_id, "m.room.topic", "")
+
+      refute Repo.exists?(
+               from(e in "events", where: e.room_id == ^room_id and e.type == "m.room.topic")
+             )
+
+      refute Repo.exists?(from(t in "client_txns", where: t.txn_id == "rollback"))
+    end
+
+    test "an externally held transaction lock times out without a late commit" do
+      creator = new_user("lock_timeout")
+      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost")
+      before_position = RoomProcess.get_position(room_id)
+
+      txn = %{
+        user_id: creator,
+        device_id: "DEVICE",
+        txn_id: "externally-locked",
+        request_scope: ClientTransactionStore.request_scope("send", [room_id, "m.room.message"])
+      }
+
+      repo_config = AxonCore.Repo.config()
+
+      connection_opts =
+        Keyword.take(repo_config, [:username, :password, :hostname, :port, :database])
+
+      {:ok, external} = Postgrex.start_link(connection_opts)
+      Process.unlink(external)
+      Postgrex.query!(external, "BEGIN", [])
+
+      Postgrex.query!(external, "SELECT pg_advisory_xact_lock($1)", [
+        ClientTransactionStore.advisory_key(txn)
+      ])
+
+      old_timeout = Application.get_env(:axon_core, :client_transaction_lock_timeout_ms)
+      Application.put_env(:axon_core, :client_transaction_lock_timeout_ms, 50)
+
+      on_exit(fn ->
+        if old_timeout,
+          do: Application.put_env(:axon_core, :client_transaction_lock_timeout_ms, old_timeout),
+          else: Application.delete_env(:axon_core, :client_transaction_lock_timeout_ms)
+
+        if Process.alive?(external), do: Process.exit(external, :shutdown)
+      end)
+
+      assert RoomProcess.send_event(room_id, creator, "m.room.message", %{"body" => "never"},
+               transaction: txn
+             ) ==
+               {:error, :transaction_lock_timeout}
+
+      assert RoomProcess.get_position(room_id) == before_position
+
+      Postgrex.query!(external, "ROLLBACK", [])
+      Process.sleep(100)
+      assert RoomProcess.get_position(room_id) == before_position
+      refute Repo.exists?(from(t in "client_txns", where: t.txn_id == "externally-locked"))
+
+      refute Repo.exists?(
+               from(e in "events",
+                 where: e.room_id == ^room_id and fragment("?->>'body'", e.content) == "never"
+               )
+             )
+    end
+  end
 
   defp new_user(prefix) do
     localpart = "#{prefix}_#{System.unique_integer([:positive])}"

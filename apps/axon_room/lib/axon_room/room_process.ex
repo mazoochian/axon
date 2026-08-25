@@ -12,7 +12,7 @@ defmodule AxonRoom.RoomProcess do
   use GenServer, restart: :transient
   require Logger
 
-  alias AxonCore.EventStore
+  alias AxonCore.{ClientTransactionStore, EventStore, Repo}
   alias AxonRoom.{AuthRules, EventBuilder, StateApplicator, StateResolver}
 
   @snapshot_interval 100
@@ -172,6 +172,16 @@ defmodule AxonRoom.RoomProcess do
 
   @impl true
   def handle_call({:send_event, sender, type, content, opts}, _from, state) do
+    transaction = Keyword.get(opts, :transaction)
+
+    if transaction do
+      send_transactional_event(sender, type, content, opts, transaction, state)
+    else
+      send_untracked_event(sender, type, content, opts, state)
+    end
+  end
+
+  defp send_untracked_event(sender, type, content, opts, state) do
     room_ctx = %{
       room_id: state.room_id,
       room_version: state.room_version,
@@ -192,6 +202,84 @@ defmodule AxonRoom.RoomProcess do
         do_send_event(event, state)
     end
   end
+
+  defp send_transactional_event(sender, type, content, opts, transaction, state) do
+    result =
+      Repo.transaction(fn ->
+        case ClientTransactionStore.lock(transaction) do
+          :ok -> :ok
+          {:error, reason} -> Repo.rollback(reason)
+        end
+
+        case ClientTransactionStore.lookup(transaction) do
+          {:already_sent, event_id} ->
+            {:already_sent, event_id}
+
+          :new ->
+            case build_and_persist(sender, type, content, opts, state) do
+              {:ok, event_id, persisted} ->
+                run_after_event_insert(transaction)
+                :ok = ClientTransactionStore.insert!(transaction, event_id)
+                {:created, persisted}
+
+              {:duplicate, event_id} ->
+                :ok = ClientTransactionStore.insert!(transaction, event_id)
+                {:already_sent, event_id}
+
+              {:error, reason} ->
+                Repo.rollback(reason)
+            end
+        end
+      end)
+
+    case result do
+      {:ok, {:already_sent, event_id}} -> {:reply, {:ok, event_id}, state}
+      {:ok, {:created, persisted}} -> commit_persisted_event(persisted, state)
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp build_and_persist(sender, type, content, opts, state) do
+    room_ctx = %{
+      room_id: state.room_id,
+      room_version: state.room_version,
+      current_state: state.current_state,
+      last_event_id: state.last_event_id,
+      depth: state.depth
+    }
+
+    event =
+      EventBuilder.build(sender, type, content, room_ctx, opts)
+      |> with_prev_content(Keyword.get(opts, :state_key), state.current_state)
+
+    case duplicate_state_event(sender, event, state.current_state) do
+      {:ok, event_id} ->
+        {:duplicate, event_id}
+
+      :not_duplicate ->
+        case AuthRules.check(event, state.current_state, state.room_version) do
+          :ok ->
+            case EventStore.insert_event(event, state.room_version) do
+              {:ok, persisted} -> {:ok, event["event_id"], persisted}
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  if Mix.env() == :test do
+    defp run_after_event_insert(%{after_event_insert: callback}) when is_function(callback, 0) do
+      case callback.() do
+        :ok -> :ok
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end
+  end
+
+  defp run_after_event_insert(_transaction), do: :ok
 
   # Mirrors Synapse's own `deduplicate_state_event`: re-setting a piece of
   # room state to exactly the content it already has (same sender, same
@@ -228,39 +316,43 @@ defmodule AxonRoom.RoomProcess do
       :ok ->
         case EventStore.insert_event(event, state.room_version) do
           {:ok, persisted} ->
-            event_map = EventStore.event_to_map(persisted)
-            new_state = apply_and_advance(state, event_map, persisted.stream_ordering)
-            broadcast(state.room_id, event_map)
-
-            unless shadow_banned_message?(event_map) do
-              # Federation gets the PDU form, not the client form — they
-              # differ for a room-v12 create event (see
-              # EventStore.event_to_pdu/1). Only reachable in practice for
-              # a create event via a room upgrade, since a brand-new room
-              # has no remote members yet, but deriving it explicitly beats
-              # relying on that.
-              broadcast_for_federation(
-                state.room_id,
-                EventStore.event_to_pdu(persisted),
-                new_state.current_state
-              )
-            end
-
-            # Push notifications (fire-and-forget)
-            AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
-            # AppService fanout via PubSub (avoids circular dep on axon_web)
-            Phoenix.PubSub.broadcast(
-              @pubsub,
-              "all_events",
-              {:new_event, state.room_id, event_map}
-            )
-
-            {:reply, {:ok, event["event_id"]}, new_state}
+            commit_persisted_event(persisted, state)
 
           {:error, reason} ->
             {:reply, {:error, reason}, state}
         end
     end
+  end
+
+  defp commit_persisted_event(persisted, state) do
+    event_map = EventStore.event_to_map(persisted)
+    new_state = apply_and_advance(state, event_map, persisted.stream_ordering)
+    broadcast(state.room_id, event_map)
+
+    unless shadow_banned_message?(event_map) do
+      # Federation gets the PDU form, not the client form — they
+      # differ for a room-v12 create event (see
+      # EventStore.event_to_pdu/1). Only reachable in practice for
+      # a create event via a room upgrade, since a brand-new room
+      # has no remote members yet, but deriving it explicitly beats
+      # relying on that.
+      broadcast_for_federation(
+        state.room_id,
+        EventStore.event_to_pdu(persisted),
+        new_state.current_state
+      )
+    end
+
+    # Push notifications (fire-and-forget)
+    AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
+    # AppService fanout via PubSub (avoids circular dep on axon_web)
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "all_events",
+      {:new_event, state.room_id, event_map}
+    )
+
+    {:reply, {:ok, persisted.event_id}, new_state}
   end
 
   @impl true

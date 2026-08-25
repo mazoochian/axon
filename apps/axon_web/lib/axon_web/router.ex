@@ -230,6 +230,8 @@ defmodule AxonWeb.Router do
     post("/r0/upload", MediaController, :upload)
     post("/v1/create", MediaController, :create)
     put("/v3/upload/:server_name/:media_id", MediaController, :upload_to_id)
+    get("/v3/preview_url", MediaController, :url_preview)
+    get("/r0/preview_url", MediaController, :url_preview)
   end
 
   # -------------------------------------------------------------------------

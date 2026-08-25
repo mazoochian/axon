@@ -90,6 +90,12 @@ defmodule AxonWeb.FallbackController do
     |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Already in this room"})
   end
 
+  def call(conn, {:error, :already_joined}) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "User is already joined to this room"})
+  end
+
   def call(conn, {:error, :cannot_knock_for_another}) do
     conn
     |> put_status(400)

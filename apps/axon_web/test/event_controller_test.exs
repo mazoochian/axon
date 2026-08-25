@@ -3,6 +3,8 @@ defmodule AxonWeb.EventControllerTest do
 
   use AxonWeb.ConnCase, async: false
 
+  import Ecto.Query
+  alias AxonCore.Repo
   alias AxonRoom.RoomProcess
 
   defp register(username) do
@@ -191,6 +193,154 @@ defmodule AxonWeb.EventControllerTest do
       |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{event_id}/#{txn}", %{})
 
     assert decode(conn1)["event_id"] == decode(conn2)["event_id"]
+  end
+
+  describe "transaction idempotency request scoping" do
+    test "redactions scope the target event and do not collide with generic redaction sends" do
+      alice = register("redact_scope_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      first = send_message(alice.token, room_id, %{"body" => "first"})
+      second = send_message(alice.token, room_id, %{"body" => "second"})
+      txn = "same-redaction-txn"
+
+      generic =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/rooms/#{room_id}/send/m.room.redaction/#{txn}", %{
+          "redacts" => first
+        })
+        |> decode()
+
+      redacts_first =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{first}/#{txn}", %{})
+        |> decode()
+
+      redacts_second =
+        authed(alice.token)
+        |> jpu("/_matrix/client/v3/rooms/#{room_id}/redact/#{second}/#{txn}", %{})
+        |> decode()
+
+      assert MapSet.size(
+               MapSet.new([
+                 generic["event_id"],
+                 redacts_first["event_id"],
+                 redacts_second["event_id"]
+               ])
+             ) == 3
+    end
+
+    test "same user, device, transaction, room, and event type returns the same event despite a changed body" do
+      alice = register("txn_scope_same_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      path = "/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn_id}"
+      alias_path = "/_matrix/client/r0/rooms/#{room_id}/send/m.room.message/#{txn_id}"
+
+      first = authed(alice.token) |> jpu(path, %{"body" => "first"})
+      retry = authed(alice.token) |> jpu(alias_path, %{"body" => "changed"})
+
+      assert first.status == 200
+      assert retry.status == 200
+      assert decode(first)["event_id"] == decode(retry)["event_id"]
+    end
+
+    test "same transaction in another room creates a different event in that room" do
+      alice = register("txn_scope_room_#{System.unique_integer([:positive])}")
+      first_room_id = create_room(alice.token)
+      second_room_id = create_room(alice.token)
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      first =
+        authed(alice.token)
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{first_room_id}/send/m.room.message/#{txn_id}",
+          %{"body" => "first room"}
+        )
+
+      second =
+        authed(alice.token)
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{second_room_id}/send/m.room.message/#{txn_id}",
+          %{"body" => "second room"}
+        )
+
+      assert first.status == 200
+      assert second.status == 200
+      refute decode(first)["event_id"] == decode(second)["event_id"]
+
+      second_event = get_event(alice.token, second_room_id, decode(second)["event_id"])
+      assert second_event.status == 200
+      assert decode(second_event)["room_id"] == second_room_id
+    end
+
+    test "same transaction in the same room with a different event type is a distinct request target" do
+      alice = register("txn_scope_type_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      message =
+        authed(alice.token)
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{room_id}/send/m.room.message/#{txn_id}",
+          %{"body" => "message"}
+        )
+
+      custom =
+        authed(alice.token)
+        |> jpu(
+          "/_matrix/client/v3/rooms/#{room_id}/send/com.example.custom/#{txn_id}",
+          %{"value" => "custom"}
+        )
+
+      assert message.status == 200
+      assert custom.status == 200
+      refute decode(message)["event_id"] == decode(custom)["event_id"]
+
+      custom_event = get_event(alice.token, room_id, decode(custom)["event_id"])
+      assert custom_event.status == 200
+      assert decode(custom_event)["type"] == "com.example.custom"
+    end
+
+    test "concurrent identical sends return one event ID and persist one event and mapping" do
+      alice = register("txn_concurrent_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token)
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+      event_type = "com.example.concurrent"
+      path = "/_matrix/client/v3/rooms/#{room_id}/send/#{event_type}/#{txn_id}"
+
+      responses =
+        1..8
+        |> Task.async_stream(
+          fn attempt ->
+            authed(alice.token)
+            |> jpu(path, %{"attempt" => attempt})
+          end,
+          max_concurrency: 8,
+          ordered: false,
+          timeout: 15_000
+        )
+        |> Enum.map(fn {:ok, conn} -> conn end)
+
+      assert Enum.all?(responses, &(&1.status == 200))
+      event_ids = Enum.map(responses, &decode(&1)["event_id"])
+      assert [_event_id] = Enum.uniq(event_ids)
+
+      assert Repo.aggregate(
+               from(e in "events",
+                 where:
+                   e.room_id == ^room_id and e.sender == ^alice.user_id and
+                     e.type == ^event_type
+               ),
+               :count
+             ) == 1
+
+      assert Repo.aggregate(
+               from(t in "client_txns",
+                 where: t.user_id == ^alice.user_id and t.txn_id == ^txn_id
+               ),
+               :count
+             ) == 1
+    end
   end
 
   # GET /rooms/:room_id/context/:event_id — previously unimplemented (no

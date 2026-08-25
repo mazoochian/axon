@@ -111,7 +111,7 @@ defmodule AxonMedia.UrlPreview do
 
         status in 200..299 ->
           content_type = find_header(headers, "content-type") || ""
-          parse_body(content_type, body, server_name)
+          parse_body(content_type, body, server_name, url)
 
         true ->
           {:error, {:http_status, status}}
@@ -126,10 +126,10 @@ defmodule AxonMedia.UrlPreview do
     |> URI.to_string()
   end
 
-  defp parse_body(content_type, body, server_name) do
+  defp parse_body(content_type, body, server_name, page_url) do
     cond do
       String.starts_with?(content_type, "text/html") ->
-        {:ok, extract_og(body, server_name)}
+        {:ok, extract_og(body, server_name, page_url)}
 
       String.starts_with?(content_type, "image/") ->
         {:ok, rehost_image(body, content_type, server_name)}
@@ -144,13 +144,15 @@ defmodule AxonMedia.UrlPreview do
   # good enough for the handful of meta tags this cares about)
   # ---------------------------------------------------------------------------
 
-  @doc "Extracts og:title/description/site_name/image from an HTML document. Public for direct unit testing of the parsing logic, independent of the SSRF-gated fetch."
-  def extract_og(html, server_name \\ nil) do
+  @doc "Extracts og:title/description/site_name/type/url/image from an HTML document. `page_url`, when given, resolves an `og:image` that's a relative reference (common in the wild despite the OG spec requiring absolute URLs) against the page it came from. Public for direct unit testing of the parsing logic, independent of the SSRF-gated fetch."
+  def extract_og(html, server_name \\ nil, page_url \\ nil) do
     base =
       %{}
       |> maybe_put_meta(html, "og:title", "title")
       |> maybe_put_meta(html, "og:description", "description")
       |> maybe_put_meta(html, "og:site_name", "site_name")
+      |> maybe_put_meta(html, "og:type", "type")
+      |> maybe_put_meta(html, "og:url", "url")
 
     base =
       if not Map.has_key?(base, "og:title") do
@@ -167,7 +169,10 @@ defmodule AxonMedia.UrlPreview do
         base
 
       image_url ->
-        case fetch_and_parse(image_url, @max_redirects, server_name) do
+        resolved_image_url =
+          if page_url, do: resolve_redirect(page_url, image_url), else: image_url
+
+        case fetch(resolved_image_url, server_name) do
           {:ok, %{"__image__" => image_map}} -> Map.merge(base, image_map)
           _ -> base
         end
@@ -178,6 +183,13 @@ defmodule AxonMedia.UrlPreview do
     case find_meta(html, og_key) do
       nil -> acc
       value -> Map.put(acc, "og:#{out_key}", value)
+    end
+  end
+
+  defp maybe_put_meta_exact(acc, html, og_key, out_key) do
+    case find_meta(html, og_key) do
+      nil -> acc
+      value -> Map.put(acc, out_key, value)
     end
   end
 
@@ -203,16 +215,106 @@ defmodule AxonMedia.UrlPreview do
   defp rehost_image(body, content_type, server_name) do
     case Store.upload("url_preview", content_type, body, server_name) do
       {:ok, media_id} ->
+        dimensions = get_image_dimensions(body, content_type)
         %{
           "__image__" => %{
             "og:image" => "mxc://#{server_name}/#{media_id}",
-            "matrix:image:size" => byte_size(body)
+            "matrix:image:size" => byte_size(body),
+            "og:image:width" => dimensions[:width],
+            "og:image:height" => dimensions[:height]
           }
         }
 
       {:error, _} ->
         %{}
     end
+  end
+
+  @doc "Parses width/height out of raw image bytes, by `content_type`. Public for direct unit testing against real fixture bytes, independent of the SSRF-gated fetch."
+  def get_image_dimensions(body, content_type) do
+    case content_type do
+      "image/png" -> get_png_dimensions(body)
+      "image/jpeg" -> get_jpeg_dimensions(body)
+      "image/gif" -> get_gif_dimensions(body)
+      "image/webp" -> get_webp_dimensions(body)
+      _ -> %{width: 0, height: 0}
+    end
+  end
+
+  defp get_png_dimensions(body) do
+    # PNG: 8-byte signature + 4-byte IHDR length + 4-byte "IHDR" type, then
+    # width/height at bytes 16-23 (4 bytes each, big-endian).
+    <<_::binary-size(16), width::32, height::32, _::binary>> = body
+    %{width: width, height: height}
+  end
+
+  defp get_jpeg_dimensions(body) do
+    # JPEG: scan for SOF markers (0xFFC0-0xFFCF except 0xFFC4, 0xFFC8, 0xFFCC)
+    # After marker: 2 bytes length, 1 byte precision, 2 bytes height, 2 bytes width
+    get_jpeg_dimensions(body, 0)
+  end
+
+  defp get_jpeg_dimensions(<<0xFF, marker, length::16, 0x08, height::16, width::16, _::binary>>, _offset) when marker in [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF] do
+    %{width: width, height: height}
+  end
+
+  defp get_jpeg_dimensions(<<0xFF, marker, length::16, rest::binary>>, offset) when marker in [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF] do
+    # This is a SOF marker but we couldn't match the pattern, skip it
+    skip = length - 2
+    <<_::binary-size(skip), rest2::binary>> = rest
+    get_jpeg_dimensions(rest2, offset + 2 + length)
+  end
+
+  defp get_jpeg_dimensions(<<0xFF, marker, length::16, rest::binary>>, offset) when marker >= 0xD0 and marker <= 0xD9 do
+    # RST markers (0xD0-0xD7) and EOI (0xD9) have no length field
+    get_jpeg_dimensions(rest, offset + 2)
+  end
+
+  defp get_jpeg_dimensions(<<0xFF, marker, length::16, rest::binary>>, offset) do
+    # Other markers have length field, skip payload
+    skip = length - 2
+    <<_::binary-size(skip), rest2::binary>> = rest
+    get_jpeg_dimensions(rest2, offset + 2 + length)
+  end
+
+  defp get_jpeg_dimensions(<<_::1, rest::binary>>, offset) do
+    get_jpeg_dimensions(rest, offset + 1)
+  end
+
+  defp get_jpeg_dimensions(<<>>, _offset) do
+    %{width: 0, height: 0}
+  end
+
+  defp get_gif_dimensions(body) do
+    # GIF: width/height at bytes 6-9 (2 bytes each, little-endian)
+    <<_::6, width::16-little, height::16-little, _::binary>> = body
+    %{width: width, height: height}
+  end
+
+  defp get_webp_dimensions(body) do
+    # WebP: VP8/VP8L chunk after RIFF header
+    # RIFF: "RIFF" (4), file_size (4), "WEBP" (4)
+    # Then VP8: "VP8 " (4), chunk_size (4), then 10 bytes header with width/height
+    # Or VP8L: "VP8L" (4), chunk_size (4), then 1 byte signature + width/height (14 bits each)
+    get_webp_dimensions(body, 0)
+  end
+
+  defp get_webp_dimensions(<<0x52, 0x49, 0x46, 0x46, _file_size::32, 0x57, 0x45, 0x42, 0x50, 0x38, 0x20, _chunk_size::32, _::8, width::24-little, height::24-little, _::binary>>, _offset) do
+    # VP8 (lossy) format
+    %{width: width, height: height}
+  end
+
+  defp get_webp_dimensions(<<0x52, 0x49, 0x46, 0x46, _file_size::32, 0x57, 0x45, 0x42, 0x50, 0x38, 0x4C, _chunk_size::32, _::8, width_bits::14-little, height_bits::14-little, _::binary>>, _offset) do
+    # VP8L (lossless) format
+    %{width: width_bits, height: height_bits}
+  end
+
+  defp get_webp_dimensions(<<_::1, rest::binary>>, offset) when offset < 100 do
+    get_webp_dimensions(rest, offset + 1)
+  end
+
+  defp get_webp_dimensions(_body, _offset) do
+    %{width: 0, height: 0}
   end
 
   # ---------------------------------------------------------------------------
@@ -230,13 +332,22 @@ defmodule AxonMedia.UrlPreview do
     with %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) <-
            URI.parse(url),
          {:ok, addresses} <- resolve(host),
-         false <- Enum.any?(addresses, &private_address?/1) do
+         false <- private_addresses_blocked?() and Enum.any?(addresses, &private_address?/1) do
       {:ok, hd(addresses)}
     else
       %URI{} -> {:error, :invalid_url}
       {:error, _} = err -> err
       true -> {:error, :blocked_address}
     end
+  end
+
+  # Off only for the Complement test harness (complement/start.sh sets
+  # URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES, consumed in config/runtime.exs) —
+  # Complement's own test webserver is only reachable via the Docker host
+  # gateway, which is itself a private address. Every real deployment keeps
+  # this on; there's no equivalent knob wired up for a real admin to flip.
+  defp private_addresses_blocked? do
+    not Application.get_env(:axon_media, :url_preview_allow_private_addresses, false)
   end
 
   defp resolve(host) do

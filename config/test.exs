@@ -12,6 +12,20 @@ config :axon_core, AxonCore.Repo,
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: 10
 
+config :axon_core, AxonCore.AdvisoryLockRepo,
+  username: "axon",
+  password: "axon",
+  hostname: System.get_env("DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("DB_PORT", "5432")),
+  database: System.get_env("AXON_TEST_DB", "axon_test"),
+  pool: DBConnection.ConnectionPool,
+  pool_size: 2
+
+# SQL Sandbox owns an outer transaction before test code runs, so PostgreSQL
+# cannot accept SET TRANSACTION there. Production keeps the default true; the
+# non-sandbox isolation regression uses AdvisoryLockRepo and still executes it.
+config :axon_core, :snapshot_set_transaction_isolation, false
+
 config :axon_web, AxonWeb.Endpoint,
   server: false,
   secret_key_base: String.duplicate("test", 16)

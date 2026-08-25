@@ -247,16 +247,17 @@ defmodule AxonWeb.AdminController do
       ) do
     admin_id = conn.assigns.current_user_id
     device_id = conn.assigns.current_device_id
+    request_scope = AxonCore.ClientTransactionStore.request_scope("server_notice", [user_id])
 
-    case admin_txn_idempotency(admin_id, device_id, txn_id) do
-      {:already_sent, event_id} ->
-        json(conn, %{"event_id" => event_id})
+    transaction = %{
+      user_id: admin_id,
+      device_id: device_id,
+      txn_id: txn_id,
+      request_scope: request_scope
+    }
 
-      :new ->
-        with {:ok, event_id} <- AxonWeb.ServerNotices.send_notice(user_id, content) do
-          record_admin_txn(admin_id, device_id, txn_id, event_id)
-          json(conn, %{"event_id" => event_id})
-        end
+    with {:ok, event_id} <- AxonWeb.ServerNotices.send_notice(user_id, content, transaction) do
+      json(conn, %{"event_id" => event_id})
     end
   end
 
@@ -270,33 +271,5 @@ defmodule AxonWeb.AdminController do
     conn
     |> put_status(400)
     |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user_id and content are required"})
-  end
-
-  defp admin_txn_idempotency(user_id, device_id, txn_id) do
-    case Repo.one(
-           from(t in "client_txns",
-             where: t.user_id == ^user_id and t.device_id == ^device_id and t.txn_id == ^txn_id,
-             select: t.event_id
-           )
-         ) do
-      nil -> :new
-      event_id -> {:already_sent, event_id}
-    end
-  end
-
-  defp record_admin_txn(user_id, device_id, txn_id, event_id) do
-    Repo.insert_all(
-      "client_txns",
-      [
-        %{
-          user_id: user_id,
-          device_id: device_id,
-          txn_id: txn_id,
-          event_id: event_id,
-          inserted_at: DateTime.utc_now(:microsecond)
-        }
-      ],
-      on_conflict: :nothing
-    )
   end
 end

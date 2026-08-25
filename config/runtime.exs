@@ -21,6 +21,13 @@ if config_env() == :prod do
     database: System.get_env("DB_NAME", "axon_prod"),
     pool_size: String.to_integer(System.get_env("POOL_SIZE", "20"))
 
+  config :axon_core, AxonCore.AdvisoryLockRepo,
+    username: System.get_env("DB_USER", "axon"),
+    password: db_pass,
+    hostname: System.get_env("DB_HOST", "localhost"),
+    database: System.get_env("DB_NAME", "axon_prod"),
+    pool_size: 2
+
   config :axon_web, AxonWeb.Endpoint,
     server: true,
     secret_key_base: secret_key_base
@@ -62,6 +69,15 @@ if config_env() == :prod do
   # endpoint is unaffected either way.
   config :axon_web, :registration,
     enabled: System.get_env("REGISTRATION_ENABLED", "false") == "true"
+
+  # Off unless explicitly turned on — a real deployment must keep blocking
+  # SSRF-risky private/loopback/link-local targets. complement/start.sh sets
+  # URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES=true because Complement's own
+  # `TestUrlPreview` webserver is only reachable via the Docker host gateway
+  # address, which is itself private — see AxonMedia.UrlPreview.
+  config :axon_media,
+    url_preview_allow_private_addresses:
+      System.get_env("URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES", "false") == "true"
 
   # Optional — leave AXON_APPSERVICE_DIR unset outside Complement.
   # complement/start.sh sets this to /complement/appservice, the fixed

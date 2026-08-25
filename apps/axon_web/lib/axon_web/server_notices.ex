@@ -13,13 +13,14 @@ defmodule AxonWeb.ServerNotices do
 
   import Ecto.Query, only: [from: 2]
 
-  alias AxonCore.{EventStore, Repo, UserStore}
+  alias AxonCore.{AdvisoryLockRepo, EventStore, Repo, UserStore}
   alias AxonRoom.{CreateRoom, RoomProcess}
 
   # Matches Complement's hardcoded expectation (TestServerNotices'
   # syncUntilInvite checks for sender == "@_server:hs1" specifically) —
   # also Synapse's own convention for `server_notices_mxid`.
   @system_localpart "_server"
+  @provision_lock_timeout_ms 1_000
 
   def system_user_id do
     server_name = Application.fetch_env!(:axon_web, :server_name)
@@ -27,11 +28,13 @@ defmodule AxonWeb.ServerNotices do
   end
 
   @doc "Sends `content` (a full m.room.message-shaped map) to `user_id`'s server notices room, creating it if needed. Returns {:ok, event_id} or {:error, reason}."
-  def send_notice(user_id, content) do
+  def send_notice(user_id, content, transaction \\ nil) do
     with :ok <- ensure_local_user(user_id),
          :ok <- ensure_system_user(),
          {:ok, room_id} <- ensure_room(user_id) do
-      RoomProcess.send_event(room_id, system_user_id(), "m.room.message", content, state_key: nil)
+      opts = [state_key: nil]
+      opts = if transaction, do: Keyword.put(opts, :transaction, transaction), else: opts
+      RoomProcess.send_event(room_id, system_user_id(), "m.room.message", content, opts)
     end
   end
 
@@ -63,8 +66,57 @@ defmodule AxonWeb.ServerNotices do
     case Repo.one(
            from(r in "server_notice_rooms", where: r.user_id == ^user_id, select: r.room_id)
          ) do
-      nil -> create_room(user_id)
+      nil -> provision_room(user_id)
       room_id -> {:ok, reinvite_if_needed(room_id, user_id)}
+    end
+  end
+
+  # This pooled, transaction-scoped lock serializes the first-use check across
+  # BEAM nodes. It covers provisioning and the mapping recheck; room creation is
+  # still a multi-event operation, so a process crash midway can leave an
+  # unmapped partial room. The final notice and transaction mapping remain atomic
+  # inside RoomProcess once a room has been provisioned.
+  defp provision_room(user_id) do
+    result =
+      AdvisoryLockRepo.transaction(fn ->
+        with :ok <- acquire_provision_lock(user_id) do
+          case Repo.one(
+                 from(r in "server_notice_rooms", where: r.user_id == ^user_id, select: r.room_id)
+               ) do
+            nil -> create_room(user_id)
+            room_id -> {:ok, room_id}
+          end
+        else
+          {:error, reason} -> AdvisoryLockRepo.rollback(reason)
+        end
+      end)
+
+    case result do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp acquire_provision_lock(user_id) do
+    <<key::signed-64, _::binary>> = :crypto.hash(:sha256, "server-notice-provision\0" <> user_id)
+
+    timeout =
+      Application.get_env(
+        :axon_web,
+        :server_notice_provision_lock_timeout_ms,
+        @provision_lock_timeout_ms
+      )
+
+    with {:ok, _} <-
+           AdvisoryLockRepo.query("SELECT set_config('lock_timeout', $1, true)", ["#{timeout}ms"]),
+         {:ok, _} <- AdvisoryLockRepo.query("SELECT pg_advisory_xact_lock($1)", [key]) do
+      :ok
+    else
+      {:error, %Postgrex.Error{postgres: %{code: :lock_not_available}}} ->
+        {:error, :server_notice_provision_timeout}
+
+      {:error, reason} ->
+        {:error, {:server_notice_provision_lock_failed, reason}}
     end
   end
 
@@ -76,7 +128,11 @@ defmodule AxonWeb.ServerNotices do
   defp reinvite_if_needed(room_id, user_id) do
     with {:ok, membership} <- EventStore.get_membership(room_id, user_id),
          true <- membership not in ["join", "invite"] do
-      RoomProcess.send_event(room_id, system_user_id(), "m.room.member", %{"membership" => "invite"},
+      RoomProcess.send_event(
+        room_id,
+        system_user_id(),
+        "m.room.member",
+        %{"membership" => "invite"},
         state_key: user_id
       )
     end

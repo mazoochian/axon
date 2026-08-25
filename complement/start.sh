@@ -51,6 +51,11 @@ export RELAXED_RATE_LIMITS=true
 # the whole suite fails at user creation.
 export REGISTRATION_ENABLED=true
 
+# Complement's TestUrlPreview webserver is only reachable via the Docker
+# host gateway (host.docker.internal), a private address axon's SSRF
+# defense otherwise always blocks — see config/runtime.exs.
+export URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES=true
+
 # Fixed path Complement copies one Synapse-style registration YAML into
 # per application service configured on this homeserver in the blueprint
 # (present even if the blueprint defines none — the directory just won't
