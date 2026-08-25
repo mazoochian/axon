@@ -25,6 +25,10 @@ erl_crash.dump
 # Local secrets (see .env.example)
 .env
 
+# Local Claude Code working context (commit policy, style notes) — not
+# project history, never committed. See CLAUDE.md itself.
+/CLAUDE.md
+
 # e2e-client (Playwright + Element Web harness)
 e2e-client/node_modules/
 e2e-client/test-results/
