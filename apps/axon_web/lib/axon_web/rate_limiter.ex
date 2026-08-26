@@ -19,9 +19,10 @@ defmodule AxonWeb.RateLimiter do
 
   @doc """
   Checks whether `bucket_key` has made fewer than `max_requests` calls in
-  the last `window_ms`, and records this call regardless of the outcome
-  (a request that gets rejected still counts, so a client can't reset its
-  own window for free by spamming past the limit).
+  the last `window_ms`. An accepted call records a fresh timestamp; a
+  rejected one does not — re-checking against an already-full window must
+  not keep pushing that window's start forward, or a client that keeps
+  getting rejected would never age back out of it.
 
   Returns `:ok` or `{:error, retry_after_ms}`.
   """

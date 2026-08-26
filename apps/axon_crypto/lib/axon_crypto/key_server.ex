@@ -229,8 +229,23 @@ defmodule AxonCrypto.KeyServer do
     # 0700: closes the window between File.open! creating the temp file at
     # the default umask and the chmod below — a non-owner can't even open a
     # path inside a directory it has no access to, so there's nothing left
-    # to race regardless of the temp file's own momentary mode.
-    File.chmod!(dir, 0o700)
+    # to race regardless of the temp file's own momentary mode. Best-effort
+    # rather than File.chmod!/2: a root-owned bind mount this process
+    # doesn't own would otherwise turn "can't tighten a directory's
+    # permissions" into "refuses to boot", for a deployment shape that
+    # worked before this hardening existed. The file's own 0600 guarantee
+    # below doesn't depend on this succeeding.
+    case File.chmod(dir, 0o700) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "KeyServer: could not restrict #{dir} to 0700 (#{inspect(reason)}) — " <>
+            "the signing key file itself is still written 0600, but its directory " <>
+            "may be more permissive than intended"
+        )
+    end
 
     tmp_path =
       Path.join(dir, ".#{Path.basename(path)}.#{:erlang.unique_integer([:positive])}.tmp")
