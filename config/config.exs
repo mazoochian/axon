@@ -61,6 +61,14 @@ config :axon_core, AxonCore.Repo,
   database: System.get_env("DB_NAME", "axon_dev"),
   pool_size: 20
 
+config :axon_core, AxonCore.AdvisoryLockRepo,
+  adapter: Ecto.Adapters.Postgres,
+  username: System.get_env("DB_USER", "axon"),
+  password: System.get_env("DB_PASS", "axon"),
+  hostname: System.get_env("DB_HOST", "localhost"),
+  database: System.get_env("DB_NAME", "axon_dev"),
+  pool_size: 2
+
 config :axon_core, ecto_repos: [AxonCore.Repo]
 
 # Phoenix endpoint

@@ -104,6 +104,9 @@ defmodule AxonCore.EventStore do
     |> Ecto.Multi.run(:membership, fn repo, %{unreject: event} ->
       update_membership(repo, event)
     end)
+    |> Ecto.Multi.run(:room_upgrade_push_rules, fn repo, %{unreject: event} ->
+      maybe_copy_room_push_rules(repo, event)
+    end)
     |> Ecto.Multi.run(:auth_edges, fn repo, %{unreject: event} ->
       insert_auth_edges(repo, event)
     end)
@@ -360,6 +363,119 @@ defmodule AxonCore.EventStore do
       {:ok, nil}
     end
   end
+
+  # A room-upgrade link is only trustworthy once *both* sides of it agree —
+  # the successor's accepted `m.room.create` names the old room as
+  # predecessor, and the old room's accepted `m.room.tombstone` names the
+  # successor as replacement_room — checked against **current** state rather
+  # than the single triggering event, since either side can arrive first
+  # (a same-server upgrade sends the tombstone first; a v12/federated
+  # create-first flow, or a remote join that only imports the successor's
+  # state, learns the create first) and the other may not exist locally yet.
+  # Reconciliation is therefore invoked from both event types below, and is a
+  # no-op until the current state actually has both sides matching. Keeping
+  # this beside event persistence, in the same transaction as the state
+  # update, means locally-created upgrades and links learned via federation
+  # take the same path. The copy never replaces a rule already configured
+  # for the successor.
+  defp maybe_copy_room_push_rules(repo, %Event{
+         type: "m.room.create",
+         state_key: "",
+         room_id: new_room_id,
+         content: %{"predecessor" => %{"room_id" => old_room_id}}
+       })
+       when is_binary(old_room_id) and old_room_id != new_room_id do
+    reconcile_room_upgrade_push_rules(repo, old_room_id, new_room_id)
+  end
+
+  defp maybe_copy_room_push_rules(repo, %Event{
+         type: "m.room.tombstone",
+         state_key: "",
+         room_id: old_room_id,
+         content: %{"replacement_room" => new_room_id}
+       })
+       when is_binary(new_room_id) and new_room_id != old_room_id do
+    reconcile_room_upgrade_push_rules(repo, old_room_id, new_room_id)
+  end
+
+  defp maybe_copy_room_push_rules(_repo, _event), do: {:ok, :ok}
+
+  defp reconcile_room_upgrade_push_rules(repo, old_room_id, new_room_id) do
+    with true <- valid_room_id?(old_room_id) and valid_room_id?(new_room_id),
+         %Event{} = create <- current_state_event(repo, new_room_id, "m.room.create", ""),
+         ^old_room_id <- get_in(create.content, ["predecessor", "room_id"]),
+         %Event{} = tombstone <- current_state_event(repo, old_room_id, "m.room.tombstone", ""),
+         ^new_room_id <- tombstone.content["replacement_room"],
+         true <- predecessor_event_id_matches?(create, tombstone) do
+      copy_room_push_rules(repo, old_room_id, new_room_id)
+    end
+
+    {:ok, :ok}
+  end
+
+  defp predecessor_event_id_matches?(create, tombstone) do
+    case get_in(create.content, ["predecessor", "event_id"]) do
+      nil -> true
+      event_id -> event_id == tombstone.event_id
+    end
+  end
+
+  # The current (accepted, non-rejected) state event for {room_id, type,
+  # state_key} — same notion `get_state_event/3` exposes, but taking the
+  # in-transaction `repo` explicitly like this module's other Multi steps
+  # rather than going through the public `Repo`-bound function.
+  defp current_state_event(repo, room_id, type, state_key) do
+    repo.one(
+      from(e in Event,
+        join: s in "current_room_state",
+        on:
+          s.event_id == e.event_id and s.room_id == ^room_id and s.type == ^type and
+            s.state_key == ^state_key,
+        where: not e.rejected,
+        select: e
+      )
+    )
+  end
+
+  defp copy_room_push_rules(repo, old_room_id, new_room_id) do
+    rows =
+      repo.all(
+        from(rule in "user_push_rules",
+          join: membership in "room_memberships",
+          on:
+            membership.user_id == rule.user_id and membership.room_id == ^old_room_id and
+              membership.membership == "join",
+          join: user in "users",
+          on: user.user_id == rule.user_id,
+          where: rule.kind == "room" and rule.rule_id == ^old_room_id,
+          select: %{
+            user_id: rule.user_id,
+            kind: "room",
+            rule_id: ^new_room_id,
+            is_default: rule.is_default,
+            pattern: rule.pattern,
+            conditions: rule.conditions,
+            actions: rule.actions,
+            enabled: rule.enabled,
+            inserted_at: rule.inserted_at
+          }
+        )
+      )
+
+    repo.insert_all("user_push_rules", rows,
+      on_conflict: :nothing,
+      conflict_target: [:user_id, :kind, :rule_id]
+    )
+  end
+
+  defp valid_room_id?("!" <> rest) do
+    case String.split(rest, ":", parts: 2) do
+      [localpart, server] -> localpart != "" and server != ""
+      _ -> false
+    end
+  end
+
+  defp valid_room_id?(_), do: false
 
   # A user newly joining a room now shares it with every other current
   # member — per spec, /sync device_lists.changed and /keys/changes must
@@ -1412,6 +1528,30 @@ defmodule AxonCore.EventStore do
     Repo.all(q)
   end
 
+  @doc """
+  Returns the latest applicable leave/ban stream ordering for each room the
+  user has left in this sync window.
+
+  The materialized current membership row is authoritative, and its persisted
+  `event_id` supplies the matching stream-ordering cutoff.
+  """
+  def get_left_room_cutoffs_since(user_id, since_ordering, opts \\ []) do
+    exclude_forgotten = Keyword.get(opts, :exclude_forgotten, false)
+
+    query =
+      from(m in RoomMembership,
+        join: e in Event,
+        on: e.event_id == m.event_id,
+        where:
+          m.user_id == ^user_id and m.membership in ["leave", "ban"] and
+            e.stream_ordering > ^since_ordering and not e.rejected and not e.soft_failed,
+        select: {m.room_id, e.stream_ordering}
+      )
+
+    query = if exclude_forgotten, do: from([m, e] in query, where: not m.forgotten), else: query
+    Repo.all(query) |> Map.new()
+  end
+
   def get_room_members(room_id, memberships \\ ["join"]) do
     Repo.all(
       from(m in RoomMembership,
@@ -1504,29 +1644,135 @@ defmodule AxonCore.EventStore do
   Groups results by room_id.
   """
   def get_user_events_since(user_id, since_ordering) do
-    joined_rooms = get_joined_rooms(user_id)
-    left_rooms = get_left_rooms_since(user_id, since_ordering)
-    all_rooms = Enum.uniq(joined_rooms ++ left_rooms)
+    get_sync_snapshot(user_id, since_ordering,
+      include_left: false,
+      include_new_left: true,
+      exclude_forgotten: false
+    ).events_by_room
+  end
 
-    if all_rooms == [] do
-      %{}
-    else
-      events =
+  @doc """
+  Reads the room membership view and its bounded sync events from one
+  repeatable-read database snapshot.
+
+  `include_left` controls historical leave rooms, `include_new_left` controls
+  leaves newer than the supplied token, and `exclude_forgotten` controls whether
+  forgotten leave rooms are omitted.
+
+  This public snapshot API owns its transaction and must not be called from an
+  existing application transaction.
+  """
+  def get_sync_snapshot(user_id, since_ordering, opts \\ []) do
+    include_left = Keyword.get(opts, :include_left, true)
+    include_new_left = Keyword.get(opts, :include_new_left, true)
+    exclude_forgotten = Keyword.get(opts, :exclude_forgotten, true)
+    after_memberships = Keyword.get(opts, :after_memberships, fn _left_cutoffs -> :ok end)
+
+    snapshot_transaction(fn ->
+      memberships =
         Repo.all(
-          from(e in Event,
+          from(m in RoomMembership,
+            join: e in Event,
+            on: e.event_id == m.event_id,
             where:
-              e.room_id in ^all_rooms and
-                e.stream_ordering > ^since_ordering and
-                not e.rejected and
-                not e.soft_failed,
-            order_by: [asc: e.stream_ordering]
+              m.user_id == ^user_id and not e.rejected and not e.soft_failed and
+                m.membership in ["join", "leave", "ban"],
+            select: %{
+              room_id: m.room_id,
+              membership: m.membership,
+              forgotten: m.forgotten,
+              stream_ordering: e.stream_ordering
+            }
           )
         )
 
-      banned_senders = shadow_banned_senders(events)
-      events = Enum.reject(events, &hidden_from_viewer?(&1, user_id, banned_senders))
+      joined_rooms =
+        for %{membership: "join", forgotten: false, room_id: room_id} <- memberships,
+            do: room_id
 
-      Enum.group_by(events, & &1.room_id)
+      left_cutoffs =
+        memberships
+        |> Enum.filter(fn membership ->
+          membership.membership in ["leave", "ban"] and
+            (not exclude_forgotten or not membership.forgotten) and
+            (include_left or
+               (include_new_left and membership.stream_ordering > since_ordering))
+        end)
+        |> Map.new(&{&1.room_id, &1.stream_ordering})
+
+      after_memberships.(left_cutoffs)
+
+      events = get_bounded_sync_events(joined_rooms, left_cutoffs, since_ordering)
+      banned_senders = shadow_banned_senders(events)
+
+      events_by_room =
+        events
+        |> Enum.reject(&hidden_from_viewer?(&1, user_id, banned_senders))
+        |> Enum.group_by(& &1.room_id)
+
+      %{
+        joined_rooms: joined_rooms,
+        left_cutoffs: left_cutoffs,
+        events_by_room: events_by_room
+      }
+    end)
+  end
+
+  defp get_bounded_sync_events(joined_rooms, left_cutoffs, since_ordering) do
+    if joined_rooms == [] and map_size(left_cutoffs) == 0 do
+      []
+    else
+      Repo.all(bounded_sync_events_query(joined_rooms, left_cutoffs, since_ordering))
+    end
+  end
+
+  @doc false
+  def bounded_sync_events_query(joined_rooms, left_cutoffs, since_ordering) do
+    {left_room_ids, left_room_cutoffs} = left_cutoffs |> Enum.sort() |> Enum.unzip()
+    max_ordering = 9_223_372_036_854_775_807
+    room_ids = joined_rooms ++ left_room_ids
+    cutoffs = List.duplicate(max_ordering, length(joined_rooms)) ++ left_room_cutoffs
+
+    from(e in Event,
+      join:
+        bound in fragment(
+          "SELECT * FROM unnest(?::text[], ?::bigint[]) AS sync_bound(room_id, cutoff)",
+          ^room_ids,
+          ^cutoffs
+        ),
+      on:
+        e.room_id == field(bound, :room_id) and
+          e.stream_ordering <= field(bound, :cutoff),
+      where: e.stream_ordering > ^since_ordering and not e.rejected and not e.soft_failed,
+      order_by: [asc: e.stream_ordering]
+    )
+  end
+
+  @doc false
+  def snapshot_transaction(fun, opts \\ []) when is_function(fun, 0) do
+    repo = Keyword.get(opts, :repo, Repo)
+
+    if repo.in_transaction?() do
+      raise ArgumentError,
+            "get_sync_snapshot must not be called inside an existing application transaction"
+    end
+
+    set_isolation? =
+      repo != Repo or Application.get_env(:axon_core, :snapshot_set_transaction_isolation, true)
+
+    case repo.transaction(fn ->
+           if set_isolation? do
+             Ecto.Adapters.SQL.query!(
+               repo,
+               "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+               []
+             )
+           end
+
+           fun.()
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> raise "snapshot transaction rolled back: #{inspect(reason)}"
     end
   end
 

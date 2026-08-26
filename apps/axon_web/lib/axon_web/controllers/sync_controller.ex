@@ -32,6 +32,7 @@ defmodule AxonWeb.SyncController do
   alias AxonSync.Presence
   alias AxonWeb.EventController
   alias AxonWeb.SyncHelpers
+  alias AxonWeb.TransactionIdProjection
 
   @default_timeline_limit 100
 
@@ -59,16 +60,20 @@ defmodule AxonWeb.SyncController do
 
     filter = load_filter(user_id, params["filter"])
 
-    {events_by_room, next_ordering} =
-      if timeout > 0 do
-        {:ok, by_room} = SyncManager.wait_for_events(user_id, since_ordering, timeout)
-        max_ord = get_max_ordering(by_room, since_ordering)
-        {by_room, max_ord}
-      else
-        by_room = EventStore.get_user_events_since(user_id, since_ordering)
-        max_ord = get_max_ordering(by_room, since_ordering)
-        {by_room, max_ord}
-      end
+    if timeout > 0 do
+      {:ok, _events} = SyncManager.wait_for_events(user_id, since_ordering, timeout)
+    end
+
+    include_leave = get_in(filter, ["room", "include_leave"]) == true
+
+    snapshot =
+      EventStore.get_sync_snapshot(user_id, since_ordering,
+        include_left: is_initial_sync and include_leave,
+        include_new_left: not is_initial_sync
+      )
+
+    events_by_room = snapshot.events_by_room
+    next_ordering = get_max_ordering(events_by_room, since_ordering)
 
     # For initial sync with no events yet, anchor at current DB max
     next_ordering =
@@ -89,14 +94,17 @@ defmodule AxonWeb.SyncController do
       SyncHelpers.build_token(next_ordering, dl_next, ad_next, pr_next, left_next, eph_next)
 
     rooms_response =
-      build_rooms_response(
-        user_id,
+      user_id
+      |> build_rooms_response(
         events_by_room,
+        snapshot.joined_rooms,
+        snapshot.left_cutoffs,
         is_initial_sync,
         since_ordering,
         eph_since,
         filter
       )
+      |> TransactionIdProjection.project_sync_rooms(user_id, device_id)
 
     global_account_data = SyncHelpers.get_global_account_data(user_id, is_initial_sync, ad_since)
     presence_events = SyncHelpers.get_presence_events(user_id, is_initial_sync, pr_since)
@@ -190,12 +198,13 @@ defmodule AxonWeb.SyncController do
   defp build_rooms_response(
          user_id,
          events_by_room,
+         joined_rooms,
+         left_cutoffs,
          is_initial_sync,
          since_ordering,
          eph_since,
          filter
        ) do
-    joined_rooms = EventStore.get_joined_rooms(user_id)
     invited_rooms = EventStore.get_invited_rooms(user_id)
     tl_limit = filter_timeline_limit(filter)
     tl_filter = filter_timeline(filter)
@@ -251,20 +260,72 @@ defmodule AxonWeb.SyncController do
         {room_id, %{"invite_state" => %{"events" => invite_state}}}
       end)
 
-    left_rooms =
-      EventStore.get_left_rooms_since(user_id, since_ordering, exclude_forgotten: is_initial_sync)
+    left_rooms = Map.keys(left_cutoffs)
 
     leave_response =
       Enum.into(left_rooms, %{}, fn room_id ->
-        leave_events = Map.get(events_by_room, room_id, [])
+        leave_cutoff = Map.fetch!(left_cutoffs, room_id)
+
+        leave_events =
+          events_by_room
+          |> Map.get(room_id, [])
+          |> Enum.filter(&(&1.stream_ordering <= leave_cutoff))
+
+        filtered_leave_events =
+          Enum.filter(leave_events, fn event ->
+            event
+            |> EventStore.event_to_map()
+            |> then(&apply_event_filter([&1], tl_filter))
+            |> Enum.any?()
+          end)
+
+        {limited, timeline_events} =
+          if length(filtered_leave_events) > tl_limit do
+            {true, Enum.take(filtered_leave_events, -tl_limit)}
+          else
+            {false, filtered_leave_events}
+          end
+
+        filtered_timeline = Enum.map(timeline_events, &EventStore.event_to_map/1)
+
+        state_cutoff =
+          case timeline_events do
+            [first | _] when limited -> first.stream_ordering
+            [] when limited -> :all
+            _ -> :none
+          end
+
+        state_events =
+          leave_events
+          |> Enum.filter(fn event ->
+            event.state_key != nil and
+              (state_cutoff == :all or
+                 (is_integer(state_cutoff) and event.stream_ordering < state_cutoff))
+          end)
+          |> Enum.reduce(%{}, fn event, state ->
+            Map.put(state, {event.type, event.state_key}, event)
+          end)
+          |> Map.values()
+          |> Enum.sort_by(& &1.stream_ordering)
+          |> Enum.map(&EventStore.event_to_map/1)
+          |> apply_event_filter(state_filter)
+
+        prev_batch =
+          case timeline_events do
+            [first | _] when limited -> Integer.to_string(first.stream_ordering)
+            [] when limited -> Integer.to_string(leave_cutoff + 1)
+            [] -> Integer.to_string(leave_cutoff)
+            events -> Integer.to_string(List.last(events).stream_ordering)
+          end
 
         {room_id,
          %{
            "timeline" => %{
-             "events" => Enum.map(leave_events, &EventStore.event_to_map/1),
-             "limited" => false
+             "events" => filtered_timeline,
+             "limited" => limited,
+             "prev_batch" => prev_batch
            },
-           "state" => %{"events" => []}
+           "state" => %{"events" => state_events}
          }}
       end)
 
@@ -344,6 +405,7 @@ defmodule AxonWeb.SyncController do
       EventStore.bundle_relations(room_id, timeline_with_membership, user_id: user_id)
 
     unread = SyncHelpers.unread_counts(room_id, user_id)
+    counts = EventStore.member_counts(room_id)
 
     %{
       "timeline" => %{
@@ -354,7 +416,10 @@ defmodule AxonWeb.SyncController do
       "state" => %{"events" => filtered_state},
       "account_data" => %{"events" => room_account_data},
       "ephemeral" => %{"events" => ephemeral},
-      "summary" => %{},
+      "summary" => %{
+        "m.joined_member_count" => counts.joined,
+        "m.invited_member_count" => counts.invited
+      },
       "unread_notifications" => %{
         "notification_count" => unread.notification_count,
         "highlight_count" => unread.highlight_count

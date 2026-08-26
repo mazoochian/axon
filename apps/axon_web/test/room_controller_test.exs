@@ -52,6 +52,34 @@ defmodule AxonWeb.RoomControllerTest do
     assert conn.status == 200
   end
 
+  describe "invite" do
+    test "inviting yourself returns 403 M_FORBIDDEN" do
+      alice = register("alice_invite_self_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "private_chat"})
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", %{"user_id" => alice.user_id})
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+
+    test "inviting an already-joined target returns 403 M_FORBIDDEN" do
+      alice = register("alice_invite_joined_#{System.unique_integer([:positive])}")
+      bob = register("bob_invite_joined_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+      join(bob.token, room_id)
+
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", %{"user_id" => bob.user_id})
+
+      assert conn.status == 403
+      assert decode(conn)["errcode"] == "M_FORBIDDEN"
+    end
+  end
+
   describe "kick" do
     test "a joined member with kick power can kick another joined member" do
       alice = register("alice_#{System.unique_integer([:positive])}")

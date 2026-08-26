@@ -176,7 +176,8 @@ defmodule AxonWeb.MediaController do
     end
   end
 
-  # GET /_matrix/client/v1/media/preview_url (also /v3, kept for older clients)
+  # GET /_matrix/client/v1/media/preview_url (also /_matrix/client/v3 and the
+  # legacy /_matrix/media/{v3,r0} namespace, kept for older clients)
   def url_preview(conn, %{"url" => url}) do
     server_name = Application.fetch_env!(:axon_web, :server_name)
 

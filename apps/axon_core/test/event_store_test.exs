@@ -7,7 +7,8 @@ defmodule AxonCore.EventStoreTest do
 
   use AxonCore.DataCase, async: false
 
-  alias AxonCore.EventStore
+  alias AxonCore.{AdvisoryLockRepo, EventStore}
+  alias Ecto.Adapters.SQL
 
   @room "!room:localhost"
   @creator "@creator:localhost"
@@ -143,6 +144,606 @@ defmodule AxonCore.EventStoreTest do
       {:ok, _} = EventStore.insert_event(ev, "10")
       state = EventStore.get_current_state_map(@room)
       refute Map.has_key?(state, {"m.room.message", nil})
+    end
+
+    test "accepted successor create observation copies room rules idempotently without overwriting" do
+      successor = "!successor:remote.example"
+      insert_user("@other:localhost")
+
+      for user_id <- [@creator, "@other:localhost"] do
+        {:ok, _} =
+          EventStore.insert_event(
+            event(%{
+              "event_id" => "$join-#{user_id}",
+              "type" => "m.room.member",
+              "state_key" => user_id,
+              "sender" => user_id,
+              "content" => %{"membership" => "join"}
+            }),
+            "10"
+          )
+      end
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: false,
+          inserted_at: now
+        },
+        %{
+          user_id: "@other:localhost",
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["notify"],
+          enabled: true,
+          inserted_at: now
+        },
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: successor,
+          is_default: false,
+          actions: ["notify"],
+          enabled: true,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+
+      tombstone =
+        event(%{
+          "event_id" => "$observed-tombstone",
+          "type" => "m.room.tombstone",
+          "state_key" => "",
+          "content" => %{"body" => "upgraded", "replacement_room" => successor}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(tombstone, "10")
+
+      create =
+        event(%{
+          "event_id" => "$observed-successor-create",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{"creator" => @creator, "predecessor" => %{"room_id" => @room}}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(create, "10")
+      assert {:ok, _} = EventStore.insert_event(create, "10")
+
+      copied =
+        Repo.all(
+          from(r in "user_push_rules",
+            where: r.rule_id == ^successor,
+            order_by: r.user_id,
+            select: {r.user_id, r.enabled, r.actions}
+          )
+        )
+
+      assert copied == [
+               {@creator, true, ["notify"]},
+               {"@other:localhost", true, ["notify"]}
+             ]
+
+      [source_other, copied_other] =
+        Repo.all(
+          from(r in "user_push_rules",
+            where: r.user_id == "@other:localhost" and r.rule_id in [^@room, ^successor],
+            order_by: r.rule_id,
+            select:
+              {r.rule_id, r.is_default, r.pattern, r.conditions, r.actions, r.enabled,
+               r.inserted_at}
+          )
+        )
+
+      assert elem(source_other, 0) == @room
+      assert elem(copied_other, 0) == successor
+      assert Tuple.delete_at(source_other, 0) == Tuple.delete_at(copied_other, 0)
+    end
+
+    test "malformed, unknown, and rejected predecessor links never copy room rules" do
+      now = DateTime.utc_now(:microsecond)
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "event_id" => "$creator-join-for-malformed",
+            "type" => "m.room.member",
+            "state_key" => @creator,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: true,
+          inserted_at: now
+        }
+      ])
+
+      for {successor, predecessor, rejected?} <- [
+            {"!malformed:localhost", "not-a-room-id", false},
+            {"!unknown:localhost", "!unknown-old:remote.example", false},
+            {"!rejected:localhost", @room, true}
+          ] do
+        {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+
+        create =
+          event(%{
+            "event_id" => "$create-#{successor}",
+            "room_id" => successor,
+            "type" => "m.room.create",
+            "state_key" => "",
+            "content" => %{"creator" => @creator, "predecessor" => %{"room_id" => predecessor}}
+          })
+
+        result =
+          if rejected?,
+            do: EventStore.insert_rejected_event(create, "10"),
+            else: EventStore.insert_event(create, "10")
+
+        assert {:ok, _} = result
+      end
+
+      assert Repo.aggregate(
+               from(r in "user_push_rules", where: r.rule_id != ^@room),
+               :count
+             ) == 0
+    end
+
+    test "an accepted successor create naming a known old room with no matching old tombstone copies nothing" do
+      successor = "!no-tombstone-successor:remote.example"
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "event_id" => "$creator-join-no-tombstone",
+            "type" => "m.room.member",
+            "state_key" => @creator,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: false,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+
+      create =
+        event(%{
+          "event_id" => "$create-no-tombstone",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{"creator" => @creator, "predecessor" => %{"room_id" => @room}}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(create, "10")
+
+      assert Repo.aggregate(from(r in "user_push_rules", where: r.rule_id == ^successor), :count) ==
+               0
+    end
+
+    test "a tombstone whose replacement_room does not match the successor's predecessor copies nothing" do
+      successor = "!mismatched-successor:remote.example"
+      decoy = "!decoy-replacement:remote.example"
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "event_id" => "$creator-join-mismatched",
+            "type" => "m.room.member",
+            "state_key" => @creator,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: false,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+      {:ok, _} = EventStore.insert_room(decoy, @creator, "10", false)
+
+      tombstone =
+        event(%{
+          "event_id" => "$tombstone-mismatched",
+          "type" => "m.room.tombstone",
+          "state_key" => "",
+          "content" => %{"body" => "upgraded", "replacement_room" => decoy}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(tombstone, "10")
+
+      create =
+        event(%{
+          "event_id" => "$create-mismatched",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{"creator" => @creator, "predecessor" => %{"room_id" => @room}}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(create, "10")
+
+      assert Repo.aggregate(from(r in "user_push_rules", where: r.rule_id == ^successor), :count) ==
+               0
+    end
+
+    test "legacy tombstone-first then a matching successor create copies once the create arrives" do
+      successor = "!tombstone-first-successor:remote.example"
+      insert_user("@other:localhost")
+
+      for user_id <- [@creator, "@other:localhost"] do
+        {:ok, _} =
+          EventStore.insert_event(
+            event(%{
+              "event_id" => "$join-tf-#{user_id}",
+              "type" => "m.room.member",
+              "state_key" => user_id,
+              "sender" => user_id,
+              "content" => %{"membership" => "join"}
+            }),
+            "10"
+          )
+      end
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: false,
+          inserted_at: now
+        },
+        %{
+          user_id: "@other:localhost",
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["notify"],
+          enabled: true,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+
+      tombstone =
+        event(%{
+          "event_id" => "$tombstone-tf",
+          "type" => "m.room.tombstone",
+          "state_key" => "",
+          "content" => %{"body" => "upgraded", "replacement_room" => successor}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(tombstone, "10")
+
+      # Tombstone landed first; the successor's create doesn't exist yet, so
+      # there's nothing on the other side of the link to copy against.
+      assert Repo.aggregate(from(r in "user_push_rules", where: r.rule_id == ^successor), :count) ==
+               0
+
+      create =
+        event(%{
+          "event_id" => "$create-tf",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{"creator" => @creator, "predecessor" => %{"room_id" => @room}}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(create, "10")
+
+      copied =
+        Repo.all(from(r in "user_push_rules", where: r.rule_id == ^successor, select: r.user_id))
+        |> Enum.sort()
+
+      assert copied == Enum.sort([@creator, "@other:localhost"])
+    end
+
+    test "v12/federated create-first copies nothing until the matching accepted old-room tombstone arrives" do
+      fed_old = "!fed-old:remote.example"
+      successor = "!fed-successor:localhost"
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "12", false)
+
+      create =
+        event(%{
+          "event_id" => "$create-fed",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{
+            "creator" => @creator,
+            "room_version" => "12",
+            "predecessor" => %{"room_id" => fed_old}
+          }
+        })
+
+      assert {:ok, _} = EventStore.insert_event(create, "12")
+
+      # The old room is entirely unknown locally at this point (true
+      # federated create-first) — nothing to copy against yet.
+      assert Repo.aggregate(from(r in "user_push_rules", where: r.rule_id == ^successor), :count) ==
+               0
+
+      {:ok, _} = EventStore.insert_room(fed_old, "@fed:remote.example", "11", false)
+      insert_user("@fed:remote.example")
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "event_id" => "$fed-join",
+            "room_id" => fed_old,
+            "sender" => "@fed:remote.example",
+            "type" => "m.room.member",
+            "state_key" => "@fed:remote.example",
+            "content" => %{"membership" => "join"}
+          }),
+          "11"
+        )
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: "@fed:remote.example",
+          kind: "room",
+          rule_id: fed_old,
+          is_default: false,
+          actions: ["notify"],
+          enabled: true,
+          inserted_at: now
+        }
+      ])
+
+      tombstone =
+        event(%{
+          "event_id" => "$tombstone-fed",
+          "room_id" => fed_old,
+          "sender" => "@fed:remote.example",
+          "type" => "m.room.tombstone",
+          "state_key" => "",
+          "content" => %{"body" => "upgraded", "replacement_room" => successor}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(tombstone, "11")
+
+      copied =
+        Repo.all(from(r in "user_push_rules", where: r.rule_id == ^successor, select: r.user_id))
+
+      assert copied == ["@fed:remote.example"]
+    end
+
+    test "a predecessor event_id must match the accepted tombstone's event_id to copy" do
+      successor = "!predecessor-eventid-successor:remote.example"
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "event_id" => "$creator-join-eventid",
+            "type" => "m.room.member",
+            "state_key" => @creator,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: false,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+
+      tombstone =
+        event(%{
+          "event_id" => "$tombstone-eventid",
+          "type" => "m.room.tombstone",
+          "state_key" => "",
+          "content" => %{"body" => "upgraded", "replacement_room" => successor}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(tombstone, "10")
+
+      wrong_create =
+        event(%{
+          "event_id" => "$create-wrong-eventid",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{
+            "creator" => @creator,
+            "predecessor" => %{"room_id" => @room, "event_id" => "$not-the-tombstone"}
+          }
+        })
+
+      assert {:ok, _} = EventStore.insert_event(wrong_create, "10")
+
+      assert Repo.aggregate(from(r in "user_push_rules", where: r.rule_id == ^successor), :count) ==
+               0
+
+      right_create =
+        event(%{
+          "event_id" => "$create-right-eventid",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{
+            "creator" => @creator,
+            "predecessor" => %{"room_id" => @room, "event_id" => "$tombstone-eventid"}
+          }
+        })
+
+      assert {:ok, _} = EventStore.insert_event(right_create, "10")
+
+      copied =
+        Repo.all(from(r in "user_push_rules", where: r.rule_id == ^successor, select: r.user_id))
+
+      assert copied == [@creator]
+    end
+
+    test "a rejected successor create naming a matching old-room tombstone copies nothing" do
+      successor = "!rejected-create-successor:remote.example"
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "event_id" => "$creator-join-rejected-create",
+            "type" => "m.room.member",
+            "state_key" => @creator,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: false,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+
+      tombstone =
+        event(%{
+          "event_id" => "$tombstone-rejected-create",
+          "type" => "m.room.tombstone",
+          "state_key" => "",
+          "content" => %{"body" => "upgraded", "replacement_room" => successor}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(tombstone, "10")
+
+      create =
+        event(%{
+          "event_id" => "$create-rejected",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{"creator" => @creator, "predecessor" => %{"room_id" => @room}}
+        })
+
+      assert {:ok, _} = EventStore.insert_rejected_event(create, "10")
+
+      assert Repo.aggregate(from(r in "user_push_rules", where: r.rule_id == ^successor), :count) ==
+               0
+    end
+
+    test "a soft-failed old-room tombstone naming a matching successor create copies nothing" do
+      successor = "!soft-failed-tombstone-successor:remote.example"
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "event_id" => "$creator-join-soft-failed-tombstone",
+            "type" => "m.room.member",
+            "state_key" => @creator,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: false,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "10", false)
+
+      create =
+        event(%{
+          "event_id" => "$create-soft-failed-tombstone",
+          "room_id" => successor,
+          "type" => "m.room.create",
+          "state_key" => "",
+          "content" => %{"creator" => @creator, "predecessor" => %{"room_id" => @room}}
+        })
+
+      assert {:ok, _} = EventStore.insert_event(create, "10")
+
+      tombstone =
+        event(%{
+          "event_id" => "$tombstone-soft-failed",
+          "room_id" => @room,
+          "type" => "m.room.tombstone",
+          "state_key" => "",
+          "content" => %{"body" => "upgraded", "replacement_room" => successor}
+        })
+
+      assert {:ok, _} = EventStore.insert_soft_failed_event(tombstone, "10")
+
+      assert Repo.aggregate(from(r in "user_push_rules", where: r.rule_id == ^successor), :count) ==
+               0
     end
   end
 
@@ -1322,6 +1923,135 @@ defmodule AxonCore.EventStoreTest do
 
       viewer_events = EventStore.get_user_events_since(@creator, base)
       assert Enum.any?(Map.get(viewer_events, @room, []), &(&1.event_id == join_ev.event_id))
+    end
+  end
+
+  describe "get_sync_snapshot/3" do
+    test "the production transaction is repeatable read on a non-sandbox connection" do
+      assert EventStore.snapshot_transaction(
+               fn ->
+                 assert {:ok, %{rows: [["repeatable read"]]}} =
+                          SQL.query(AdvisoryLockRepo, "SHOW transaction_isolation", [])
+
+                 :ok
+               end,
+               repo: AdvisoryLockRepo
+             ) == :ok
+    end
+
+    test "fails clearly rather than nesting the public snapshot API in an application transaction" do
+      assert_raise ArgumentError,
+                   ~r/must not be called inside an existing application transaction/,
+                   fn ->
+                     Repo.transaction(fn -> EventStore.get_sync_snapshot(@creator, 0) end)
+                   end
+    end
+
+    test "bounded event SQL has constant shape and three binds for thousands of room bounds" do
+      small = Map.new(1..2, &{"!left#{&1}:localhost", &1})
+      large = Map.new(1..1_000, &{"!left#{&1}:localhost", &1})
+
+      small_query = EventStore.bounded_sync_events_query(["!joined:localhost"], small, 7)
+      {small_sql, small_params} = SQL.to_sql(:all, Repo, small_query)
+
+      large_query = EventStore.bounded_sync_events_query(["!joined:localhost"], large, 7)
+      {large_sql, large_params} = SQL.to_sql(:all, Repo, large_query)
+
+      assert small_sql == large_sql
+      assert length(small_params) == 3
+      assert length(large_params) == 3
+      assert small_sql =~ "unnest"
+    end
+
+    test "legacy get_user_events_since includes a newly forgotten leave while sync snapshots exclude it" do
+      alice = "@snapshot_forgotten:localhost"
+      insert_user(alice)
+
+      {:ok, _join} =
+        EventStore.insert_event(
+          event(%{
+            "type" => "m.room.member",
+            "state_key" => alice,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      {:ok, leave} =
+        EventStore.insert_event(
+          event(%{
+            "type" => "m.room.member",
+            "state_key" => alice,
+            "content" => %{"membership" => "leave"}
+          }),
+          "10"
+        )
+
+      Repo.update_all(
+        from(m in "room_memberships", where: m.room_id == ^@room and m.user_id == ^alice),
+        set: [forgotten: true]
+      )
+
+      assert Enum.any?(EventStore.get_user_events_since(alice, 0)[@room], fn event ->
+               event.event_id == leave.event_id
+             end)
+
+      refute Map.has_key?(
+               EventStore.get_sync_snapshot(alice, 0,
+                 include_left: true,
+                 exclude_forgotten: true
+               ).events_by_room,
+               @room
+             )
+    end
+
+    test "uses the captured leave cutoff when an event appears between membership and event reads" do
+      alice = "@snapshot_leave:localhost"
+      insert_user(alice)
+
+      {:ok, _join} =
+        EventStore.insert_event(
+          event(%{
+            "type" => "m.room.member",
+            "state_key" => alice,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      {:ok, leave} =
+        EventStore.insert_event(
+          event(%{
+            "type" => "m.room.member",
+            "state_key" => alice,
+            "content" => %{"membership" => "leave"}
+          }),
+          "10"
+        )
+
+      test_pid = self()
+
+      snapshot =
+        EventStore.get_sync_snapshot(alice, 0,
+          after_memberships: fn cutoffs ->
+            send(test_pid, {:captured_cutoffs, cutoffs})
+
+            {:ok, late} =
+              EventStore.insert_event(
+                event(%{"content" => %{"msgtype" => "m.text", "body" => "too late"}}),
+                "10"
+              )
+
+            send(test_pid, {:late_event, late})
+          end
+        )
+
+      assert_receive {:captured_cutoffs, %{@room => cutoff}}
+      assert cutoff == leave.stream_ordering
+      assert_receive {:late_event, late}
+      assert snapshot.left_cutoffs == %{@room => leave.stream_ordering}
+      refute Enum.any?(snapshot.events_by_room[@room], &(&1.event_id == late.event_id))
+      assert Enum.all?(snapshot.events_by_room[@room], &(&1.stream_ordering <= cutoff))
     end
   end
 

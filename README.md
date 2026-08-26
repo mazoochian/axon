@@ -16,8 +16,9 @@ Named after the neurological structure, Axon is designed to fix the fundamental 
 - Presence is in-memory only (ETS) and does not persist across a restart — by design (presence is ephemeral), but worth knowing if you're expecting it to survive a deploy.
 - Third-party (3pid) invites now use real identity-server delegation (hash lookup, store-invite, join-side signature verification against the identity server's own key) when `DEFAULT_IDENTITY_SERVER` is configured or the client supplies its own `id_server` — see [Identity server (3pid invites)](#identity-server-3pid-invites). This is email-only per spec (store-invite has no msisdn equivalent); msisdn invites make a real best-effort `validate/msisdn/requestToken` call but always fall back to axon's own self-signed proof, since there's no OTP-delivery provider wired up. Axon's direct SMTP send (`AxonWeb.Mailer`, best-effort, fire-and-forget) still runs alongside the identity server's own delivery when `SMTP_HOST` is configured.
 - **`POST /register` is now gated behind `REGISTRATION_ENABLED` (off by default in production)** — see the [Environment variables](#environment-variables) table. This is a behavior change from earlier versions of axon, which left self-registration open (rate-limited only) on any deployment not using OIDC. If you're upgrading an existing public deployment, set `REGISTRATION_ENABLED=true` explicitly or self-registration will silently stop working.
+- **Room `GenServer`s never get evicted.** `AxonRoom.RoomProcess` starts on first access (`get_or_start/1`) and then runs forever — nothing ever stops it except a node restart or an explicit admin purge (`stop_if_running/1`). There's no idle timeout, so resident room-process count (and the room state each one holds in memory) only grows over a node's uptime. This isn't a durability risk — a room's state is always rebuilt from `room_state_snapshots` + event replay on next access — but it is unbounded memory growth for a long-running deployment with many dormant rooms. Fixing it means adding an idle timeout that stops a `RoomProcess` after N minutes of inactivity.
 
-See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 28 and counting — the roadmap as originally scoped is complete; ongoing phases are new features plus a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
+See [ROADMAP.md](ROADMAP.md) for the phase history (Phase 8 through 30 and counting — the roadmap as originally scoped is complete; ongoing phases are new features plus a compliance/hardening pass against the [Complement](#compliance-testing) acceptance suite).
 
 ## Why BEAM?
 
@@ -27,7 +28,7 @@ The BEAM runtime inverts all of these problems:
 
 - **Lightweight processes**: ~2 KB base overhead each vs. ~200 MB for a Python worker
 - **Per-process GC**: no global GC pauses that block all rooms simultaneously
-- **Built-in distribution**: Horde + libcluster give transparent multi-node clustering without Redis
+- **Built-in distribution**: Horde gives transparent multi-node process distribution without Redis. `libcluster` is wired in as the node-discovery layer for this, but no topology is configured yet (`config :libcluster, topologies: []` in dev/test, nothing set in prod) — so today's deployments are single-node by default; multi-node requires picking and configuring a `libcluster` strategy first.
 - **Natural mapping**: one `RoomProcess` GenServer per active room, one `Sender` GenServer per remote federation server
 
 ## Architecture
@@ -52,20 +53,28 @@ axon_crypto  (no deps on other apps)
       │
 axon_core    (crypto)
       │
-  ┌───┴──────────────────┐
-axon_room  axon_federation  axon_sync
-  └──────────────────────┴──────────┘
-                │
-          axon_web          (depends on all above)
+      ├── axon_push
+      │
+axon_room    (core, push)
+      │
+axon_federation  (core, room)
+      │
+axon_sync    (core)
+      │
+axon_media   (core)
+      │
+axon_web     (depends on all above)
 ```
+
+`axon_federation` depends directly on `axon_room` (its `RoomJoin`/`Backfill` modules call `AxonRoom.RoomProcess` directly) — it is not a peer of `axon_room` sitting independently on `axon_core`. `axon_room` in turn depends on `axon_push`. Only `axon_web`, at the top, can see everything.
 
 ### Key design decisions
 
 **Event store is append-only**: `events` rows are never updated or deleted. `current_room_state` is a materialized view. `room_state_snapshots` are taken every 100 events to bound replay time on process restart.
 
-**State resolution v2**: Implemented as a pure Elixir function in `AxonRoom.StateResV2`. Inputs are a list of state sets and a `get_event_fn`. The algorithm computes auth difference, sorts the full conflicted set by reverse topological power ordering (mainline-based), then runs the iterative auth check.
+**State resolution v2**: The algorithm itself is a pure Elixir function in `AxonRoom.StateResV2` — inputs are a list of state sets and a `get_event_fn`; it computes auth difference, sorts the full conflicted set by reverse topological power ordering (mainline-based), then runs the iterative auth check. A separate module, `AxonRoom.StateResolver`, decides *when* to invoke it: it detects when an inbound PDU's `prev_events` fork away from the room's current head and builds the per-branch state sets to resolve against. Linear "next event follows our head" traffic skips this entirely and checks against `current_state` directly.
 
-**Federation fan-out via PubSub**: `RoomProcess` (in `axon_room`) cannot depend on `AxonFederation.HttpClient` (in `axon_federation`) — they're at the same supervision level. Instead, `RoomProcess` broadcasts `{:federate_event, event_map, remote_servers}` on `Axon.PubSub`, and `AxonWeb.FederationFanout` (which can see both apps) handles the outbound HTTP.
+**Federation fan-out via PubSub**: `axon_room` cannot depend on `axon_federation` — it's the other way around (`axon_federation` depends on `axon_room`, see the dependency graph above), so `RoomProcess` importing `AxonFederation.HttpClient` directly would be a circular dependency and simply wouldn't compile. Instead, `RoomProcess` broadcasts `{:federate_event, event_map, remote_servers}` on `Axon.PubSub`, and `AxonWeb.FederationFanout` (which, sitting in `axon_web` at the top of the graph, can see both apps) handles the outbound HTTP. This decoupling is a plain, compiler-unchecked message shape rather than a typed call — real fragility to be aware of when changing either side; a past bug where `RoomProcess.apply_remote_event/2` didn't relay `send_join`/`send_leave`/`send_knock` onward (breaking membership convergence in 3+-server rooms) lived exactly at this seam.
 
 ## Database schema
 
@@ -326,9 +335,9 @@ COMPLEMENT_BASE_IMAGE=axon-complement:latest \
 
 ### Current results
 
-As of Phase 28 (see [ROADMAP.md](ROADMAP.md) for the full trail). **These are real numbers from an actual full-package Complement run this phase** — both `tests/csapi` and `tests/` were run to completion against a freshly rebuilt `axon-complement:latest`, not individually-run subsets or estimates. They replace every prior figure cited here and in ROADMAP.md, including the stale `63/64` (itself a scoped-subset number — `tests/csapi` has 106 real top-level tests, not 64) and the stale-since-Phase-22 `61/88`.
+As of Phase 29 for `tests/csapi` (see [ROADMAP.md](ROADMAP.md) for the full trail); `tests/` and `tests/msc*` are as of Phase 28, unchanged since — Phase 29 didn't touch federation code. The `tests/csapi` figure below is a targeted re-run of Phase 28's 16 named failures against a freshly rebuilt `axon-complement:latest`, not a fresh full-package sweep — the package total is carried forward from Phase 28's real full run rather than re-measured end to end.
 
-- **`tests/csapi` (core Client-Server API): 89/106 (84.0%)**. One test, `TestMessagesOverFederation`, hit the same near-hang on its `messagesRequestLimit`-below-backfill-count subtest that Phase 16 first documented (10+ minutes of 0-event `/messages` polling, most likely host memory pressure, not confirmed axon-side) — it's excluded from both the pass and fail counts above, not silently folded into either. The other 16 failures (`TestRelationsPagination`, `TestPushRuleRoomUpgrade`, `TestRoomsInvite`, `TestArchivedRoomsHistory`, `TestSyncTimelineGap`, `TestRoomSummary`, `TestThreadedReceipts`, `TestTxnInEvent`, `TestTxnScopeOnLocalEcho`, `TestTxnIdempotency`, `TestTxnIdWithRefreshToken`, `TestUploadKey`, `TestUrlPreview`, `TestRoomSpecificUsernameChange`, `TestRoomSpecificUsernameAtJoin`, `TestKeysQueryWithDeviceIDAsObjectFails`) are this run's actual current-state measurement, not yet individually root-caused — see the Phase 28 entry for a triage-ordering note on which of these look, by name, like they might cluster around shared causes.
+- **`tests/csapi` (core Client-Server API): 100/106 (94.3%)**. Phase 29 closed 11 of Phase 28's 16 untriaged failures, each confirmed individually live: `TestArchivedRoomsHistory`, `TestRoomSummary`, `TestTxnInEvent`, `TestTxnScopeOnLocalEcho`, `TestTxnIdempotency`, `TestTxnIdWithRefreshToken`, `TestUploadKey`, `TestKeysQueryWithDeviceIDAsObjectFails` (a scoped client-transaction idempotency rework, see the Phase 29 entry), plus `TestUrlPreview` (four independent bugs — a router gap, no SSRF test-harness escape hatch, an unresolved relative `og:image`, and a PNG dimension-parsing bug), `TestRoomSpecificUsernameChange`, `TestRoomSpecificUsernameAtJoin` (a real user-directory privacy leak: search matched every account on the server, not just users sharing a room with the requester). `TestMessagesOverFederation` remains excluded from both counts (Phase 16/28's still-unresolved near-hang, most likely host memory pressure, not confirmed axon-side). The remaining 5 (`TestRelationsPagination`, `TestPushRuleRoomUpgrade`, `TestRoomsInvite`, `TestSyncTimelineGap`, `TestThreadedReceipts`) are untouched since Phase 28 — `TestPushRuleRoomUpgrade` was spot-checked this phase as a non-regression check and confirmed still failing, unchanged.
 - **`tests/` (top-level federation/room package): 65/89 (73.0%)**. The dominant blocker remains the `send_join` signature-verification mismatch — confirmed **not** an axon bug across five independent from-scratch cryptographic verifications (Phases 19/21/22/25/26) — which alone gates the entire knocking feature family and most of the restricted-rooms cluster (14 tests, including `TestCorruptedAuthChain`, whose own auth-chain-corruption assertions never run because it fails earlier at `send_join`). A second dev-dependency cluster, inside Complement's own pinned `gomatrixserverlib` snapshot rather than axon's code, accounts for 3 more (`TestMSC4297StateResolutionV2_1_starts_from_empty_set`, `..._includes_conflicted_subgraph`, `TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent`). Five failures are newly discovered this run and not yet triaged: `TestInboundFederationKeys`, `TestUnbanViaInvite`, `TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6` (previously named — Phase 22's known backfill-fallback gap, confirmed here as not a regression), `TestFederationRoomsInvite`, `TestFederationKeyUploadQuery`. One more, `TestMSC4289PrivilegedRoomCreators`, is flagged separately as a possible regression rather than a fresh unknown — Phase 22 recorded it passing at the time. See the Phase 28 entry for the full grouped list.
 - `tests/msc*` (unstable MSCs): skipped this run, per longstanding practice — axon has never claimed to implement unstable MSCs, and each `msc*` subpackage spins its own Docker network/containers. Two specific names are still worth calling out directly, since Phase 26 traced them past a resemblance into a confirmed cause: `TestMSC4297StateResolutionV2_1_starts_from_empty_set` and `..._includes_conflicted_subgraph` (counted in the `tests/` federation package above, not this one — Complement files them under the top-level package despite the MSC name) both fail inside Complement's own pinned `gomatrixserverlib` snapshot before axon's state-res code ever runs.
 

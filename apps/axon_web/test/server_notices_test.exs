@@ -139,6 +139,100 @@ defmodule AxonWeb.ServerNoticesTest do
     assert decode(conn1)["event_id"] == decode(conn2)["event_id"]
   end
 
+  test "concurrent identical PUT notices create one final event and keep recipient scope" do
+    admin = register("notice_concurrent_admin_#{System.unique_integer([:positive])}")
+    make_admin(admin.user_id)
+    recipient = register("notice_concurrent_recipient")
+
+    authed(admin.token)
+    |> jp("/_synapse/admin/v1/send_server_notice", %{
+      "user_id" => recipient.user_id,
+      "content" => %{"msgtype" => "m.text", "body" => "provision"}
+    })
+
+    txn = "notice-concurrent-#{System.unique_integer([:positive])}"
+
+    body = %{
+      "user_id" => recipient.user_id,
+      "content" => %{"msgtype" => "m.text", "body" => "once"}
+    }
+
+    ids =
+      1..8
+      |> Task.async_stream(
+        fn _ ->
+          authed(admin.token)
+          |> jpu("/_synapse/admin/v1/send_server_notice/#{txn}", body)
+          |> decode()
+          |> Map.fetch!("event_id")
+        end,
+        max_concurrency: 8,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, id} -> id end)
+
+    assert length(Enum.uniq(ids)) == 1
+
+    assert Repo.aggregate(
+             from(t in "client_txns",
+               where:
+                 t.txn_id == ^txn and
+                   t.request_scope ==
+                     ^AxonCore.ClientTransactionStore.request_scope("server_notice", [
+                       recipient.user_id
+                     ])
+             ),
+             :count
+           ) == 1
+  end
+
+  test "concurrent first notices provision one room mapping and one final notice" do
+    admin = register("notice_first_admin_#{System.unique_integer([:positive])}")
+    make_admin(admin.user_id)
+    recipient = register("notice_first_recipient_#{System.unique_integer([:positive])}")
+    txn = "first-concurrent-#{System.unique_integer([:positive])}"
+
+    body = %{
+      "user_id" => recipient.user_id,
+      "content" => %{"msgtype" => "m.text", "body" => "once"}
+    }
+
+    ids =
+      1..6
+      |> Task.async_stream(
+        fn _ ->
+          authed(admin.token)
+          |> jpu("/_synapse/admin/v1/send_server_notice/#{txn}", body)
+          |> decode()
+          |> Map.fetch!("event_id")
+        end,
+        max_concurrency: 6,
+        ordered: false,
+        timeout: 20_000
+      )
+      |> Enum.map(fn {:ok, id} -> id end)
+
+    assert length(Enum.uniq(ids)) == 1
+
+    assert Repo.aggregate(
+             from(r in "server_notice_rooms", where: r.user_id == ^recipient.user_id),
+             :count
+           ) == 1
+
+    [room_id] =
+      Repo.all(
+        from(r in "server_notice_rooms",
+          where: r.user_id == ^recipient.user_id,
+          select: r.room_id
+        )
+      )
+
+    assert Repo.aggregate(
+             from(e in "events", where: e.room_id == ^room_id and e.type == "m.room.message"),
+             :count
+           ) == 1
+  end
+
   test "a non-admin cannot send a server notice" do
     alice = register("notice_nonadmin_#{System.unique_integer([:positive])}")
     bob = register("notice_nonadmin_target_#{System.unique_integer([:positive])}")
@@ -181,7 +275,11 @@ defmodule AxonWeb.ServerNoticesTest do
     authed(erin.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
     authed(erin.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/leave", %{})
 
-    body2 = %{"user_id" => erin.user_id, "content" => %{"msgtype" => "m.text", "body" => "second"}}
+    body2 = %{
+      "user_id" => erin.user_id,
+      "content" => %{"msgtype" => "m.text", "body" => "second"}
+    }
+
     conn = authed(admin.token) |> jp("/_synapse/admin/v1/send_server_notice", body2)
     assert conn.status == 200
 

@@ -69,6 +69,28 @@ defmodule AxonWeb.Phase5RelationsTest do
     decode(conn)
   end
 
+  defp relations_fixture() do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token)
+
+    root_id =
+      send_event(alice.token, room_id, "m.room.message", %{
+        "msgtype" => "m.text",
+        "body" => "root"
+      })
+
+    relation_ids =
+      for body <- ["first", "second", "third"] do
+        send_event(alice.token, room_id, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => body,
+          "m.relates_to" => %{"rel_type" => "m.thread", "event_id" => root_id}
+        })
+      end
+
+    %{alice: alice, room_id: room_id, root_id: root_id, relation_ids: relation_ids}
+  end
+
   describe "reactions (m.annotation aggregation)" do
     test "get_event bundles unsigned.m.relations.m.annotation with counts" do
       alice = register("alice_#{System.unique_integer([:positive])}")
@@ -119,6 +141,42 @@ defmodule AxonWeb.Phase5RelationsTest do
       body = decode(conn)
 
       assert Enum.any?(body["chunk"], &(&1["event_id"] == reaction_id))
+    end
+  end
+
+  describe "relations pagination" do
+    test "initial dir=f page returns the oldest relations in ascending order" do
+      %{alice: alice, room_id: room_id, root_id: root_id, relation_ids: relation_ids} =
+        relations_fixture()
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v1/rooms/#{room_id}/relations/#{root_id}?dir=f&limit=2")
+
+      assert conn.status == 200
+      body = decode(conn)
+
+      assert Enum.map(body["chunk"], & &1["event_id"]) == Enum.take(relation_ids, 2)
+      assert is_binary(body["next_batch"])
+    end
+
+    test "next_batch returns the second forward page" do
+      %{alice: alice, room_id: room_id, root_id: root_id, relation_ids: relation_ids} =
+        relations_fixture()
+
+      first =
+        authed(alice.token)
+        |> get("/_matrix/client/v1/rooms/#{room_id}/relations/#{root_id}?dir=f&limit=2")
+        |> decode()
+
+      second =
+        authed(alice.token)
+        |> get(
+          "/_matrix/client/v1/rooms/#{room_id}/relations/#{root_id}?dir=f&limit=2&from=#{first["next_batch"]}"
+        )
+        |> decode()
+
+      assert Enum.map(second["chunk"], & &1["event_id"]) == Enum.drop(relation_ids, 2)
     end
   end
 
