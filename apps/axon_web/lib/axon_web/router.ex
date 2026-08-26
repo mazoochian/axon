@@ -368,6 +368,21 @@ defmodule AxonWeb.Router do
     post("/v3/search", SearchController, :search)
     post("/r0/search", SearchController, :search)
 
+    # Third party networks — proxied to whichever Application Service
+    # declares the protocol (or owns the queried mxid/alias).
+    get("/v3/thirdparty/protocols", ThirdPartyController, :protocols)
+    get("/v3/thirdparty/protocol/:protocol", ThirdPartyController, :protocol)
+    get("/v3/thirdparty/user", ThirdPartyController, :user)
+    get("/v3/thirdparty/user/:protocol", ThirdPartyController, :user_by_protocol)
+    get("/v3/thirdparty/location", ThirdPartyController, :location)
+    get("/v3/thirdparty/location/:protocol", ThirdPartyController, :location_by_protocol)
+    get("/r0/thirdparty/protocols", ThirdPartyController, :protocols)
+    get("/r0/thirdparty/protocol/:protocol", ThirdPartyController, :protocol)
+    get("/r0/thirdparty/user", ThirdPartyController, :user)
+    get("/r0/thirdparty/user/:protocol", ThirdPartyController, :user_by_protocol)
+    get("/r0/thirdparty/location", ThirdPartyController, :location)
+    get("/r0/thirdparty/location/:protocol", ThirdPartyController, :location_by_protocol)
+
     # Room members & aliases
     get("/v3/rooms/:room_id/members", RoomController, :members)
     get("/v3/rooms/:room_id/joined_members", RoomController, :joined_members)

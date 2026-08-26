@@ -52,9 +52,11 @@ defmodule AxonWeb.ReceiptController do
   # Wakes any long-polling /sync for the room's members (previously nothing
   # broadcast at all, so a receipt with no accompanying new timeline event
   # in the same room sat unseen until the recipient's timeout elapsed, or
-  # some unrelated event happened to touch the room) and relays m.read
+  # some unrelated event happened to touch the room), relays m.read
   # receipts (not m.read.private, which per spec never leaves the user's own
-  # devices) to remote servers sharing the room.
+  # devices/services) to remote servers sharing the room, and pushes both
+  # kinds to any application service that opted into ephemeral data and is
+  # in this receipt's audience.
   defp store_receipt(room_id, user_id, receipt_type, event_id, ts) do
     Repo.insert_all(
       "receipts",
@@ -73,7 +75,29 @@ defmodule AxonWeb.ReceiptController do
 
     EventStore.record_ephemeral_update(room_id)
     if receipt_type == "m.read", do: federate_receipt(room_id, user_id, event_id, ts)
+    dispatch_appservice_receipt(room_id, user_id, receipt_type, event_id, ts)
   end
+
+  # AS ephemeral push (AS spec, "Pushing ephemeral data"), in the
+  # Client-Server-API `m.receipt` content shape rather than federation's
+  # `event_ids` list form. An m.read.private receipt only ever reaches an AS
+  # that owns the receipt's own user (dispatch_ephemeral/5's `private?: true`)
+  # — it is never broadcast to every AS bridging the room the way a public
+  # m.read receipt is.
+  defp dispatch_appservice_receipt(room_id, user_id, receipt_type, event_id, ts)
+       when receipt_type in ["m.read", "m.read.private"] do
+    content = %{event_id => %{receipt_type => %{user_id => %{"ts" => ts}}}}
+
+    AxonWeb.AppService.Manager.dispatch_ephemeral(
+      "m.receipt",
+      room_id,
+      user_id,
+      content,
+      private?: receipt_type == "m.read.private"
+    )
+  end
+
+  defp dispatch_appservice_receipt(_room_id, _user_id, _receipt_type, _event_id, _ts), do: :ok
 
   defp federate_receipt(room_id, user_id, event_id, ts) do
     case EventStore.remote_servers_for_room(room_id) do
