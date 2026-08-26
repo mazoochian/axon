@@ -173,9 +173,13 @@ defmodule AxonWeb.MediaControllerTest do
     end
 
     test "cloud instance metadata is not reachable" do
+      # The media ID has to be a *valid* one for this to be testing the
+      # address guard at all — a path-shaped id is now turned away by the
+      # charset check first (see the "media ID validation" describe below),
+      # which would make this pass for the wrong reason.
       conn =
         build_conn()
-        |> get("/_matrix/media/v3/download/169.254.169.254/latest%2Fmeta-data")
+        |> get("/_matrix/media/v3/download/169.254.169.254/AAAAAAAAAAAAAAAAAAAAAAAA")
 
       assert conn.status == 502
     end
@@ -199,6 +203,126 @@ defmodule AxonWeb.MediaControllerTest do
       assert blocked.status == unreachable.status
       assert blocked.resp_body == unreachable.resp_body
       assert decode(blocked)["errcode"] == "M_UNKNOWN"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # media ID validation (audit L3)
+  #
+  # `media_id` comes straight out of the request path and, when the media
+  # belongs to another server, is string-interpolated into the *outbound*
+  # federation request path. A `media_id` of `../../x`, `x?allow_remote=true`
+  # or `x#frag` therefore let a client steer the path and query of a request
+  # this server makes to a third-party homeserver, over a connection
+  # carrying our X-Matrix signature.
+  #
+  # What's asserted is not just the 4xx: it's that a real listening socket
+  # standing in for the remote server never sees a connection at all. A
+  # rejection that still made the outbound request would be no fix.
+  # ---------------------------------------------------------------------------
+
+  describe "media ID validation" do
+    setup do
+      previous = Application.get_env(:axon_federation, :allow_private_addresses)
+      # Loopback normally *is* blocked; allow it here so that if the
+      # charset check failed to stop the request, the request would
+      # genuinely reach the socket below rather than being caught by the
+      # SSRF guard and passing this test for the wrong reason.
+      Application.put_env(:axon_federation, :allow_private_addresses, true)
+      on_exit(fn -> Application.put_env(:axon_federation, :allow_private_addresses, previous) end)
+
+      {:ok, socket} =
+        :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false, reuseaddr: true])
+
+      {:ok, port} = :inet.port(socket)
+      on_exit(fn -> :gen_tcp.close(socket) end)
+
+      %{socket: socket, port: port}
+    end
+
+    # `%2F` survives Plug's path splitting and decodes inside the segment,
+    # so these really do arrive at the controller as `../..`, `x?y` and
+    # `x#y` — the exact strings that would have been interpolated.
+    @bad_media_ids [
+      {"traversal", "..%2F..%2Fetc%2Fpasswd"},
+      {"bare dot-dot slash", "..%2F"},
+      {"query injection", "abc%3Fallow_remote%3Dtrue"},
+      {"fragment injection", "abc%23fragment"},
+      {"percent escape", "abc%2500"},
+      {"whitespace", "abc%20def"},
+      {"an at-sign", "abc%40def"},
+      # `$` in a regex matches just before a trailing newline, not only at
+      # the true end of the string — `\A...\z` (not `^...$`) is what
+      # actually anchors both ends.
+      {"a trailing newline", "abc%0A"}
+    ]
+
+    for {label, encoded} <- @bad_media_ids do
+      test "download rejects a media ID containing #{label} without dialing the remote", %{
+        socket: socket,
+        port: port
+      } do
+        conn =
+          build_conn()
+          |> get("/_matrix/media/v3/download/127.0.0.1:#{port}/#{unquote(encoded)}")
+
+        assert conn.status == 400
+        assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+        assert {:error, :timeout} = :gen_tcp.accept(socket, 200)
+      end
+    end
+
+    test "thumbnail rejects the same media IDs", %{socket: socket, port: port} do
+      conn =
+        build_conn()
+        |> get(
+          "/_matrix/media/v3/thumbnail/127.0.0.1:#{port}/..%2F..%2Fsecret?width=32&height=32"
+        )
+
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+      assert {:error, :timeout} = :gen_tcp.accept(socket, 200)
+    end
+
+    test "the authenticated MSC3916 download path validates identically", %{port: port} do
+      alice = register("mediaid_authed_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v1/media/download/127.0.0.1:#{port}/..%2F..%2Fsecret")
+
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+    end
+
+    test "a media ID longer than the opaque-identifier limit is rejected", %{port: port} do
+      conn =
+        build_conn()
+        |> get("/_matrix/media/v3/download/127.0.0.1:#{port}/#{String.duplicate("a", 256)}")
+
+      assert conn.status == 400
+    end
+
+    # The spec's Opaque Identifier Grammar is RFC 3986's unreserved set, not
+    # just the base64url alphabet this server happens to mint its own IDs
+    # from — `.` and `~` are a remote homeserver's to use, and rejecting
+    # them would break fetching perfectly legitimate media.
+    # Asked of *local* media on purpose: it exercises the charset check and
+    # then stops, with no outbound connection to a socket that would accept
+    # and never answer. A 404 here is the charset check passing.
+    test "a spec-legal media ID using the full unreserved set is not rejected" do
+      assert build_conn()
+             |> get("/_matrix/media/v3/download/localhost/aZ0-_.~")
+             |> Map.get(:status) == 404
+
+      assert build_conn()
+             |> get("/_matrix/media/v3/thumbnail/localhost/aZ0-_.~?width=32&height=32")
+             |> Map.get(:status) == 404
+    end
+
+    test "local media with a well-formed but unknown ID still 404s, not 400" do
+      conn = build_conn() |> get("/_matrix/media/v3/download/localhost/AAAAAAAAAAAAAAAAAAAAAAAA")
+      assert conn.status == 404
     end
   end
 

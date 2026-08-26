@@ -154,26 +154,68 @@ defmodule AxonWeb.MediaController do
     |> json(%{"errcode" => "M_CANNOT_OVERWRITE_MEDIA", "error" => "Media has already been uploaded"})
   end
 
+  # A Matrix media ID is an opaque identifier, and the spec defines exactly
+  # what that means: the Opaque Identifier Grammar in the appendices, which
+  # is RFC 3986's unreserved set — `[0-9A-Za-z._~-]`, one to 255 characters.
+  # Notably absent: `/`, `?`, `#`, `%`, `..`-with-a-slash.
+  #
+  # This is checked here, at the boundary, rather than deeper down because
+  # `media_id` is string-interpolated into the *outbound* federation request
+  # path when proxying remote media
+  # (`AxonFederation.MediaFetch.download/2`, `thumbnail/3`). Unvalidated,
+  # a `media_id` of `x/../../../foo`, `x?allow_remote=true` or `x#frag`
+  # lets a client steer the path and query of a request this server makes
+  # to a *third-party* homeserver — request-path injection against someone
+  # else, with our X-Matrix signature on it. Encoding it at the
+  # interpolation site would fix the injection but leave the endpoint
+  # answering nonsense IDs with a remote round trip; rejecting up front
+  # costs nothing, since no such ID can name real media anyway.
+  #
+  # The audit suggested `[A-Za-z0-9_-]+` (what this server's own
+  # `strong_rand_bytes |> url_encode64` IDs use); the spec's grammar is
+  # slightly wider, and a remote homeserver's IDs are its business, not
+  # ours — `.` and `~` are legitimately theirs to use.
+  # \A/\z rather than ^/$ — the latter allow a trailing newline (`$` matches
+  # just before one), which would let a `media_id` smuggle a newline into
+  # whatever downstream logs or headers it ends up in.
+  @media_id_re ~r/\A[0-9A-Za-z._~-]{1,255}\z/
+
   # GET /_matrix/media/v3/download/:server_name/:media_id
   # GET /_matrix/media/v3/download/:server_name/:media_id/:filename
   def download(conn, %{"server_name" => origin_server, "media_id" => media_id} = params) do
     local_server = Application.fetch_env!(:axon_web, :server_name)
     override_filename = non_empty(params["filename"])
 
-    if origin_server == local_server do
-      serve_local(conn, media_id, override_filename)
-    else
-      proxy_remote(conn, origin_server, media_id, override_filename)
+    cond do
+      not valid_media_id?(media_id) -> invalid_media_id(conn)
+      origin_server == local_server -> serve_local(conn, media_id, override_filename)
+      true -> proxy_remote(conn, origin_server, media_id, override_filename)
     end
   end
 
   # GET /_matrix/media/v3/thumbnail/:server_name/:media_id?width=&height=&method=
   def thumbnail(conn, %{"server_name" => origin_server, "media_id" => media_id} = params) do
-    if origin_server == Application.fetch_env!(:axon_web, :server_name) do
-      serve_local_thumbnail(conn, media_id, params)
-    else
-      proxy_remote_thumbnail(conn, origin_server, media_id, params)
+    cond do
+      not valid_media_id?(media_id) ->
+        invalid_media_id(conn)
+
+      origin_server == Application.fetch_env!(:axon_web, :server_name) ->
+        serve_local_thumbnail(conn, media_id, params)
+
+      true ->
+        proxy_remote_thumbnail(conn, origin_server, media_id, params)
     end
+  end
+
+  defp valid_media_id?(media_id) when is_binary(media_id),
+    do: Regex.match?(@media_id_re, media_id)
+
+  defp valid_media_id?(_), do: false
+
+  defp invalid_media_id(conn) do
+    conn
+    |> put_status(400)
+    |> json(%{"errcode" => "M_INVALID_PARAM", "error" => "Invalid media ID"})
   end
 
   # GET /_matrix/client/v1/media/preview_url (also /_matrix/client/v3 and the

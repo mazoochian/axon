@@ -13,7 +13,7 @@ defmodule AxonWeb.FederationControllerTest do
 
   import Ecto.Query, only: [from: 2]
 
-  alias AxonFederation.{FakeRemoteMatrixServer, KeyCache}
+  alias AxonFederation.{EventVerification, FakeRemoteMatrixServer, KeyCache}
   alias AxonCore.{EventStore, Repo}
   alias AxonCrypto.EventHash
   alias AxonRoom.{CreateRoom, RoomProcess}
@@ -1124,6 +1124,337 @@ defmodule AxonWeb.FederationControllerTest do
 
       {head, _} = RoomProcess.get_position(room_id)
       assert head == legit["event_id"]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # send_transaction — content-hash integrity (audit M1)
+  #
+  # A PDU's signature is computed over its *redacted* form, so for an
+  # `m.room.message` — whose entire `content` redaction strips — the
+  # author's signature says nothing whatsoever about the body. The content
+  # hash is the only thing that does, and it was never checked on inbound
+  # events: any server relaying somebody else's event could rewrite the
+  # message body on the way through and the original author's signature
+  # would still verify perfectly.
+  #
+  # Per the spec's checks-on-receipt list, a hash failure "is redacted
+  # before being processed further" rather than dropped — the event really
+  # did happen and really was signed, it's only its unsigned parts that
+  # can't be trusted. These go in over the real /send route, with the
+  # victim's real homeserver key producing the real signature and a second
+  # real server relaying it.
+  # ---------------------------------------------------------------------------
+
+  describe "PUT send_transaction/2 content hash" do
+    setup do
+      author_port = 18_940 + System.unique_integer([:positive, :monotonic])
+      relay_port = 18_940 + System.unique_integer([:positive, :monotonic])
+      author_hs = "fake-author-hs-#{System.unique_integer([:positive])}.test"
+      relay_hs = "fake-relay-hs-#{System.unique_integer([:positive])}.test"
+
+      start_supervised!({FakeRemoteMatrixServer, port: author_port, server_name: author_hs})
+      start_supervised!({FakeRemoteMatrixServer, port: relay_port, server_name: relay_hs})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{@port}",
+        author_hs => "http://127.0.0.1:#{author_port}",
+        relay_hs => "http://127.0.0.1:#{relay_port}"
+      })
+
+      owner = new_local_user("hashowner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+
+      author = remote_user_at(author_port, "author")
+      join_remote_member_at(author_port, room_id, author)
+
+      %{
+        room_id: room_id,
+        author: author,
+        author_port: author_port,
+        relay_port: relay_port
+      }
+    end
+
+    # The relay signs the *transaction* with its own key, which is entirely
+    # legitimate — X-Matrix auth attests who is talking to us, not who wrote
+    # the events inside — and that is exactly the position a relaying server
+    # is in.
+    defp relay_pdu(relay_port, pdu) do
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      signed_put_at(relay_port, "/_matrix/federation/v1/send/#{txn_id}", %{
+        "pdus" => [pdu],
+        "edus" => []
+      })
+    end
+
+    test "an event whose content was altered after signing is applied in its redacted form", %{
+      room_id: room_id,
+      author: author,
+      author_port: author_port,
+      relay_port: relay_port
+    } do
+      signed =
+        room_id
+        |> forgeable_message(author, "meet me at noon")
+        |> then(&FakeRemoteMatrixServer.sign_event(author_port, &1, "11"))
+
+      # The relay rewrites the body. The signature still verifies — it never
+      # covered `content` — and only `hashes.sha256` disagrees.
+      tampered = put_in(signed, ["content", "body"], "transfer all the money to me")
+
+      assert :ok = EventVerification.verify_signature(tampered, "11")
+
+      conn = relay_pdu(relay_port, tampered)
+      assert conn.status == 200
+
+      assert {:ok, stored} = EventStore.get_event(tampered["event_id"])
+
+      # Redacted: the body the relay substituted is not what anyone reads,
+      # and neither is the original — nothing in `content` was ever signed.
+      refute Map.has_key?(stored.content, "body")
+      assert stored.content == %{}
+      assert stored.sender == author
+    end
+
+    test "an untouched event with a correct content hash keeps its content", %{
+      room_id: room_id,
+      author: author,
+      author_port: author_port,
+      relay_port: relay_port
+    } do
+      signed =
+        room_id
+        |> forgeable_message(author, "meet me at noon")
+        |> then(&FakeRemoteMatrixServer.sign_event(author_port, &1, "11"))
+
+      conn = relay_pdu(relay_port, signed)
+      assert conn.status == 200
+
+      assert {:ok, stored} = EventStore.get_event(signed["event_id"])
+      assert stored.content["body"] == "meet me at noon"
+      assert stored.content["msgtype"] == "m.text"
+    end
+
+    # `hashes` survives redaction in every room version, so it is itself
+    # covered by the signature — an author server that omits it produces a
+    # perfectly-signed event with nothing to check the body against, which
+    # is the same integrity failure as a wrong hash and gets the same
+    # answer. (Stripping the hash off an *already signed* event doesn't
+    # model this: that breaks the signature and the event is dropped a step
+    # earlier, for a different reason.)
+    test "a PDU carrying no hashes at all is applied redacted, not rejected", %{
+      room_id: room_id,
+      author: author,
+      author_port: author_port,
+      relay_port: relay_port
+    } do
+      signed =
+        room_id
+        |> forgeable_message(author, "meet me at noon")
+        |> Map.delete("hashes")
+        |> then(&FakeRemoteMatrixServer.sign_event_verbatim(author_port, &1, "11"))
+
+      refute Map.has_key?(signed, "hashes")
+
+      conn = relay_pdu(relay_port, signed)
+      assert conn.status == 200
+
+      # Still stored — a missing hash is an integrity failure, not a
+      # forgery, and the spec's answer to both is the same redaction.
+      assert {:ok, stored} = EventStore.get_event(signed["event_id"])
+      assert stored.content == %{}
+    end
+
+    # The state-event counterpart: redaction is content-selective, so the
+    # membership itself survives (auth rules still work on a redacted
+    # member event) while the profile fields the relay could have forged
+    # do not.
+    test "a tampered membership event keeps its membership but loses its profile fields", %{
+      room_id: room_id,
+      author: author,
+      author_port: author_port,
+      relay_port: relay_port
+    } do
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      signed =
+        FakeRemoteMatrixServer.sign_event(
+          author_port,
+          %{
+            "event_id" => "$hashmember_#{System.unique_integer([:positive])}",
+            "room_id" => room_id,
+            "type" => "m.room.member",
+            "state_key" => author,
+            "sender" => author,
+            "content" => %{"membership" => "join", "displayname" => "Author"},
+            "depth" => depth + 1,
+            "prev_events" => [last_event_id],
+            "origin_server_ts" => System.os_time(:millisecond)
+          },
+          "11"
+        )
+
+      tampered = put_in(signed, ["content", "displayname"], "Server Administrator")
+
+      conn = relay_pdu(relay_port, tampered)
+      assert conn.status == 200
+
+      assert {:ok, stored} = EventStore.get_event(tampered["event_id"])
+      assert stored.content["membership"] == "join"
+      refute Map.has_key?(stored.content, "displayname")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # send_join/send_leave/send_knock — the authenticated caller (X-Matrix
+  # origin) must be the same server as the event's own sender. Unlike
+  # ordinary PDUs over /send (which any server may relay, hence the content-
+  # hash coverage above), join/leave/knock are meant to be handed to us
+  # directly by the server that authored them — nothing else explains why
+  # they skip the content-hash check. That was true by convention, not by
+  # enforcement, until now: any server holding a validly-signed join/leave/
+  # knock event for a *different* server's user (e.g. relayed by that
+  # server, or by an intermediary that happened to see it) could send it in
+  # under its own X-Matrix auth and have it applied.
+  # ---------------------------------------------------------------------------
+
+  describe "send_join/send_leave/send_knock reject a mismatched origin" do
+    setup do
+      victim_port = 18_980 + System.unique_integer([:positive, :monotonic])
+      evil_port = 18_980 + System.unique_integer([:positive, :monotonic])
+      victim_hs = "fake-originvictim-hs-#{System.unique_integer([:positive])}.test"
+      evil_hs = "fake-originevil-hs-#{System.unique_integer([:positive])}.test"
+
+      start_supervised!({FakeRemoteMatrixServer, port: victim_port, server_name: victim_hs})
+      start_supervised!({FakeRemoteMatrixServer, port: evil_port, server_name: evil_hs})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{@port}",
+        victim_hs => "http://127.0.0.1:#{victim_port}",
+        evil_hs => "http://127.0.0.1:#{evil_port}"
+      })
+
+      owner = new_local_user("originowner")
+
+      {:ok, room_id} =
+        CreateRoom.execute(owner,
+          server_name: "localhost",
+          preset: "public_chat",
+          join_rule: "knock"
+        )
+
+      %{
+        room_id: room_id,
+        victim_hs: victim_hs,
+        victim_port: victim_port,
+        evil_port: evil_port
+      }
+    end
+
+    test "a join signed by the victim's own key is rejected when relayed under a different origin",
+         %{room_id: room_id, victim_port: victim_port, evil_port: evil_port} do
+      victim = remote_user_at(victim_port, "originvictim")
+
+      join_event =
+        signed_remote_event_at(victim_port, %{
+          "event_id" => "$originjoin_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => victim,
+          "sender" => victim,
+          "content" => %{"membership" => "join"},
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+
+      # The relay's own X-Matrix auth signs the *request*, not the join
+      # event — a perfectly valid thing for a relay to do, and exactly why
+      # the event's own signature verifying isn't enough on its own. 400,
+      # not 403: this is validate_join_event/3 rejecting a structurally
+      # invalid request (same M_BAD_JSON shape validate_invite_event/3
+      # already uses for its own origin check), not a signature failure.
+      conn = signed_put_at(evil_port, path, join_event)
+
+      assert conn.status == 400
+      assert EventStore.get_membership(room_id, victim) != {:ok, "join"}
+    end
+
+    test "the victim's own server sending the same join succeeds", %{
+      room_id: room_id,
+      victim_port: victim_port
+    } do
+      victim = remote_user_at(victim_port, "originvictimok")
+
+      join_event =
+        signed_remote_event_at(victim_port, %{
+          "event_id" => "$originjoinok_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => victim,
+          "sender" => victim,
+          "content" => %{"membership" => "join"},
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      path =
+        "/_matrix/federation/v2/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}"
+
+      conn = signed_put_at(victim_port, path, join_event)
+
+      assert conn.status == 200
+      assert EventStore.get_membership(room_id, victim) == {:ok, "join"}
+    end
+
+    test "a leave signed by the victim's own key is rejected when relayed under a different origin",
+         %{room_id: room_id, victim_port: victim_port, evil_port: evil_port} do
+      victim = remote_user_at(victim_port, "originleaver")
+      join_remote_member_at(victim_port, room_id, victim)
+
+      leave_event =
+        signed_remote_event_at(victim_port, %{
+          "event_id" => "$originleave_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => victim,
+          "sender" => victim,
+          "content" => %{"membership" => "leave"},
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      path = "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}"
+
+      conn = signed_put_at(evil_port, path, leave_event)
+
+      assert conn.status == 400
+      assert EventStore.get_membership(room_id, victim) == {:ok, "join"}
+    end
+
+    test "a knock signed by the victim's own key is rejected when relayed under a different origin",
+         %{room_id: room_id, victim_port: victim_port, evil_port: evil_port} do
+      victim = remote_user_at(victim_port, "originknocker")
+
+      knock_event =
+        signed_remote_event_at(victim_port, %{
+          "event_id" => "$originknock_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => victim,
+          "sender" => victim,
+          "content" => %{"membership" => "knock"},
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      path =
+        "/_matrix/federation/v1/send_knock/#{URI.encode(room_id)}/#{URI.encode(knock_event["event_id"])}"
+
+      conn = signed_put_at(evil_port, path, knock_event)
+
+      assert conn.status == 400
+      assert EventStore.get_membership(room_id, victim) != {:ok, "knock"}
     end
   end
 

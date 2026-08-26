@@ -4,7 +4,34 @@ defmodule AxonWeb.AuthController do
   action_fallback(AxonWeb.FallbackController)
 
   plug(AxonWeb.Plug.RateLimit, [bucket: :login] when action == :login)
+
+  # Second, independent dimension on the same action: per targeted account,
+  # not per source IP. A rotating-IP credential-stuffing run against one
+  # account never touches the per-IP limit above. See AxonWeb.Plug.RateLimit.
+  plug(
+    AxonWeb.Plug.RateLimit,
+    [bucket: :login_account, key_by: :login_account] when action == :login
+  )
+
   plug(AxonWeb.Plug.RateLimit, [bucket: :register] when action == :register)
+
+  # The two User-Interactive Auth stages that verify a password. Both call
+  # `Argon2.verify_pass` — intentionally expensive — on an attacker-supplied
+  # string, with nothing throttling them: an online guessing oracle against
+  # the caller's own password (which is what stands between a stolen token
+  # and a permanent account takeover, since /account/password with the right
+  # password logs every other device out) and a cheap way to pin a CPU.
+  # Keyed per user: these are authenticated routes, so the account is known,
+  # and a shared NAT egress shouldn't put unrelated users in one bucket.
+  plug(
+    AxonWeb.Plug.RateLimit,
+    [bucket: :ui_auth, key_by: :user] when action in [:change_password, :deactivate]
+  )
+
+  # /refresh carries no Bearer token — the refresh_token in the body *is*
+  # the credential — so it's an unauthenticated endpoint that validates a
+  # secret, and per-IP is the only key available.
+  plug(AxonWeb.Plug.RateLimit, [bucket: :refresh] when action == :refresh)
 
   # The Synapse-compatible shared-secret admin bootstrap: unauthenticated by
   # design (the HMAC MAC *is* the credential), so an IP limit is the only
@@ -344,7 +371,14 @@ defmodule AxonWeb.AuthController do
 
     case type do
       "m.login.password" ->
-        identifier = params["identifier"] || %{}
+        # A non-map `identifier` (a client sending it as a string/list/etc.)
+        # must not 500 out of `identifier["user"]` below.
+        identifier =
+          case params["identifier"] do
+            %{} = m -> m
+            _ -> %{}
+          end
+
         user = identifier["user"] || params["user"]
         password = params["password"]
 
@@ -362,6 +396,13 @@ defmodule AxonWeb.AuthController do
 
           with {:ok, result} <- UserStore.login(String.downcase(user), password, opts) do
             json(conn, login_response(result, %{"home_server" => server_name()}))
+          else
+            error ->
+              # Only a failure counts against the per-account rate-limit
+              # bucket — see AxonWeb.Plug.RateLimit.record_login_failure/1
+              # for why a successful login must not.
+              AxonWeb.Plug.RateLimit.record_login_failure(params)
+              error
           end
         end
 
@@ -500,7 +541,10 @@ defmodule AxonWeb.AuthController do
 
   defp server_name, do: Application.fetch_env!(:axon_web, :server_name)
 
-  defp valid_localpart?(localpart), do: Regex.match?(~r/^[a-z0-9._\-=\/]+$/i, localpart)
+  # Moved to AxonCore.MatrixId so AxonWeb.Oidc can apply the *same* rule to
+  # the `username` claim it takes off an introspection response, rather than
+  # trusting it verbatim while /register refuses the identical string.
+  defp valid_localpart?(localpart), do: AxonCore.MatrixId.valid_localpart?(localpart)
 
   defp user_exists?(user_id) do
     Repo.one(from(u in "users", where: u.user_id == ^user_id, select: u.user_id)) != nil
@@ -509,7 +553,12 @@ defmodule AxonWeb.AuthController do
   defp gen_session, do: :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
 
   defp validate_ui_auth(current_user_id, %{"type" => "m.login.password"} = auth) do
-    identifier = auth["identifier"] || %{}
+    identifier =
+      case auth["identifier"] do
+        %{} = m -> m
+        _ -> %{}
+      end
+
     auth_user = identifier["user"] || auth["user"]
     password = auth["password"]
 

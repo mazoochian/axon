@@ -80,6 +80,33 @@ defmodule AxonWeb.ProdConfigTest do
       assert get_in(config, [:axon_web, :registration_shared_secret]) == "per-deployment-secret"
     end
 
+    # The escape hatch itself is legitimate (Complement's harness needs it),
+    # so it stays — what it must not do is take effect *silently*. The flag
+    # is what AxonWeb.StartupChecks reads at boot to warn about it; if the
+    # two ever drift apart, rate limiting is off with nothing saying so.
+    test "RELAXED_RATE_LIMITS sets the flag the startup warning keys off, alongside the limits" do
+      config = runtime_config(Map.put(@required, "RELAXED_RATE_LIMITS", nil))
+      assert get_in(config, [:axon_web, :relaxed_rate_limits]) == nil
+
+      config = runtime_config(Map.put(@required, "RELAXED_RATE_LIMITS", "true"))
+      assert get_in(config, [:axon_web, :relaxed_rate_limits]) == true
+
+      limits = get_in(config, [:axon_web, :rate_limits])
+      assert limits[:login] == [max: 1_000_000, window_ms: 60_000]
+
+      # Every bucket config.exs defines has to be relaxed too — a bucket
+      # missed here would leave `Application.get_env(...)[bucket]` nil at
+      # request time and crash the plug, which is how a Complement run finds
+      # out about a new limiter the hard way.
+      declared =
+        Config.Reader.read!(Path.join(@config_dir, "config.exs"), env: :prod)
+        |> get_in([:axon_web, :rate_limits])
+        |> Keyword.keys()
+        |> Enum.sort()
+
+      assert Keyword.keys(limits) |> Enum.sort() == declared
+    end
+
     test "the media SSRF guard is on unless explicitly disabled" do
       config = runtime_config(Map.put(@required, "FEDERATION_ALLOW_PRIVATE_ADDRESSES", nil))
       assert get_in(config, [:axon_federation, :allow_private_addresses]) == false
@@ -105,6 +132,28 @@ defmodule AxonWeb.ProdConfigTest do
   end
 
   describe "config.exs" do
+    test "parameter filtering is configured, and covers every env" do
+      # Applies to dev and test too, not just prod: a developer's console
+      # and a CI log are both places a password can end up in plain text,
+      # and the setting costs nothing where it isn't needed.
+      config = Config.Reader.read!(Path.join(@config_dir, "config.exs"), env: :dev)
+      filters = get_in(config, [:phoenix, :filter_parameters])
+
+      assert is_list(filters)
+      assert "password" in filters
+      assert "token" in filters
+      assert "mac" in filters
+    end
+
+    test "the build's Mix environment is recorded for runtime code to read" do
+      # AxonWeb.StartupChecks only warns in :prod, and `Mix.env/0` doesn't
+      # exist inside a release — so this has to be captured at build time.
+      for env <- [:dev, :test, :prod] do
+        config = Config.Reader.read!(Path.join(@config_dir, "config.exs"), env: env)
+        assert get_in(config, [:axon_web, :env]) == env
+      end
+    end
+
     test "the last-resort endpoint secret is not a fixed literal" do
       first = Config.Reader.read!(Path.join(@config_dir, "config.exs"), env: :prod)
       second = Config.Reader.read!(Path.join(@config_dir, "config.exs"), env: :prod)

@@ -162,20 +162,23 @@ defmodule AxonCrypto.KeyServerTest do
 
   describe "signing key persistence (:axon_crypto, :signing_key_path)" do
     setup do
-      path =
-        Path.join(
-          System.tmp_dir!(),
-          "axon_test_signing_key_#{System.unique_integer([:positive])}.json"
-        )
+      # A dedicated subdirectory, not the shared system tmp dir directly —
+      # `persist_keypair!` chmods the key's *directory* to 0700 (see the
+      # I4 fix below), and doing that to `System.tmp_dir!()` itself would
+      # lock every other process on the box out of `/tmp`.
+      dir =
+        Path.join(System.tmp_dir!(), "axon_test_signing_key_dir_#{System.unique_integer([:positive])}")
+
+      path = Path.join(dir, "signing_key.json")
 
       Application.put_env(:axon_crypto, :signing_key_path, path)
 
       on_exit(fn ->
         Application.delete_env(:axon_crypto, :signing_key_path)
-        File.rm(path)
+        File.rm_rf(dir)
       end)
 
-      %{path: path}
+      %{path: path, dir: dir}
     end
 
     test "with no path configured, two servers still get distinct in-memory keys" do
@@ -244,6 +247,105 @@ defmodule AxonCrypto.KeyServerTest do
 
       mode = File.stat!(path).mode |> Bitwise.band(0o777)
       assert mode == 0o600
+    end
+
+    # Closes the window I4's file-level fix left open: a non-owner could
+    # still open the temp path in the instant between its creation and its
+    # own chmod, as long as the *directory* let them traverse into it at
+    # all. 0700 removes that access outright rather than racing it.
+    test "the key's directory is locked down to its owner", %{dir: dir} do
+      name = :"key_server_dirperm_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = GenServer.start_link(KeyServer, [server_name: "dirperm.example.org"], name: name)
+
+      mode = File.stat!(dir).mode |> Bitwise.band(0o777)
+      assert mode == 0o700
+    end
+
+    test "leaves no temp file behind in the key's directory", %{path: path} do
+      name = :"key_server_tmp_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = GenServer.start_link(KeyServer, [server_name: "tmp.example.org"], name: name)
+
+      assert File.exists?(path)
+      assert leftover_temp_files(path) == []
+    end
+
+    test "a stale temp file from a previous crashed write doesn't block persistence", %{
+      path: path
+    } do
+      # The temp name carries a unique integer precisely so a leftover from
+      # an interrupted boot can't collide with (or be reused by) the next
+      # one — `:exclusive` would refuse to open it, and refusing to boot
+      # because of debris is the wrong failure.
+      stale = Path.join(Path.dirname(path), ".#{Path.basename(path)}.0.tmp")
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(stale, "junk from a crashed write")
+      on_exit(fn -> File.rm(stale) end)
+
+      name = :"key_server_stale_#{System.unique_integer([:positive])}"
+
+      {:ok, _pid} =
+        GenServer.start_link(KeyServer, [server_name: "stale.example.org"], name: name)
+
+      assert File.exists?(path)
+      assert %{"private_key" => _} = path |> File.read!() |> Jason.decode!()
+      assert File.stat!(path).mode |> Bitwise.band(0o777) == 0o600
+    end
+
+    # The finding this covers (audit I4) is a race, so this is a *detector*
+    # rather than a proof: a watcher spins on the final path for the whole
+    # of the write and records every mode it ever sees. Against the previous
+    # implementation — `File.write!` then `File.chmod!(0o600)` — there is a
+    # window in which the file exists at whatever the umask allows (0644 on
+    # a default 022 umask), and this catches it. Against the current one
+    # there is no such window to catch at all: the key is written to a temp
+    # file that is chmod-ed 0600 while still empty, and only then renamed
+    # into place, so `path` goes from absent to 0600 in a single atomic
+    # step. That's the actual guarantee; this test is what would have
+    # noticed it was missing.
+    test "the final path is never observable with permissions other than 0600", %{path: path} do
+      parent = self()
+
+      watcher =
+        spawn_link(fn ->
+          observations = watch_modes(path, System.monotonic_time(:millisecond) + 2_000, [])
+          send(parent, {:observations, observations})
+        end)
+
+      name = :"key_server_race_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = GenServer.start_link(KeyServer, [server_name: "race.example.org"], name: name)
+      assert File.exists?(path)
+
+      send(watcher, :stop)
+      assert_receive {:observations, observations}, 5_000
+
+      assert Enum.all?(observations, &(&1 == 0o600)),
+             "the key file was visible with mode(s) #{inspect(Enum.uniq(observations))}"
+    end
+
+    defp watch_modes(path, deadline, acc) do
+      receive do
+        :stop -> acc
+      after
+        0 ->
+          acc =
+            case File.stat(path) do
+              {:ok, %{mode: mode}} -> [Bitwise.band(mode, 0o777) | acc]
+              _ -> acc
+            end
+
+          if System.monotonic_time(:millisecond) >= deadline,
+            do: acc,
+            else: watch_modes(path, deadline, acc)
+      end
+    end
+
+    defp leftover_temp_files(path) do
+      dir = Path.dirname(path)
+      base = Path.basename(path)
+
+      dir
+      |> File.ls!()
+      |> Enum.filter(&(String.starts_with?(&1, ".#{base}.") and String.ends_with?(&1, ".tmp")))
     end
   end
 end

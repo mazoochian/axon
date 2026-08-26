@@ -80,6 +80,19 @@ defmodule AxonWeb.AuthControllerTest do
     assert (authed(second_token) |> get("/_matrix/client/v3/account/whoami")).status == 401
   end
 
+  test "a non-map identifier in a login body doesn't crash — falls through to the missing-param case" do
+    conn =
+      build_conn()
+      |> jp("/_matrix/client/v3/login", %{
+        "type" => "m.login.password",
+        "identifier" => "not_an_object",
+        "password" => "whatever"
+      })
+
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_MISSING_PARAM"
+  end
+
   test "register_available reports true for a free username and false when taken" do
     free_conn =
       build_conn()

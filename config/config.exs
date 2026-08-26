@@ -14,6 +14,14 @@ random_secret_key_base = fn -> 48 |> :crypto.strong_rand_bytes() |> Base.encode6
 config :axon_web,
   server_name: System.get_env("AXON_SERVER_NAME", "localhost")
 
+# The build's Mix environment, recorded so runtime code can ask. `Mix.env/0`
+# itself does not exist in a release — Mix isn't in the runtime dependency
+# tree — so anything that needs to behave differently in a real deployment
+# than in dev/test (see AxonWeb.StartupChecks, which only warns about
+# risky-but-legal configuration when this says :prod) has to be told at
+# build time rather than inferring it.
+config :axon_web, :env, config_env()
+
 # Identity server for 3pid invites (see AxonWeb.IdentityServer,
 # AxonWeb.RoomController.invite_3pid/4, and README.md's "Identity server
 # (3pid invites)"). A plain base URL, e.g. "https://vector.im" or a local
@@ -118,15 +126,63 @@ config :axon_web, AxonWeb.FederationEndpoint,
 # clients long-poll it continuously (and re-call immediately whenever the
 # poll returns), so a naive per-request-count limit sized like login/search
 # would false-positive on normal usage rather than actually catching abuse.
+# `login` is limited on two independent dimensions: `login` per source IP
+# (how fast one host can guess), and `login_account` per targeted localpart
+# (how fast one *account* can be guessed at, from however many hosts).
+# Per-IP alone is not a per-account lockout — a thousand IPs doing ten
+# attempts each never trip it while putting ten thousand guesses on one
+# password — so credential stuffing against a single account was, in
+# effect, unthrottled. The per-account window is deliberately wider and
+# more generous than the per-IP one: it is shared by everyone legitimately
+# signing in to that account (several devices, an app retrying), and a
+# limit tight enough to be a lockout is a limit an attacker can use *as*
+# a lockout.
+#
+# `ui_auth` covers the password-verifying User-Interactive Auth stages
+# (`/account/password`, `/account/deactivate`), keyed per user. Those run
+# `Argon2.verify_pass` — deliberately expensive — with nothing between
+# them and an authenticated caller, so they were both an online
+# password-guessing oracle against the caller's own account and a cheap
+# way to make this server burn CPU. `refresh` is keyed per IP, since it
+# carries no access token: the refresh token in the body *is* the
+# credential being presented, and an unthrottled endpoint that validates a
+# secret is an endpoint that can be guessed at.
 config :axon_web, :rate_limits,
   login: [max: 10, window_ms: 60_000],
+  login_account: [max: 30, window_ms: 300_000],
   register: [max: 5, window_ms: 60_000],
   send_event: [max: 20, window_ms: 10_000],
   media_upload: [max: 20, window_ms: 60_000],
   url_preview: [max: 20, window_ms: 60_000],
   search: [max: 20, window_ms: 60_000],
   sync: [max: 300, window_ms: 60_000],
-  admin_register: [max: 5, window_ms: 60_000]
+  admin_register: [max: 5, window_ms: 60_000],
+  ui_auth: [max: 10, window_ms: 60_000],
+  refresh: [max: 30, window_ms: 60_000]
+
+# Phoenix logs request parameters at :info for every controller action, and
+# `password`/`access_token`/`mac` are all ordinary body params on this API
+# — an unfiltered log is a plaintext credential store with a retention
+# policy nobody wrote down. There was no `filter_parameters` set at all,
+# which means Phoenix's own default (`["password"]`) applied and everything
+# else went to the log verbatim.
+#
+# Matching is by substring on the parameter *name*, so each entry covers a
+# family: `token` catches `access_token`, `refresh_token` and
+# `id_access_token`; `password` catches `new_password`; `secret` catches
+# `client_secret`; `mac` is the shared-secret admin bootstrap's HMAC.
+# Deliberately *not* here: `key` and `signature`. Device keys, cross-signing
+# keys and event signatures are public by design, and a substring match on
+# `key` would swallow `state_key`, `room_key`s and `key_name` too — cost to
+# debuggability with nothing bought.
+#
+# This also covers the audit's L2: access tokens are accepted in the
+# `?access_token=` query string (spec-permitted legacy behavior real
+# clients still rely on, so it stays), and query params reach the log
+# through the same mechanism and are filtered by the same list. The
+# request *line* Phoenix logs is `conn.request_path`, which carries no
+# query string, so nothing else needs redacting there.
+config :phoenix, :filter_parameters, ["password", "token", "mac", "secret"]
 
 # Shared secret for the Synapse-compatible `/_synapse/admin/v1/register`
 # bootstrap endpoint. No default on purpose: nil means the endpoint (and its

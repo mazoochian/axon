@@ -192,6 +192,30 @@ defmodule AxonCrypto.KeyServer do
     {key_id, public_key, private_key}
   end
 
+  # Writes the private signing key so that `path` never exists with
+  # permissions anyone else can read it through — not even for the
+  # microseconds between creation and chmod.
+  #
+  # This used to be `File.write!` then `File.chmod!(0o600)`. Between those
+  # two calls the file exists at whatever the process umask allows, which
+  # on a default 022 umask is world-readable, and it contains an Ed25519
+  # private key. A short window is still a window: it is reliably hit by
+  # anything watching the directory (inotify), and it is not a race the
+  # attacker has to win repeatedly — one read of that file is a permanent
+  # compromise of this server's federation identity, since possession of
+  # the key is the whole of the proof.
+  #
+  # Three steps, in this order:
+  #
+  #   1. Create a temp file in the *same directory* (so the rename in step
+  #      3 stays within one filesystem and is therefore atomic) with
+  #      `:exclusive`, which fails rather than reusing a file someone else
+  #      planted, and chmod it to 0600 while it is still empty.
+  #   2. Only then write the key material into it.
+  #   3. `File.rename!` onto the final path — a rename is atomic and
+  #      carries the mode with the inode, so `path` goes from not existing
+  #      to existing-with-0600 in one step, and a concurrent reader sees
+  #      one or the other and never a half-written or over-permissive file.
   defp persist_keypair!(path, {key_id, public_key, private_key}) do
     doc =
       Jason.encode!(%{
@@ -200,9 +224,36 @@ defmodule AxonCrypto.KeyServer do
         "private_key" => Base.encode64(private_key, padding: false)
       })
 
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, doc)
-    # Contains the private signing key — readable only by the process owner.
-    File.chmod!(path, 0o600)
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    # 0700: closes the window between File.open! creating the temp file at
+    # the default umask and the chmod below — a non-owner can't even open a
+    # path inside a directory it has no access to, so there's nothing left
+    # to race regardless of the temp file's own momentary mode.
+    File.chmod!(dir, 0o700)
+
+    tmp_path =
+      Path.join(dir, ".#{Path.basename(path)}.#{:erlang.unique_integer([:positive])}.tmp")
+
+    try do
+      file = File.open!(tmp_path, [:write, :binary, :exclusive])
+
+      try do
+        File.chmod!(tmp_path, 0o600)
+
+        case IO.binwrite(file, doc) do
+          :ok -> :ok
+          {:error, reason} -> raise File.Error, reason: reason, action: "write to", path: tmp_path
+        end
+      after
+        File.close(file)
+      end
+
+      File.rename!(tmp_path, path)
+    rescue
+      e ->
+        File.rm(tmp_path)
+        reraise(e, __STACKTRACE__)
+    end
   end
 end

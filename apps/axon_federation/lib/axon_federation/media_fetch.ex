@@ -45,15 +45,17 @@ defmodule AxonFederation.MediaFetch do
   `AxonFederation.AddressGuard`.
   """
   def download(server_name, media_id) do
+    id = encode_media_id(media_id)
+
     with {:ok, base_url} <- ServerResolver.resolve_checked(server_name) do
       fetch(
         server_name,
         base_url,
-        "/_matrix/federation/v1/media/download/#{media_id}",
+        "/_matrix/federation/v1/media/download/#{id}",
         fn ->
           legacy_fetch(
             base_url,
-            "/_matrix/media/v3/download/#{server_name}/#{media_id}?allow_remote=false"
+            "/_matrix/media/v3/download/#{server_name}/#{id}?allow_remote=false"
           )
         end
       )
@@ -63,12 +65,13 @@ defmodule AxonFederation.MediaFetch do
   @doc "Fetch a thumbnail. Returns `{:ok, content_type, body, filename}` or `{:error, reason}`."
   def thumbnail(server_name, media_id, query) when is_map(query) do
     qs = URI.encode_query(query)
+    id = encode_media_id(media_id)
 
     path =
-      "/_matrix/federation/v1/media/thumbnail/#{media_id}" <> if(qs == "", do: "", else: "?#{qs}")
+      "/_matrix/federation/v1/media/thumbnail/#{id}" <> if(qs == "", do: "", else: "?#{qs}")
 
     legacy_qs = URI.encode_query(Map.put(query, "allow_remote", "false"))
-    legacy_path = "/_matrix/media/v3/thumbnail/#{server_name}/#{media_id}?#{legacy_qs}"
+    legacy_path = "/_matrix/media/v3/thumbnail/#{server_name}/#{id}?#{legacy_qs}"
 
     with {:ok, base_url} <- ServerResolver.resolve_checked(server_name) do
       fetch(server_name, base_url, path, fn -> legacy_fetch(base_url, legacy_path) end)
@@ -76,6 +79,16 @@ defmodule AxonFederation.MediaFetch do
   end
 
   # ---------------------------------------------------------------------------
+
+  # Belt and braces behind `AxonWeb.MediaController`'s charset check, which
+  # is where a bad `media_id` is actually meant to be turned away. Anything
+  # that survives that check is already RFC 3986 unreserved and passes
+  # through this unchanged, so it costs nothing; what it buys is that no
+  # future caller of this module can reintroduce path/query injection into
+  # a request we sign and send to a third-party homeserver just by
+  # forgetting to validate first.
+  defp encode_media_id(media_id),
+    do: media_id |> to_string() |> URI.encode(&URI.char_unreserved?/1)
 
   defp fetch(server_name, base_url, path, fallback) do
     case HttpClient.get_raw(server_name, path, base_url) do

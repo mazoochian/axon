@@ -78,4 +78,35 @@ defmodule AxonCore.MatrixId do
   """
   def valid_server_name?(server) when is_binary(server), do: server =~ @server_name_re
   def valid_server_name?(_), do: false
+
+  # The Client-Server API's "user identifiers" grammar: a localpart is
+  # `[a-z0-9._=/+-]`, and servers "MUST reject" a `/register` asking for
+  # anything outside it. Uppercase is tolerated here (and folded to lower
+  # by the caller) because historical accounts exist with it — the spec
+  # calls those "historical user IDs" that servers should still accept.
+  @localpart_re ~r/^[a-z0-9._\-=\/]+$/i
+
+  @doc """
+  True when `localpart` is a usable Matrix localpart.
+
+  Lives here rather than in `AxonWeb.AuthController`, where it was a
+  private function, because `/register` is not the only place a localpart
+  arrives from outside: `AxonWeb.Oidc` takes one from an OAuth2
+  introspection response's `username` claim, and was using it verbatim.
+  Two independent notions of "valid localpart" is exactly how a name that
+  registration would refuse gets in through the side door.
+
+      iex> AxonCore.MatrixId.valid_localpart?("alice.1_test")
+      true
+
+      iex> AxonCore.MatrixId.valid_localpart?("@alice:example.com")
+      false
+
+      iex> AxonCore.MatrixId.valid_localpart?("")
+      false
+  """
+  def valid_localpart?(localpart) when is_binary(localpart),
+    do: Regex.match?(@localpart_re, localpart)
+
+  def valid_localpart?(_), do: false
 end

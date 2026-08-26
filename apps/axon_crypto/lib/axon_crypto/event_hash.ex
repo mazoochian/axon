@@ -23,13 +23,76 @@ defmodule AxonCrypto.EventHash do
   Computes the content hash of an event (for the `hashes.sha256` field).
 
   Remove unsigned, signatures, hashes from the event first, then SHA256 the canonical JSON.
+
+  The result is **Unpadded Base64** — the standard RFC 4648 alphabet with
+  the `=` padding stripped, which is what the spec names for this field
+  ("The Unpadded Base64 encoded key"). This used to emit *URL-safe* base64
+  (`-`/`_` in place of `+`/`/`), which is the encoding room versions 4+ use
+  for the reference hash in an event ID and is a different thing. A SHA-256
+  digest contains at least one byte-triple encoding to `+` or `/` roughly
+  three times out of four, so three quarters of the content hashes this
+  server put on the wire disagreed, character for character, with what a
+  spec-compliant peer recomputes — and a peer that checks content hashes
+  (Synapse does) answers a mismatch by *redacting* the event, silently
+  stripping the body off most outbound messages. Verification here decodes
+  before comparing (see `verify_content_hash/1`) so it stays tolerant of
+  either alphabet on the way in regardless.
   """
   @spec content_hash(map()) :: binary()
   def content_hash(event) do
+    event |> content_hash_bytes() |> Base.encode64(padding: false)
+  end
+
+  @doc """
+  Checks an event's own `hashes.sha256` against a freshly computed content
+  hash. `:ok`, or `{:error, :missing_content_hash | :content_hash_mismatch}`.
+
+  Unlike the signature — which is computed over the *redacted* event, and so
+  says nothing about any field redaction strips — this covers the event
+  verbatim, `content` included. It is therefore the only thing standing
+  between a relaying server and rewriting the body of somebody else's
+  `m.room.message` on its way through: the author's signature still verifies
+  over the redacted form, because the body was never part of it.
+
+  A failure is deliberately not phrased as "reject". Per the Server-Server
+  API's checks-on-receipt list, an event that "passes signature checks" but
+  fails hash checks "is redacted before being processed further" — a
+  mismatch means the unsigned parts of the event can't be trusted, not
+  necessarily that the whole event is forged. See
+  `AxonFederation.EventVerification.verify/2`.
+
+  The comparison is on the decoded digest, not the base64 text, so an event
+  whose hash arrives in URL-safe base64 rather than the spec's unpadded
+  standard base64 still verifies — the hash is 32 bytes, and which alphabet
+  a peer spelled them in is not something to fail an event over.
+  """
+  @spec verify_content_hash(map()) ::
+          :ok | {:error, :missing_content_hash | :content_hash_mismatch}
+  def verify_content_hash(event) when is_map(event) do
+    with claimed when is_binary(claimed) <- get_in(event, ["hashes", "sha256"]),
+         {:ok, claimed_bytes} <- decode_unpadded_base64(claimed) do
+      if claimed_bytes == content_hash_bytes(event),
+        do: :ok,
+        else: {:error, :content_hash_mismatch}
+    else
+      nil -> {:error, :missing_content_hash}
+      :error -> {:error, :content_hash_mismatch}
+      _ -> {:error, :missing_content_hash}
+    end
+  end
+
+  defp content_hash_bytes(event) do
     event
     |> Map.drop(["hashes" | @non_content_fields])
     |> CanonicalJSON.encode_to_binary()
-    |> sha256_b64url()
+    |> then(&:crypto.hash(:sha256, &1))
+  end
+
+  defp decode_unpadded_base64(str) do
+    case Base.decode64(str, padding: false) do
+      {:ok, bytes} -> {:ok, bytes}
+      :error -> Base.url_decode64(str, padding: false)
+    end
   end
 
   @doc """

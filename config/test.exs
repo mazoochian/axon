@@ -48,13 +48,16 @@ config :axon_web, :registration, enabled: true
 # directly with small, explicit limits instead of relying on these.
 config :axon_web, :rate_limits,
   login: [max: 1_000_000, window_ms: 60_000],
+  login_account: [max: 1_000_000, window_ms: 300_000],
   register: [max: 1_000_000, window_ms: 60_000],
   send_event: [max: 1_000_000, window_ms: 10_000],
   media_upload: [max: 1_000_000, window_ms: 60_000],
   url_preview: [max: 1_000_000, window_ms: 60_000],
   search: [max: 1_000_000, window_ms: 60_000],
   sync: [max: 1_000_000, window_ms: 60_000],
-  admin_register: [max: 1_000_000, window_ms: 60_000]
+  admin_register: [max: 1_000_000, window_ms: 60_000],
+  ui_auth: [max: 1_000_000, window_ms: 60_000],
+  refresh: [max: 1_000_000, window_ms: 60_000]
 
 # Fixed convenience value for the shared-secret admin bootstrap
 # (`/_synapse/admin/v1/register`) — prod requires REGISTRATION_SHARED_SECRET

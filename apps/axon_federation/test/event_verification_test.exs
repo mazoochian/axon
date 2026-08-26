@@ -151,6 +151,83 @@ defmodule AxonFederation.EventVerificationTest do
     assert {:error, :key_not_found} = EventVerification.verify_signature(event, "11")
   end
 
+  # ---------------------------------------------------------------------------
+  # verify/2 — signature *and* content hash, with the spec's asymmetric
+  # failure modes: a bad signature drops the event, a bad content hash
+  # redacts it. See the moduledoc on AxonFederation.EventVerification.
+  # ---------------------------------------------------------------------------
+
+  describe "verify/2" do
+    test "returns an untouched event when both checks pass",
+         %{good: good, good_port: good_port} do
+      legit =
+        base_event("@alice:#{good}")
+        |> then(&FakeRemoteMatrixServer.sign_event(good_port, &1, "11"))
+
+      assert {:ok, verified} = EventVerification.verify(legit, "11")
+      assert verified == legit
+      assert verified["content"]["body"] == "I never said this"
+    end
+
+    test "returns the redacted event when the content hash doesn't match",
+         %{good: good, good_port: good_port} do
+      tampered =
+        base_event("@alice:#{good}")
+        |> then(&FakeRemoteMatrixServer.sign_event(good_port, &1, "11"))
+        |> put_in(["content", "body"], "a body a relaying server substituted")
+
+      # The signature is still perfectly valid — v11 redaction strips
+      # `content` from an m.room.message, so the body was never signed.
+      # Only the content hash notices.
+      assert :ok = EventVerification.verify_signature(tampered, "11")
+
+      assert {:ok, verified} = EventVerification.verify(tampered, "11")
+      assert verified["content"] == %{}
+      assert verified["sender"] == tampered["sender"]
+      assert verified["signatures"] == tampered["signatures"]
+    end
+
+    test "a bad signature is an error, not a redaction",
+         %{good: good, good_port: good_port} do
+      tampered =
+        base_event("@alice:#{good}")
+        |> then(&FakeRemoteMatrixServer.sign_event(good_port, &1, "11"))
+        |> Map.put("depth", 6)
+
+      assert {:error, :bad_signature} = EventVerification.verify(tampered, "11")
+    end
+
+    test "event_id survives the redaction, even in a room version that drops it",
+         %{good: good, good_port: good_port} do
+      # Room version 11's redaction algorithm doesn't list `event_id` among
+      # the surviving top-level keys (it isn't a real wire field there — it's
+      # the reference hash). Everything downstream of verification, right
+      # through to EventStore.insert_event/2's NOT NULL column, still needs
+      # it on the map.
+      tampered =
+        base_event("@alice:#{good}")
+        |> Map.put("event_id", "$known_id_#{System.unique_integer([:positive])}")
+        |> then(&FakeRemoteMatrixServer.sign_event(good_port, &1, "11"))
+        |> put_in(["content", "body"], "rewritten")
+
+      assert {:ok, verified} = EventVerification.verify(tampered, "11")
+      assert verified["event_id"] == tampered["event_id"]
+    end
+
+    test "a room version that keeps event_id through redaction keeps it too",
+         %{good: good, good_port: good_port} do
+      tampered =
+        base_event("@alice:#{good}")
+        |> Map.put("event_id", "$v10_id_#{System.unique_integer([:positive])}")
+        |> then(&FakeRemoteMatrixServer.sign_event(good_port, &1, "10"))
+        |> put_in(["content", "body"], "rewritten")
+
+      assert {:ok, verified} = EventVerification.verify(tampered, "10")
+      assert verified["event_id"] == tampered["event_id"]
+      assert verified["content"] == %{}
+    end
+  end
+
   describe "verify_signature_from/3" do
     test "asks about one named server, for callers needing an additional signature",
          %{good: good, good_port: good_port, evil: evil, evil_port: evil_port} do

@@ -5,6 +5,11 @@ defmodule AxonWeb.Application do
   def start(_type, _args) do
     attach_sentry_logger_handler()
 
+    # Before anything starts listening: say out loud which
+    # risky-but-deliberately-supported settings this build booted with.
+    # See AxonWeb.StartupChecks — a no-op outside :prod.
+    AxonWeb.StartupChecks.run()
+
     topologies = Application.get_env(:libcluster, :topologies, [])
 
     children = [

@@ -16,6 +16,10 @@ defmodule AxonWeb.FakeOidcServer do
 
   @valid_token "fake-as-valid-token"
   @valid_token_no_device_scope "fake-as-valid-token-no-device-scope"
+  @valid_token_bad_username "fake-as-valid-token-bad-username"
+  @valid_token_mixed_case_username "fake-as-valid-token-mixed-case-username"
+  @valid_token_empty_sub_dave "fake-as-valid-token-empty-sub-dave"
+  @valid_token_empty_sub_erin "fake-as-valid-token-empty-sub-erin"
 
   def valid_token, do: @valid_token
 
@@ -26,6 +30,29 @@ defmodule AxonWeb.FakeOidcServer do
   behavior in AxonWeb.Oidc.
   """
   def valid_token_no_device_scope, do: @valid_token_no_device_scope
+
+  @doc """
+  A token whose `username` claim is not a legal Matrix localpart — a full
+  user ID, complete with `@` and `:`. A misconfigured Authorization Server
+  (or one that lets a user set their own `username`) can send anything at
+  all here, and Axon used to take it verbatim as the localpart while
+  `/register` would have refused the identical string.
+  """
+  def valid_token_bad_username, do: @valid_token_bad_username
+
+  @doc "A token whose `username` claim is legal but mixed-case."
+  def valid_token_mixed_case_username, do: @valid_token_mixed_case_username
+
+  @doc """
+  Two distinct tokens whose introspection responses both carry `"sub": ""`
+  (a misbehaving AS, or one omitting `sub` and getting a JSON default back)
+  with different `username`s — `""` is truthy in Elixir, so `subject ||
+  localpart` used to accept it as a real subject, collapsing every such
+  token onto the same shared `oidc_subject: ""` account regardless of who
+  it actually belonged to.
+  """
+  def valid_token_empty_sub_dave, do: @valid_token_empty_sub_dave
+  def valid_token_empty_sub_erin, do: @valid_token_empty_sub_erin
 
   def child_spec(opts) do
     port = Keyword.fetch!(opts, :port)
@@ -70,6 +97,40 @@ defmodule AxonWeb.FakeOidcServer do
           "active" => true,
           "sub" => "oidc-subject-nodevice",
           "username" => "bob_oidc",
+          "scope" => "urn:matrix:org.matrix.msc2967.client:api:*"
+        })
+
+      @valid_token_bad_username ->
+        json(conn, %{
+          "active" => true,
+          "sub" => "oidc-subject-hostile",
+          "username" => "@server.notices:localhost",
+          "scope" =>
+            "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:OIDCDEV2"
+        })
+
+      @valid_token_mixed_case_username ->
+        json(conn, %{
+          "active" => true,
+          "sub" => "oidc-subject-mixedcase",
+          "username" => "Carol_OIDC",
+          "scope" =>
+            "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:OIDCDEV3"
+        })
+
+      @valid_token_empty_sub_dave ->
+        json(conn, %{
+          "active" => true,
+          "sub" => "",
+          "username" => "dave_oidc",
+          "scope" => "urn:matrix:org.matrix.msc2967.client:api:*"
+        })
+
+      @valid_token_empty_sub_erin ->
+        json(conn, %{
+          "active" => true,
+          "sub" => "",
+          "username" => "erin_oidc",
           "scope" => "urn:matrix:org.matrix.msc2967.client:api:*"
         })
 

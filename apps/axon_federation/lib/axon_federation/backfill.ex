@@ -56,13 +56,28 @@ defmodule AxonFederation.Backfill do
 
     room_version = AxonCore.EventStore.get_room_version(room_id)
 
-    with {:ok, %{"pdus" => [pdu | _]}} <- HttpClient.get(origin, path),
-         :ok <- EventVerification.verify_signature(pdu, room_version) do
-      catch_up(room_id, origin, pdu)
-      RoomProcess.apply_remote_event(room_id, pdu)
-    else
-      {:ok, _} -> {:error, :malformed_event_response}
-      {:error, reason} -> {:error, reason}
+    # `verified` is the event as fetched, or its redacted form if the
+    # content hash didn't check out — a proactively *fetched* event is at
+    # least as exposed to a relaying server rewriting its content as one
+    # arriving over /send, since `origin` here is simply whichever server
+    # answered, not necessarily the author. See
+    # AxonFederation.EventVerification.verify/2.
+    case HttpClient.get(origin, path) do
+      {:ok, %{"pdus" => [pdu | _]}} ->
+        case EventVerification.verify(pdu, room_version) do
+          {:ok, verified} ->
+            catch_up(room_id, origin, verified)
+            RoomProcess.apply_remote_event(room_id, verified)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:ok, _} ->
+        {:error, :malformed_event_response}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -246,8 +261,8 @@ defmodule AxonFederation.Backfill do
   defp verify_and_apply(room_id, origin, event) do
     room_version = AxonCore.EventStore.get_room_version(room_id)
 
-    with :ok <- EventVerification.verify_signature(event, room_version),
-         {:ok, _event_id} <- RoomProcess.apply_remote_event(room_id, event) do
+    with {:ok, verified} <- EventVerification.verify(event, room_version),
+         {:ok, _event_id} <- RoomProcess.apply_remote_event(room_id, verified) do
       :ok
     else
       {:error, reason} ->

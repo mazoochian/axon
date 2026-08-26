@@ -117,7 +117,7 @@ defmodule AxonWeb.FederationController do
     origin = conn.assigns[:origin_server]
 
     with :ok <- check_acl(room_id, origin),
-         :ok <- validate_join_event(join_event, room_id),
+         :ok <- validate_join_event(join_event, room_id, origin),
          :ok <- verify_event_signature(join_event),
          {:ok, event_id} <- apply_join_event(room_id, join_event, origin) do
       # Build response: full room state + auth chain
@@ -205,7 +205,7 @@ defmodule AxonWeb.FederationController do
     origin = conn.assigns[:origin_server]
 
     with :ok <- check_acl(room_id, origin),
-         :ok <- validate_leave_event(leave_event, room_id),
+         :ok <- validate_leave_event(leave_event, room_id, origin),
          :ok <- verify_event_signature(leave_event),
          {:ok, _} <- apply_leave_event(room_id, leave_event, origin) do
       json(conn, %{})
@@ -413,7 +413,7 @@ defmodule AxonWeb.FederationController do
     origin = conn.assigns[:origin_server]
 
     with :ok <- check_acl(room_id, origin),
-         :ok <- validate_knock_event(knock_event, room_id),
+         :ok <- validate_knock_event(knock_event, room_id, origin),
          :ok <- verify_event_signature(knock_event),
          {:ok, _event_id} <- apply_knock_event(room_id, knock_event, origin) do
       json(conn, %{"knock_room_state" => EventStore.stripped_state_events(room_id)})
@@ -447,12 +447,17 @@ defmodule AxonWeb.FederationController do
     end
   end
 
-  defp validate_knock_event(event, room_id) do
+  # See validate_join_event/3's comment on why `origin` must equal the
+  # event's own sender domain.
+  defp validate_knock_event(event, room_id, origin) do
+    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
+
     cond do
       event["type"] != "m.room.member" -> {:error, :invalid_knock}
       event["room_id"] != room_id -> {:error, :invalid_knock}
       get_in(event, ["content", "membership"]) != "knock" -> {:error, :invalid_knock}
       event["state_key"] != event["sender"] -> {:error, :invalid_knock}
+      sender_server != origin -> {:error, :invalid_knock}
       true -> :ok
     end
   end
@@ -1273,12 +1278,26 @@ defmodule AxonWeb.FederationController do
   # Helpers — event validation & application
   # ---------------------------------------------------------------------------
 
-  defp validate_join_event(event, room_id) do
+  # `origin` (the authenticated X-Matrix caller) must be the same server as
+  # the event's own `sender` — otherwise any federating server could relay
+  # another server's join event to us untouched except for its unsigned
+  # `displayname`/`avatar_url` fields (both dropped by redaction, so the
+  # signature over the redacted event doesn't cover them), impersonating
+  # the joining user's profile without ever holding their key. Real content-
+  # hash tampering is caught by EventVerification.verify/2 upstream of this
+  # (M1), but join/leave/knock go straight through verify_event_signature/1
+  # instead (see that function's own moduledoc note) specifically because
+  # they're meant to be authored directly by the calling server with no
+  # relay in between — which this check is what actually enforces.
+  defp validate_join_event(event, room_id, origin) do
+    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
+
     cond do
       event["type"] != "m.room.member" -> {:error, :invalid_join}
       event["room_id"] != room_id -> {:error, :invalid_join}
       get_in(event, ["content", "membership"]) != "join" -> {:error, :invalid_join}
       event["state_key"] != event["sender"] -> {:error, :invalid_join}
+      sender_server != origin -> {:error, :invalid_join}
       true -> :ok
     end
   end
@@ -1290,12 +1309,17 @@ defmodule AxonWeb.FederationController do
   # exactly like join/knock. Previously this endpoint had no type/content
   # validation at all — any signed, auth-valid event (e.g. an ordinary
   # message) from a joined member would be silently accepted and applied.
-  defp validate_leave_event(event, room_id) do
+  # See validate_join_event/3's comment on why `origin` must equal the
+  # event's own sender domain.
+  defp validate_leave_event(event, room_id, origin) do
+    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
+
     cond do
       event["type"] != "m.room.member" -> {:error, :invalid_leave}
       event["room_id"] != room_id -> {:error, :invalid_leave}
       get_in(event, ["content", "membership"]) != "leave" -> {:error, :invalid_leave}
       event["state_key"] != event["sender"] -> {:error, :invalid_leave}
+      sender_server != origin -> {:error, :invalid_leave}
       true -> :ok
     end
   end
@@ -1308,6 +1332,21 @@ defmodule AxonWeb.FederationController do
 
   defp verify_event_signature(event, room_version),
     do: EventVerification.verify_signature(event, room_version)
+
+  # Signature *and* content hash, for the one path where an event can have
+  # been relayed by a server other than its author: a PDU in a /send
+  # transaction. Returns the event to actually apply — the redacted form
+  # when the content hash didn't check out, per the spec's
+  # checks-on-receipt ordering. See AxonFederation.EventVerification.verify/2.
+  #
+  # send_join/send_leave/send_knock deliberately keep the signature-only
+  # check above: those carry an event the calling server itself authored,
+  # handed to us directly with no relay in between, so the "a middleman
+  # rewrote the body" threat this closes doesn't arise there — and
+  # redacting a join would silently drop the joiner's displayname/avatar
+  # off their membership event.
+  defp verify_event(event),
+    do: EventVerification.verify(event, EventStore.get_room_version(event["room_id"]))
 
   # See apply_knock_event/3 — must go through RoomProcess.apply_remote_event/3,
   # not a direct EventStore.insert_event, or the room's live GenServer never
@@ -1346,9 +1385,11 @@ defmodule AxonWeb.FederationController do
         {:error, :acl_denied}
 
       true ->
-        case verify_event_signature(pdu) do
-          :ok ->
-            apply_remote_event(pdu, room_id, origin)
+        case verify_event(pdu) do
+          # `verified` is `pdu` itself, or its redacted form if the content
+          # hash didn't match — apply what came back, never the original.
+          {:ok, verified} ->
+            apply_remote_event(verified, room_id, origin)
 
           {:error, reason} ->
             Logger.warning("Inbound PDU signature failed from #{origin}: #{inspect(reason)}")

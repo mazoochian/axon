@@ -51,7 +51,12 @@ defmodule AxonWeb.Oidc do
          true <- has_api_scope?(claims),
          localpart when is_binary(localpart) <- extract_localpart(claims) do
       server_name = Application.fetch_env!(:axon_web, :server_name)
-      subject = claims["sub"] || localpart
+      # An empty string is truthy in Elixir, so a token with `"sub": ""` (a
+      # misbehaving AS, or one that omits the claim entirely and gets back a
+      # JSON default) would otherwise fall through as a real subject rather
+      # than the localpart fallback below it — every such token would then
+      # collapse onto the same `oidc_subject: ""` account.
+      subject = if is_binary(claims["sub"]) and claims["sub"] != "", do: claims["sub"], else: localpart
 
       case UserStore.authenticate_via_oidc(subject, localpart, device_id, server_name) do
         {:ok, result} ->
@@ -159,17 +164,45 @@ defmodule AxonWeb.Oidc do
 
   defp token_hash(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
 
-  # `username` is the documented fallback claim real ASes (Matrix
-  # Authentication Service, Synapse's delegated-auth client) send for the
-  # Matrix localpart; fall back to a sanitized `sub` if it's absent.
+  # `username` is the documented claim real ASes (Matrix Authentication
+  # Service, Synapse's delegated-auth client) send for the Matrix localpart.
+  # It used to be taken *verbatim* — only the `sub` fallback below was ever
+  # sanitized — so an Authorization Server that let a user influence their
+  # own `username` claim (or was simply misconfigured) could pick a
+  # localpart `/register` would have refused outright: an `@`, a `:`, a
+  # displayname, an empty string. The AS is a trusted component, but
+  # "trusted" is not "authorized to define this server's identifier
+  # grammar", and it costs nothing to hold it to the same rule every other
+  # account creation path obeys. Anything that doesn't pass falls through
+  # to the `sub`-derived localpart, which is sanitized by construction.
   defp extract_localpart(claims) do
-    claims["username"] || sanitize_localpart(claims["sub"])
+    case claims["username"] do
+      username when is_binary(username) ->
+        if AxonCore.MatrixId.valid_localpart?(username) do
+          String.downcase(username)
+        else
+          Logger.warning(
+            "OIDC introspection returned a `username` claim that is not a valid Matrix " <>
+              "localpart; falling back to the sanitized `sub`"
+          )
+
+          sanitize_localpart(claims["sub"])
+        end
+
+      _ ->
+        sanitize_localpart(claims["sub"])
+    end
   end
 
   defp sanitize_localpart(nil), do: nil
 
   defp sanitize_localpart(sub) do
-    sub |> to_string() |> String.downcase() |> String.replace(~r/[^a-z0-9._=\-\/]/, "_")
+    case sub |> to_string() |> String.downcase() |> String.replace(~r/[^a-z0-9._=\-\/]/, "_") do
+      # An empty `sub` sanitizes to an empty localpart, which would provision
+      # `@:localhost` — nil instead, so introspection fails closed.
+      "" -> nil
+      localpart -> localpart
+    end
   end
 
   defp generate_device_id do

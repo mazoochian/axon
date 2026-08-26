@@ -21,8 +21,31 @@ defmodule AxonCrypto.EventHashTest do
 
       assert hash1 == hash2
       assert is_binary(hash1)
-      # base64url without padding
-      assert String.match?(hash1, ~r/^[A-Za-z0-9_-]+$/)
+      # Unpadded Base64 — the standard RFC 4648 alphabet with the padding
+      # stripped, which is what the spec names for `hashes.sha256`. This
+      # used to assert the URL-safe alphabet, which is what room versions
+      # 4+ use for an *event id* and is a different encoding; the two agree
+      # only for the roughly one digest in four containing no byte-triple
+      # that encodes to `+` or `/`.
+      assert String.match?(hash1, ~r{^[A-Za-z0-9+/]+$})
+      refute String.ends_with?(hash1, "=")
+      assert {:ok, raw} = Base.decode64(hash1, padding: false)
+      assert byte_size(raw) == 32
+    end
+
+    test "encodes a digest containing both + and / rather than escaping them" do
+      # Find an event whose digest actually exercises the two characters
+      # the URL-safe alphabet would have rewritten — otherwise this passes
+      # for free on most inputs.
+      hash =
+        Enum.find_value(1..500, fn n ->
+          h = EventHash.content_hash(%{"content" => %{"body" => "probe #{n}"}})
+          if String.contains?(h, "+") and String.contains?(h, "/"), do: h
+        end)
+
+      assert is_binary(hash), "no probe produced a digest exercising both + and /"
+      refute String.contains?(hash, "-")
+      refute String.contains?(hash, "_")
     end
 
     test "same content produces same hash" do
@@ -34,6 +57,69 @@ defmodule AxonCrypto.EventHashTest do
       e1 = %{"content" => %{"body" => "hello"}}
       e2 = %{"content" => %{"body" => "world"}}
       assert EventHash.content_hash(e1) != EventHash.content_hash(e2)
+    end
+  end
+
+  describe "verify_content_hash/1" do
+    defp hashed(event), do: Map.put(event, "hashes", %{"sha256" => EventHash.content_hash(event)})
+
+    test "accepts an event whose hash matches the content it carries" do
+      event = hashed(%{"type" => "m.room.message", "content" => %{"body" => "hello"}})
+      assert :ok == EventHash.verify_content_hash(event)
+    end
+
+    test "rejects an event whose content changed after the hash was taken" do
+      event = hashed(%{"type" => "m.room.message", "content" => %{"body" => "hello"}})
+      tampered = put_in(event, ["content", "body"], "goodbye")
+
+      assert {:error, :content_hash_mismatch} == EventHash.verify_content_hash(tampered)
+    end
+
+    test "ignores unsigned, signatures and event_id, which are not covered by the hash" do
+      # All three are legitimately added or rewritten in transit — `unsigned`
+      # by every relaying server, `signatures` by anyone counter-signing,
+      # `event_id` by this server itself in send_transaction/2 before the
+      # PDU ever reaches verification. Failing the hash on any of them would
+      # redact essentially every inbound event.
+      event = hashed(%{"type" => "m.room.message", "content" => %{"body" => "hello"}})
+
+      decorated =
+        event
+        |> Map.put("unsigned", %{"age" => 4321})
+        |> Map.put("signatures", %{"relay.test" => %{"ed25519:1" => "sig"}})
+        |> Map.put("event_id", "$abc")
+
+      assert :ok == EventHash.verify_content_hash(decorated)
+    end
+
+    test "accepts a hash spelled in URL-safe base64 as well as the spec's standard alphabet" do
+      event = %{"type" => "m.room.message", "content" => %{"body" => "hello"}}
+
+      url_safe =
+        event
+        |> EventHash.content_hash()
+        |> Base.decode64!(padding: false)
+        |> Base.url_encode64(padding: false)
+
+      assert :ok ==
+               EventHash.verify_content_hash(Map.put(event, "hashes", %{"sha256" => url_safe}))
+    end
+
+    test "an event with no hashes at all, or an unparseable one, fails" do
+      event = %{"type" => "m.room.message", "content" => %{"body" => "hello"}}
+
+      assert {:error, :missing_content_hash} == EventHash.verify_content_hash(event)
+
+      assert {:error, :missing_content_hash} ==
+               EventHash.verify_content_hash(Map.put(event, "hashes", %{}))
+
+      assert {:error, :missing_content_hash} ==
+               EventHash.verify_content_hash(Map.put(event, "hashes", %{"sha256" => 42}))
+
+      assert {:error, :content_hash_mismatch} ==
+               EventHash.verify_content_hash(
+                 Map.put(event, "hashes", %{"sha256" => "not base64!!"})
+               )
     end
   end
 

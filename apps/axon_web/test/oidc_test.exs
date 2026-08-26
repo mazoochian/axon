@@ -145,6 +145,58 @@ defmodule AxonWeb.OidcTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # localpart derivation (audit L4)
+  #
+  # The `username` claim used to be taken verbatim as the Matrix localpart —
+  # only the `sub` fallback was ever sanitized. The Authorization Server is
+  # a trusted component, but "trusted" isn't "authorized to define this
+  # server's identifier grammar": an AS that lets a user influence their own
+  # `username`, or one that's simply misconfigured, could name a localpart
+  # `/register` would refuse outright.
+  # ---------------------------------------------------------------------------
+
+  describe "localpart derivation from introspection claims" do
+    test "a `username` claim that isn't a legal localpart falls back to the sanitized `sub`" do
+      token = AxonWeb.FakeOidcServer.valid_token_bad_username()
+
+      body = whoami(token)
+
+      # The claim was "@server.notices:localhost" — a full user ID. Taken
+      # verbatim it produced "@@server.notices:localhost:localhost"; worse,
+      # a claim shaped to survive interpolation could have collided with an
+      # existing account.
+      assert body["user_id"] == "@oidc-subject-hostile:localhost"
+      refute body["user_id"] =~ "server.notices"
+    end
+
+    test "a legal `username` claim is still used, folded to lowercase like /register does" do
+      token = AxonWeb.FakeOidcServer.valid_token_mixed_case_username()
+
+      assert whoami(token)["user_id"] == "@carol_oidc:localhost"
+    end
+
+    test "the ordinary case is unchanged: a plain `username` claim wins over `sub`" do
+      assert whoami(AxonWeb.FakeOidcServer.valid_token())["user_id"] == "@alice_oidc:localhost"
+    end
+
+    test "two tokens both carrying an empty `sub` don't collapse onto the same account" do
+      dave_id = whoami(AxonWeb.FakeOidcServer.valid_token_empty_sub_dave())["user_id"]
+      erin_id = whoami(AxonWeb.FakeOidcServer.valid_token_empty_sub_erin())["user_id"]
+
+      assert dave_id == "@dave_oidc:localhost"
+      assert erin_id == "@erin_oidc:localhost"
+      refute dave_id == erin_id
+    end
+
+    test "the same empty-`sub` token still authenticates the same account on a second login" do
+      first = whoami(AxonWeb.FakeOidcServer.valid_token_empty_sub_dave())["user_id"]
+      second = whoami(AxonWeb.FakeOidcServer.valid_token_empty_sub_dave())["user_id"]
+
+      assert first == second
+    end
+  end
+
   describe "sensitive endpoints bypass password-based UIA while OIDC is enabled" do
     test "cross-signing key upload succeeds without an auth challenge" do
       token = AxonWeb.FakeOidcServer.valid_token()

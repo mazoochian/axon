@@ -134,16 +134,28 @@ if config_env() == :prod do
   # set by complement/start.sh, not intended for a real deployment. Mirrors
   # config/test.exs's approach: the limiter's own behavior is covered by
   # rate_limit_test.exs regardless of these being relaxed here.
+  #
+  # `:relaxed_rate_limits` is set alongside them so the fact is visible to
+  # something other than a careful reading of the numbers:
+  # `AxonWeb.StartupChecks` logs a loud warning at boot when it's on, which
+  # is the difference between "rate limiting is off in this deployment" being
+  # discoverable and it being silent. Everything here is prod-only config, so
+  # a warning at boot is the only place it can be said.
   if System.get_env("RELAXED_RATE_LIMITS") == "true" do
+    config :axon_web, :relaxed_rate_limits, true
+
     config :axon_web, :rate_limits,
       login: [max: 1_000_000, window_ms: 60_000],
+      login_account: [max: 1_000_000, window_ms: 300_000],
       register: [max: 1_000_000, window_ms: 60_000],
       send_event: [max: 1_000_000, window_ms: 10_000],
       media_upload: [max: 1_000_000, window_ms: 60_000],
       url_preview: [max: 1_000_000, window_ms: 60_000],
       search: [max: 1_000_000, window_ms: 60_000],
       sync: [max: 1_000_000, window_ms: 60_000],
-      admin_register: [max: 1_000_000, window_ms: 60_000]
+      admin_register: [max: 1_000_000, window_ms: 60_000],
+      ui_auth: [max: 1_000_000, window_ms: 60_000],
+      refresh: [max: 1_000_000, window_ms: 60_000]
   end
 
   # Real Matrix federation is TLS-only. In a typical deployment that

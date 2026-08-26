@@ -102,8 +102,38 @@ defmodule AxonFederation.FakeRemoteMatrixServer do
   which is what a real homeserver signs. Defaults to room version 11; pass
   `room_version` explicitly when a test's room is on another version, since
   the redaction algorithm (and therefore the signature) differs.
+
+  The `hashes.sha256` content hash is computed and stamped on first, which
+  is also what a real homeserver does ("adding hashes and signatures to
+  outgoing events" is one ordered operation, hash then sign) — any
+  `hashes` the caller supplied is replaced. Before axon verified inbound
+  content hashes at all, test PDUs across the suite carried a placeholder
+  `%{"sha256" => "x"}`; now that a mismatch redacts the event, that
+  placeholder would quietly strip the `content` off every event these
+  fakes send. A test that specifically wants a *wrong* hash sets it after
+  signing — which is the tampering it's trying to model anyway.
   """
   def sign_event(port, event, room_version \\ "11") when is_map(event) do
+    s = state(port)
+
+    event
+    |> Map.put("hashes", %{"sha256" => EventHash.content_hash(event)})
+    |> EventHash.sign_event(s.server_name, s.key_id, s.private_key, room_version)
+  end
+
+  @doc """
+  `sign_event/3` without the hash-stamping step: signs `event` exactly as
+  given, `hashes` (or the absence of one) included.
+
+  `hashes` is a top-level key that survives redaction in every room
+  version, so it *is* covered by the signature — which means a test can't
+  model "a peer whose content hash is wrong or missing" by stripping the
+  hash off an already-signed event: that breaks the signature instead, and
+  the event is dropped for the wrong reason. This signs the malformed
+  event as its author, the way a buggy or malicious homeserver actually
+  would.
+  """
+  def sign_event_verbatim(port, event, room_version \\ "11") when is_map(event) do
     s = state(port)
     EventHash.sign_event(event, s.server_name, s.key_id, s.private_key, room_version)
   end
