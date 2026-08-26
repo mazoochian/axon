@@ -60,6 +60,20 @@ defmodule AxonFederation.KeyCacheTest do
     assert KeyCache.get_key(@server_name, "ed25519:bad") == nil
   end
 
+  test "a server_name resolving to a private address is refused when the SSRF guard is active" do
+    # Test/dev config sets :allow_private_addresses to true (loopback fakes
+    # are the whole point of this suite) — flip it off just for this test to
+    # exercise the guard AxonFederation.ServerResolver.resolve_checked/1
+    # applies, since key fetches can be driven by an attacker-controlled
+    # server_name (an inbound X-Matrix `origin`, or an event's `sender`)
+    # exactly like remote-media proxying can.
+    Application.put_env(:axon_federation, :allow_private_addresses, false)
+    on_exit(fn -> Application.put_env(:axon_federation, :allow_private_addresses, true) end)
+
+    assert KeyCache.get_key(@server_name, "ed25519:whatever") == nil
+    assert FakeRemoteMatrixServer.requests(@port) == []
+  end
+
   # KNOWN GAP (not fixed here — flagged per plan's fix-small-flag-big policy):
   # KeyCache.cache_key_doc/2 never verifies the fetched key document's own
   # self-signature, nor checks the document's "server_name" field matches the

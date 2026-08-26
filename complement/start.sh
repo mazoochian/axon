@@ -56,6 +56,19 @@ export REGISTRATION_ENABLED=true
 # defense otherwise always blocks — see config/runtime.exs.
 export URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES=true
 
+# Same reasoning for remote *media* federation: every Complement homeserver
+# is reachable only at a private Docker network address, which axon's media
+# SSRF guard otherwise always blocks — see config/runtime.exs and
+# AxonFederation.AddressGuard.
+export FEDERATION_ALLOW_PRIVATE_ADDRESSES=true
+
+# Complement's Synapse-compat harness mints its admin/test accounts through
+# POST /_synapse/admin/v1/register, MACed with the shared secret its own
+# homeserver config hardcodes to "complement". That value used to be a
+# compiled-in literal in axon itself; it now comes from the environment and
+# the endpoint is simply absent when unset, so Complement has to set it here.
+export REGISTRATION_SHARED_SECRET=complement
+
 # Fixed path Complement copies one Synapse-style registration YAML into
 # per application service configured on this homeserver in the blueprint
 # (present even if the blueprint defines none — the directory just won't

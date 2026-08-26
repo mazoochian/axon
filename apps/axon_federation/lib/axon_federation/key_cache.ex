@@ -66,17 +66,23 @@ defmodule AxonFederation.KeyCache do
   # ---------------------------------------------------------------------------
 
   defp fetch_and_cache(server_name) do
-    url = resolve_key_url(server_name)
+    case resolve_key_url(server_name) do
+      {:ok, url} ->
+        case do_get(url) do
+          {:ok, body} ->
+            case Jason.decode(body) do
+              {:ok, doc} -> cache_key_doc(server_name, doc)
+              {:error, _} -> Logger.warning("KeyCache: invalid JSON from #{server_name}")
+            end
 
-    case do_get(url) do
-      {:ok, body} ->
-        case Jason.decode(body) do
-          {:ok, doc} -> cache_key_doc(server_name, doc)
-          {:error, _} -> Logger.warning("KeyCache: invalid JSON from #{server_name}")
+          {:error, reason} ->
+            Logger.warning(
+              "KeyCache: failed to fetch keys from #{server_name}: #{inspect(reason)}"
+            )
         end
 
-      {:error, reason} ->
-        Logger.warning("KeyCache: failed to fetch keys from #{server_name}: #{inspect(reason)}")
+      {:error, :blocked_address} ->
+        Logger.warning("KeyCache: refusing to fetch keys from #{server_name}: blocked address")
     end
   end
 
@@ -96,8 +102,17 @@ defmodule AxonFederation.KeyCache do
     end)
   end
 
+  # `server_name` here can come straight from an unauthenticated caller (the
+  # `origin` field of an inbound X-Matrix Authorization header, or an event's
+  # `sender`/`origin` during verification) rather than a room's own member
+  # list, so this goes through the same SSRF guard remote-media proxying
+  # uses rather than `ServerResolver.resolve/1` directly — see
+  # `ServerResolver.resolve_checked/1`.
   defp resolve_key_url(server_name) do
-    AxonFederation.ServerResolver.resolve(server_name) <> "/_matrix/key/v2/server"
+    case AxonFederation.ServerResolver.resolve_checked(server_name) do
+      {:ok, base_url} -> {:ok, base_url <> "/_matrix/key/v2/server"}
+      {:error, :blocked_address} -> {:error, :blocked_address}
+    end
   end
 
   defp do_get(url) do

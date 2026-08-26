@@ -972,6 +972,162 @@ defmodule AxonWeb.FederationControllerTest do
   end
 
   # ---------------------------------------------------------------------------
+  # send_transaction — cross-server sender forgery
+  #
+  # Signature verification used to pick the key-holding server out of the
+  # PDU's own `origin` field. Since every federating server publishes its
+  # signing key, that let anyone running a homeserver inject events
+  # *attributed to a user on somebody else's server* into any room they
+  # share: sign with your own key, set `origin` to yourself, and put the
+  # victim's ID in `sender`. Verification then checked the key that had
+  # really signed, and the event was applied as authentic.
+  #
+  # Two real fake servers with real keypairs here, one playing the victim's
+  # homeserver and one the attacker's, going in over real HTTP through the
+  # real /send route.
+  # ---------------------------------------------------------------------------
+
+  describe "PUT send_transaction/2 sender/signature binding" do
+    setup do
+      victim_port = 18_960 + System.unique_integer([:positive, :monotonic])
+      evil_port = 18_960 + System.unique_integer([:positive, :monotonic])
+      victim_hs = "fake-victim-hs-#{System.unique_integer([:positive])}.test"
+      evil_hs = "fake-evil-hs-#{System.unique_integer([:positive])}.test"
+
+      start_supervised!({FakeRemoteMatrixServer, port: victim_port, server_name: victim_hs})
+      start_supervised!({FakeRemoteMatrixServer, port: evil_port, server_name: evil_hs})
+
+      Application.put_env(:axon_federation, :server_overrides, %{
+        @server_name => "http://127.0.0.1:#{@port}",
+        victim_hs => "http://127.0.0.1:#{victim_port}",
+        evil_hs => "http://127.0.0.1:#{evil_port}"
+      })
+
+      owner = new_local_user("forgeowner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+
+      victim = remote_user_at(victim_port, "victim")
+      join_remote_member_at(victim_port, room_id, victim)
+
+      %{
+        room_id: room_id,
+        victim: victim,
+        victim_hs: victim_hs,
+        victim_port: victim_port,
+        evil_hs: evil_hs,
+        evil_port: evil_port
+      }
+    end
+
+    defp forgeable_message(room_id, sender, body) do
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      %{
+        "event_id" => "$forge_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => sender,
+        "content" => %{"msgtype" => "m.text", "body" => body},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "origin_server_ts" => System.os_time(:millisecond),
+        "hashes" => %{"sha256" => "x"}
+      }
+    end
+
+    test "a message attributed to a remote victim but signed by the attacker is not applied", %{
+      room_id: room_id,
+      victim: victim,
+      evil_hs: evil_hs,
+      evil_port: evil_port
+    } do
+      forged =
+        room_id
+        |> forgeable_message(victim, "I hereby resign")
+        |> Map.put("origin", evil_hs)
+        |> then(&FakeRemoteMatrixServer.sign_event(evil_port, &1, "11"))
+
+      # Attacker signs the *transaction* with their own key, which is
+      # legitimate — X-Matrix auth says who is talking to us, not who wrote
+      # the events inside.
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        signed_put_at(evil_port, "/_matrix/federation/v1/send/#{txn_id}", %{
+          "pdus" => [forged],
+          "edus" => []
+        })
+
+      # Per-PDU failures soft-fail rather than erroring the transaction.
+      assert conn.status == 200
+      assert EventStore.get_event(forged["event_id"]) == {:error, :not_found}
+
+      {head, _} = RoomProcess.get_position(room_id)
+      refute head == forged["event_id"]
+    end
+
+    test "the same trick on a state event attributed to the victim is not applied", %{
+      room_id: room_id,
+      victim: victim,
+      evil_hs: evil_hs,
+      evil_port: evil_port
+    } do
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      forged =
+        %{
+          "event_id" => "$forgestate_#{System.unique_integer([:positive])}",
+          "room_id" => room_id,
+          "type" => "m.room.member",
+          "state_key" => victim,
+          "sender" => victim,
+          "content" => %{"membership" => "leave"},
+          "depth" => depth + 1,
+          "prev_events" => [last_event_id],
+          "origin_server_ts" => System.os_time(:millisecond),
+          "hashes" => %{"sha256" => "x"}
+        }
+        |> Map.put("origin", evil_hs)
+        |> then(&FakeRemoteMatrixServer.sign_event(evil_port, &1, "11"))
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        signed_put_at(evil_port, "/_matrix/federation/v1/send/#{txn_id}", %{"pdus" => [forged]})
+
+      assert conn.status == 200
+      assert EventStore.get_event(forged["event_id"]) == {:error, :not_found}
+    end
+
+    test "the victim's own server can still send the very same message", %{
+      room_id: room_id,
+      victim: victim,
+      victim_hs: victim_hs,
+      victim_port: victim_port
+    } do
+      legit =
+        room_id
+        |> forgeable_message(victim, "I hereby resign")
+        |> Map.put("origin", victim_hs)
+        |> then(&FakeRemoteMatrixServer.sign_event(victim_port, &1, "11"))
+
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        signed_put_at(victim_port, "/_matrix/federation/v1/send/#{txn_id}", %{
+          "pdus" => [legit],
+          "edus" => []
+        })
+
+      assert conn.status == 200
+      assert {:ok, _stored} = EventStore.get_event(legit["event_id"])
+
+      {head, _} = RoomProcess.get_position(room_id)
+      assert head == legit["event_id"]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # send_transaction — ancestry-gap catch-up (AxonFederation.Backfill)
   # ---------------------------------------------------------------------------
 

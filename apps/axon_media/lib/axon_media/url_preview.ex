@@ -36,7 +36,6 @@ defmodule AxonMedia.UrlPreview do
 
   require Logger
   import Ecto.Query, only: [from: 2]
-  import Bitwise
   alias AxonCore.Repo
   alias AxonMedia.Store
 
@@ -350,59 +349,13 @@ defmodule AxonMedia.UrlPreview do
     not Application.get_env(:axon_media, :url_preview_allow_private_addresses, false)
   end
 
-  defp resolve(host) do
-    host_charlist = String.to_charlist(host)
+  # Resolution and the private/reserved-range predicate both live in
+  # AxonCore.NetworkAddress — shared verbatim with the remote-media SSRF
+  # guard (AxonFederation.AddressGuard), so the two can't drift apart on
+  # which ranges count as reachable.
+  defp resolve(host), do: AxonCore.NetworkAddress.resolve(host)
 
-    case :inet.parse_address(host_charlist) do
-      {:ok, ip} ->
-        {:ok, [ip]}
-
-      {:error, :einval} ->
-        case :inet.getaddrs(host_charlist, :inet) do
-          {:ok, v4} -> {:ok, v4 ++ resolve_v6(host_charlist)}
-          {:error, _} -> resolve_v6_only(host_charlist)
-        end
-    end
-  end
-
-  defp resolve_v6(host_charlist) do
-    case :inet.getaddrs(host_charlist, :inet6) do
-      {:ok, v6} -> v6
-      {:error, _} -> []
-    end
-  end
-
-  defp resolve_v6_only(host_charlist) do
-    case :inet.getaddrs(host_charlist, :inet6) do
-      {:ok, v6} -> {:ok, v6}
-      {:error, reason} -> {:error, {:dns_failed, reason}}
-    end
-  end
-
-  # IPv4 private/reserved ranges: 10/8, 172.16/12, 192.168/16, 127/8
-  # (loopback), 169.254/16 (link-local, incl. cloud metadata), 0/8, 100.64/10
-  # (CGNAT), 224/4 (multicast), 240/4 (reserved).
-  defp private_address?({10, _, _, _}), do: true
-  defp private_address?({127, _, _, _}), do: true
-  defp private_address?({169, 254, _, _}), do: true
-  defp private_address?({0, _, _, _}), do: true
-  defp private_address?({a, b, _, _}) when a == 172 and b in 16..31, do: true
-  defp private_address?({192, 168, _, _}), do: true
-  defp private_address?({100, b, _, _}) when b in 64..127, do: true
-  defp private_address?({a, _, _, _}) when a >= 224, do: true
-  # IPv6: ::1 loopback, fe80::/10 link-local, fc00::/7 unique-local, ::/128.
-  defp private_address?({0, 0, 0, 0, 0, 0, 0, 0}), do: true
-  defp private_address?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-  defp private_address?({a, _, _, _, _, _, _, _}) when (a &&& 0xFFC0) == 0xFE80, do: true
-  defp private_address?({a, _, _, _, _, _, _, _}) when (a &&& 0xFE00) == 0xFC00, do: true
-  # IPv4-mapped IPv6 (::ffff:a.b.c.d) — unwrap and re-check as IPv4.
-  defp private_address?({0, 0, 0, 0, 0, 0xFFFF, high, low}) do
-    private_address?({div(high, 256), rem(high, 256), div(low, 256), rem(low, 256)})
-  end
-
-  defp private_address?(_), do: false
-
-  import Bitwise
+  defp private_address?(address), do: AxonCore.NetworkAddress.private?(address)
 
   # ---------------------------------------------------------------------------
   # HTTP fetch (size + time capped)

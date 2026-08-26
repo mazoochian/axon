@@ -29,7 +29,7 @@ defmodule AxonFederation.MediaFetch do
   obscure.
   """
 
-  alias AxonFederation.HttpClient
+  alias AxonFederation.{AddressGuard, HttpClient, ServerResolver}
   require Logger
 
   @user_agent "Axon/1.0"
@@ -38,18 +38,26 @@ defmodule AxonFederation.MediaFetch do
   Fetch the original media. Returns `{:ok, content_type, body, filename}`
   (filename is `nil` if the remote didn't supply one via
   `Content-Disposition`) or `{:error, reason}`.
+
+  `server_name` arrives straight out of a client request URL, so it goes
+  through `ServerResolver.resolve_checked/1` first: `{:error, :blocked_address}`
+  when it names (or delegates to) a private/loopback/link-local address. See
+  `AxonFederation.AddressGuard`.
   """
   def download(server_name, media_id) do
-    fetch(
-      server_name,
-      "/_matrix/federation/v1/media/download/#{media_id}",
-      fn ->
-        legacy_fetch(
-          server_name,
-          "/_matrix/media/v3/download/#{server_name}/#{media_id}?allow_remote=false"
-        )
-      end
-    )
+    with {:ok, base_url} <- ServerResolver.resolve_checked(server_name) do
+      fetch(
+        server_name,
+        base_url,
+        "/_matrix/federation/v1/media/download/#{media_id}",
+        fn ->
+          legacy_fetch(
+            base_url,
+            "/_matrix/media/v3/download/#{server_name}/#{media_id}?allow_remote=false"
+          )
+        end
+      )
+    end
   end
 
   @doc "Fetch a thumbnail. Returns `{:ok, content_type, body, filename}` or `{:error, reason}`."
@@ -62,13 +70,15 @@ defmodule AxonFederation.MediaFetch do
     legacy_qs = URI.encode_query(Map.put(query, "allow_remote", "false"))
     legacy_path = "/_matrix/media/v3/thumbnail/#{server_name}/#{media_id}?#{legacy_qs}"
 
-    fetch(server_name, path, fn -> legacy_fetch(server_name, legacy_path) end)
+    with {:ok, base_url} <- ServerResolver.resolve_checked(server_name) do
+      fetch(server_name, base_url, path, fn -> legacy_fetch(base_url, legacy_path) end)
+    end
   end
 
   # ---------------------------------------------------------------------------
 
-  defp fetch(server_name, path, fallback) do
-    case HttpClient.get_raw(server_name, path) do
+  defp fetch(server_name, base_url, path, fallback) do
+    case HttpClient.get_raw(server_name, path, base_url) do
       {:ok, %{status: 200, headers: headers, body: body}} ->
         parse_multipart(headers, body)
 
@@ -205,7 +215,18 @@ defmodule AxonFederation.MediaFetch do
   # its own federation endpoints). `filename` is the one already parsed
   # from the multipart file part's own Content-Disposition — the redirect
   # target's response isn't required to (and by spec, need not) repeat it.
+  #
+  # The URL is guarded like the origin server name itself: it's a location
+  # chosen by a host the *caller* named, so following it unchecked would
+  # hand back the same SSRF primitive the guard on `server_name` just took
+  # away.
   defp follow_location(url, filename) do
+    with :ok <- AddressGuard.check_base_url(url) do
+      do_follow_location(url, filename)
+    end
+  end
+
+  defp do_follow_location(url, filename) do
     req = Finch.build(:get, url, [{"user-agent", @user_agent}])
 
     case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do
@@ -232,8 +253,10 @@ defmodule AxonFederation.MediaFetch do
   # Legacy fallback (deprecated, unauthenticated /_matrix/media/v3/...)
   # ---------------------------------------------------------------------------
 
-  defp legacy_fetch(server_name, path_with_query) do
-    base = AxonFederation.ServerResolver.resolve(server_name)
+  # `base` is the already-resolved, already-SSRF-checked base URL from the
+  # caller — re-resolving here would mean a second `.well-known` lookup
+  # whose (possibly different) answer never went through the guard.
+  defp legacy_fetch(base, path_with_query) do
     req = Finch.build(:get, base <> path_with_query, [{"user-agent", @user_agent}])
 
     case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do

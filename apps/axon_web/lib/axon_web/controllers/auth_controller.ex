@@ -6,6 +6,16 @@ defmodule AxonWeb.AuthController do
   plug(AxonWeb.Plug.RateLimit, [bucket: :login] when action == :login)
   plug(AxonWeb.Plug.RateLimit, [bucket: :register] when action == :register)
 
+  # The Synapse-compatible shared-secret admin bootstrap: unauthenticated by
+  # design (the HMAC MAC *is* the credential), so an IP limit is the only
+  # thing standing between an attacker and unlimited offline-style MAC
+  # guessing against a live server. Nonce issuance is limited too — it's the
+  # first half of the same flow.
+  plug(
+    AxonWeb.Plug.RateLimit,
+    [bucket: :admin_register] when action in [:synapse_nonce, :synapse_register]
+  )
+
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{UserStore, Repo}
 
@@ -233,16 +243,53 @@ defmodule AxonWeb.AuthController do
     json(conn, %{"id_server_unbind_result" => "success"})
   end
 
-  @synapse_shared_secret "complement"
+  # Shared secret for the Synapse-compatible admin bootstrap endpoints
+  # below. Read at request time from `:axon_web, :registration_shared_secret`
+  # — sourced from REGISTRATION_SHARED_SECRET in config/runtime.exs (prod),
+  # and from a fixed convenience value in config/dev.exs and config/test.exs
+  # (a throwaway local database is not worth per-run key management, and
+  # Complement's harness hardcodes "complement" as its own homeserver's
+  # registration_shared_secret).
+  #
+  # This used to be a compiled-in literal with no override, which meant every
+  # deployment shipped the *same* publicly-known secret — i.e. anyone could
+  # mint a full admin account on any Axon server. There is deliberately no
+  # fallback now: unset in prod and both endpoints below behave as if they
+  # don't exist (404 M_UNRECOGNIZED, same shape AxonWeb.Router gives any
+  # unrouted path), rather than degrading to a guessable default.
+  defp synapse_shared_secret do
+    case Application.get_env(:axon_web, :registration_shared_secret) do
+      secret when is_binary(secret) and secret != "" -> secret
+      _ -> nil
+    end
+  end
+
+  defp shared_secret_disabled_response(conn) do
+    conn
+    |> put_status(404)
+    |> json(%{"errcode" => "M_UNRECOGNIZED", "error" => "Unrecognized request"})
+  end
 
   # GET /_synapse/admin/v1/register
   def synapse_nonce(conn, _params) do
-    nonce = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
-    json(conn, %{"nonce" => nonce})
+    if is_nil(synapse_shared_secret()) do
+      shared_secret_disabled_response(conn)
+    else
+      nonce = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
+      json(conn, %{"nonce" => nonce})
+    end
   end
 
   # POST /_synapse/admin/v1/register
   def synapse_register(conn, params) do
+    if is_nil(synapse_shared_secret()) do
+      shared_secret_disabled_response(conn)
+    else
+      do_synapse_register(conn, params)
+    end
+  end
+
+  defp do_synapse_register(conn, params) do
     username = params["username"]
     password = params["password"] || ""
     nonce = params["nonce"] || ""
@@ -255,7 +302,7 @@ defmodule AxonWeb.AuthController do
         |> put_status(400)
         |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
 
-      mac != compute_synapse_mac(nonce, username, password, is_admin) ->
+      not valid_synapse_mac?(mac, nonce, username, password, is_admin) ->
         conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Invalid MAC"})
 
       true ->
@@ -488,9 +535,18 @@ defmodule AxonWeb.AuthController do
 
   defp validate_ui_auth(_user_id, _auth), do: :error
 
+  # Constant-time comparison (Plug.Crypto.secure_compare/2) rather than `==`,
+  # so a MAC guess can't be refined a byte at a time off the response timing.
+  defp valid_synapse_mac?(mac, nonce, username, password, is_admin) when is_binary(mac) do
+    expected = compute_synapse_mac(nonce, username, password, is_admin)
+    byte_size(mac) == byte_size(expected) and Plug.Crypto.secure_compare(mac, expected)
+  end
+
+  defp valid_synapse_mac?(_mac, _nonce, _username, _password, _is_admin), do: false
+
   defp compute_synapse_mac(nonce, username, password, is_admin) do
     admin_str = if is_admin, do: "admin", else: "notadmin"
     data = nonce <> "\x00" <> username <> "\x00" <> password <> "\x00" <> admin_str
-    :crypto.mac(:hmac, :sha, @synapse_shared_secret, data) |> Base.encode16(case: :lower)
+    :crypto.mac(:hmac, :sha, synapse_shared_secret(), data) |> Base.encode16(case: :lower)
   end
 end

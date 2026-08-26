@@ -11,6 +11,8 @@ defmodule AxonFederation.ServerResolver do
   delegation, then `https://<server_name>:8448`.
   """
 
+  alias AxonFederation.AddressGuard
+
   @user_agent "Axon/1.0"
 
   @doc "Returns the base URL (no trailing slash) to reach `server_name` at."
@@ -19,6 +21,27 @@ defmodule AxonFederation.ServerResolver do
     case overrides()[server_name] do
       nil -> resolve_dns(server_name)
       base_url -> base_url
+    end
+  end
+
+  @doc """
+  `resolve/1` with an SSRF guard around it, for callers whose `server_name`
+  came out of an untrusted request rather than out of a room's member list —
+  today that's remote-media proxying (`AxonFederation.MediaFetch`), whose
+  server_name is a path segment of an unauthenticated client endpoint.
+
+  The guard runs twice: once on `server_name` itself, *before* the
+  well-known fetch (which is an outbound request to that same caller-named
+  host), and once on whatever base URL resolution produced, since
+  `.well-known/matrix/server` delegation lets a public host redirect us to a
+  private one. See `AxonFederation.AddressGuard`.
+  """
+  @spec resolve_checked(String.t()) :: {:ok, String.t()} | {:error, :blocked_address}
+  def resolve_checked(server_name) do
+    with :ok <- AddressGuard.check_server_name(server_name),
+         base_url = resolve(server_name),
+         :ok <- AddressGuard.check_base_url(base_url) do
+      {:ok, base_url}
     end
   end
 

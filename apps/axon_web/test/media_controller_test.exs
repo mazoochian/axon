@@ -115,6 +115,94 @@ defmodule AxonWeb.MediaControllerTest do
   end
 
   # ---------------------------------------------------------------------------
+  # SSRF: `:server_name` on the download/thumbnail endpoints is a path
+  # segment supplied by the caller, and the legacy `/_matrix/media/v3/...`
+  # form takes no authentication at all — so before AxonFederation.AddressGuard
+  # existed, an anonymous request was enough to make the homeserver open a
+  # connection to any host:port on the internal network. The assertions that
+  # matter here are on a real listening socket: not "an error came back", but
+  # "nothing ever arrived at the attacker's port".
+  # ---------------------------------------------------------------------------
+
+  describe "remote media SSRF" do
+    setup do
+      previous = Application.get_env(:axon_federation, :allow_private_addresses)
+      Application.put_env(:axon_federation, :allow_private_addresses, false)
+      on_exit(fn -> Application.put_env(:axon_federation, :allow_private_addresses, previous) end)
+
+      {:ok, socket} =
+        :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false, reuseaddr: true])
+
+      {:ok, port} = :inet.port(socket)
+      on_exit(fn -> :gen_tcp.close(socket) end)
+
+      %{socket: socket, port: port}
+    end
+
+    test "an unauthenticated legacy download can't make the server dial loopback",
+         %{socket: socket, port: port} do
+      conn =
+        build_conn()
+        |> get("/_matrix/media/v3/download/127.0.0.1:#{port}/AAAAAAAAAAAAAAAAAAAAAAAA")
+
+      assert conn.status == 502
+      assert {:error, :timeout} = :gen_tcp.accept(socket, 300)
+    end
+
+    test "the authenticated MSC3916 download path is guarded identically",
+         %{socket: socket, port: port} do
+      alice = register("ssrf_authed_#{System.unique_integer([:positive])}")
+
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v1/media/download/127.0.0.1:#{port}/AAAAAAAAAAAAAAAAAAAAAAAA")
+
+      assert conn.status == 502
+      assert {:error, :timeout} = :gen_tcp.accept(socket, 300)
+    end
+
+    test "the thumbnail endpoint is guarded too", %{socket: socket, port: port} do
+      conn =
+        build_conn()
+        |> get(
+          "/_matrix/media/v3/thumbnail/127.0.0.1:#{port}/AAAAAAAAAAAAAAAAAAAAAAAA?width=32&height=32"
+        )
+
+      assert conn.status == 502
+      assert {:error, :timeout} = :gen_tcp.accept(socket, 300)
+    end
+
+    test "cloud instance metadata is not reachable" do
+      conn =
+        build_conn()
+        |> get("/_matrix/media/v3/download/169.254.169.254/latest%2Fmeta-data")
+
+      assert conn.status == 502
+    end
+
+    # A blocked target and a merely-unreachable one must be indistinguishable
+    # from outside, or the endpoint becomes an internal port scanner: the
+    # attacker reads "blocked" as "that address exists and is internal" and
+    # "connection refused" as "that address is reachable but nothing's
+    # listening". Same status, same body, both times.
+    test "a blocked target is indistinguishable from an unreachable public one", %{port: port} do
+      blocked =
+        build_conn()
+        |> get("/_matrix/media/v3/download/127.0.0.1:#{port}/AAAAAAAAAAAAAAAAAAAAAAAA")
+
+      # 192.0.2.0/24 is TEST-NET-1: public as far as the guard is concerned,
+      # and reliably not routable to anything.
+      unreachable =
+        build_conn()
+        |> get("/_matrix/media/v3/download/192.0.2.1:8448/AAAAAAAAAAAAAAAAAAAAAAAA")
+
+      assert blocked.status == unreachable.status
+      assert blocked.resp_body == unreachable.resp_body
+      assert decode(blocked)["errcode"] == "M_UNKNOWN"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Content-Disposition / filename (previously: ?filename= was read at
   # upload time and immediately discarded, and download always hardcoded
   # `Content-Disposition: inline` with no filename at all, regardless of

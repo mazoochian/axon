@@ -83,8 +83,13 @@ defmodule AxonFederation.HttpClient do
   verbatim: it's both the URL suffix and (per the federation request
   signing spec) part of the signed request-target, exactly like `get/2`.
   """
-  def get_raw(server_name, path) do
-    url = build_url(server_name, path)
+  # `base_url` lets a caller that has *already* resolved (and, in the media
+  # case, SSRF-checked) the destination reuse that answer instead of paying
+  # for — and, more importantly, re-deciding — a second `.well-known`
+  # lookup here. A well-known answer that changed between the check and the
+  # request would otherwise land outside the guard.
+  def get_raw(server_name, path, base_url \\ nil) do
+    url = (base_url || AxonFederation.ServerResolver.resolve(server_name)) <> path
     auth = build_auth_header(server_name, "GET", path, nil)
 
     req =

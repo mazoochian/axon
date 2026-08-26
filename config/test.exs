@@ -53,6 +53,25 @@ config :axon_web, :rate_limits,
   media_upload: [max: 1_000_000, window_ms: 60_000],
   url_preview: [max: 1_000_000, window_ms: 60_000],
   search: [max: 1_000_000, window_ms: 60_000],
-  sync: [max: 1_000_000, window_ms: 60_000]
+  sync: [max: 1_000_000, window_ms: 60_000],
+  admin_register: [max: 1_000_000, window_ms: 60_000]
+
+# Fixed convenience value for the shared-secret admin bootstrap
+# (`/_synapse/admin/v1/register`) — prod requires REGISTRATION_SHARED_SECRET
+# from the environment and disables the endpoint outright when it's unset.
+# Matches what complement/start.sh exports, since Complement's own harness
+# hardcodes "complement" as the registration shared secret.
+config :axon_web, :registration_shared_secret, "complement"
+
+# Remote-media/key fetches are SSRF-guarded against private/loopback/
+# link-local addresses (AxonFederation.AddressGuard), which every fake
+# remote server in this suite is — they're Bandit listeners on 127.0.0.1
+# reached via `:server_overrides`. Unlike `:axon_media,
+# :url_preview_allow_private_addresses` below (which individual tests flip
+# on only where they specifically need to reach a loopback fixture), this
+# stays on suite-wide: fake remote servers are pervasive across the
+# federation test suite, not a handful of opt-in cases.
+config :axon_federation, :allow_private_addresses, true
+config :axon_media, :url_preview_allow_private_addresses, false
 
 config :logger, level: :warning

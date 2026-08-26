@@ -1,5 +1,15 @@
 import Config
 
+# Last-resort `secret_key_base` for the two endpoints below, used only when
+# nothing else supplies one — dev/test set their own literal, and prod takes
+# it from SECRET_KEY_BASE in config/runtime.exs, which *raises* rather than
+# defaulting. This used to be `String.duplicate("a", 64)`: a fixed, published
+# value keying every signed/encrypted cookie, CSRF token and Phoenix.Token
+# the server issues, and therefore forgeable by anyone who has read this
+# repo. Random per build instead, so an unconfigured endpoint is at worst
+# useless across restarts rather than trivially forgeable.
+random_secret_key_base = fn -> 48 |> :crypto.strong_rand_bytes() |> Base.encode64() end
+
 # Server identity
 config :axon_web,
   server_name: System.get_env("AXON_SERVER_NAME", "localhost")
@@ -76,7 +86,7 @@ config :axon_web, AxonWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   http: [ip: {0, 0, 0, 0}, port: 8008],
   url: [host: "localhost"],
-  secret_key_base: System.get_env("SECRET_KEY_BASE", String.duplicate("a", 64)),
+  secret_key_base: System.get_env("SECRET_KEY_BASE") || random_secret_key_base.(),
   render_errors: [
     formats: [json: AxonWeb.FallbackController],
     layout: false
@@ -96,7 +106,7 @@ config :axon_web, AxonWeb.FederationEndpoint,
   adapter: Bandit.PhoenixAdapter,
   http: [ip: {0, 0, 0, 0}, port: 8448],
   url: [host: "localhost"],
-  secret_key_base: System.get_env("SECRET_KEY_BASE", String.duplicate("a", 64)),
+  secret_key_base: System.get_env("SECRET_KEY_BASE") || random_secret_key_base.(),
   render_errors: [formats: [json: AxonWeb.FallbackController], layout: false],
   pubsub_server: Axon.PubSub
 
@@ -115,7 +125,16 @@ config :axon_web, :rate_limits,
   media_upload: [max: 20, window_ms: 60_000],
   url_preview: [max: 20, window_ms: 60_000],
   search: [max: 20, window_ms: 60_000],
-  sync: [max: 300, window_ms: 60_000]
+  sync: [max: 300, window_ms: 60_000],
+  admin_register: [max: 5, window_ms: 60_000]
+
+# Shared secret for the Synapse-compatible `/_synapse/admin/v1/register`
+# bootstrap endpoint. No default on purpose: nil means the endpoint (and its
+# nonce companion) answer 404 M_UNRECOGNIZED instead of accepting a MAC
+# computed with a value an attacker could read out of this repo. prod sources
+# it from REGISTRATION_SHARED_SECRET (config/runtime.exs); dev/test set a
+# fixed convenience value. See AxonWeb.AuthController.
+config :axon_web, :registration_shared_secret, nil
 
 # Media storage backend: :local or :s3
 config :axon_media,

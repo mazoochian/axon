@@ -70,6 +70,17 @@ if config_env() == :prod do
   config :axon_web, :registration,
     enabled: System.get_env("REGISTRATION_ENABLED", "false") == "true"
 
+  # Shared secret for the Synapse-compatible `/_synapse/admin/v1/register`
+  # bootstrap (and its nonce endpoint). Deliberately *not* defaulted: leave
+  # REGISTRATION_SHARED_SECRET unset and both endpoints answer 404
+  # M_UNRECOGNIZED, which is the right posture for a deployment that already
+  # has its admins. This replaces a compiled-in literal ("complement") that
+  # shipped identically in every build — i.e. a publicly-known key to a
+  # full-admin account on any Axon server. Generate with `openssl rand -hex 32`
+  # if you need the bootstrap; complement/start.sh sets it to "complement",
+  # the value Complement's own harness expects. See AxonWeb.AuthController.
+  config :axon_web, :registration_shared_secret, System.get_env("REGISTRATION_SHARED_SECRET")
+
   # Off unless explicitly turned on — a real deployment must keep blocking
   # SSRF-risky private/loopback/link-local targets. complement/start.sh sets
   # URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES=true because Complement's own
@@ -78,6 +89,18 @@ if config_env() == :prod do
   config :axon_media,
     url_preview_allow_private_addresses:
       System.get_env("URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES", "false") == "true"
+
+  # Same shape, same reasoning, for remote *media* fetches: the
+  # download/thumbnail endpoints take the origin server name straight out of
+  # the request URL, so without this guard an unauthenticated client can aim
+  # the homeserver's outbound connection at any internal address it likes.
+  # Off unless explicitly turned on. complement/start.sh sets
+  # FEDERATION_ALLOW_PRIVATE_ADDRESSES=true because every Complement
+  # homeserver lives on a private Docker network address — see
+  # AxonFederation.AddressGuard.
+  config :axon_federation,
+    allow_private_addresses:
+      System.get_env("FEDERATION_ALLOW_PRIVATE_ADDRESSES", "false") == "true"
 
   # Optional — leave AXON_APPSERVICE_DIR unset outside Complement.
   # complement/start.sh sets this to /complement/appservice, the fixed
@@ -119,7 +142,8 @@ if config_env() == :prod do
       media_upload: [max: 1_000_000, window_ms: 60_000],
       url_preview: [max: 1_000_000, window_ms: 60_000],
       search: [max: 1_000_000, window_ms: 60_000],
-      sync: [max: 1_000_000, window_ms: 60_000]
+      sync: [max: 1_000_000, window_ms: 60_000],
+      admin_register: [max: 1_000_000, window_ms: 60_000]
   end
 
   # Real Matrix federation is TLS-only. In a typical deployment that

@@ -302,13 +302,7 @@ defmodule AxonWeb.MediaController do
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Remote media not found"})
 
       {:error, reason} ->
-        Logger.warning(
-          "Remote media fetch failed for #{origin_server}/#{media_id}: #{inspect(reason)}"
-        )
-
-        conn
-        |> put_status(502)
-        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to fetch remote media"})
+        remote_fetch_failed(conn, origin_server, media_id, reason)
     end
   end
 
@@ -327,14 +321,25 @@ defmodule AxonWeb.MediaController do
         |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Remote media not found"})
 
       {:error, reason} ->
-        Logger.warning(
-          "Remote thumbnail fetch failed for #{origin_server}/#{media_id}: #{inspect(reason)}"
-        )
-
-        conn
-        |> put_status(502)
-        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to fetch remote media"})
+        remote_fetch_failed(conn, origin_server, media_id, reason)
     end
+  end
+
+  # One response for every way a remote fetch can fail short of a clean 404:
+  # a blocked private/loopback target, a refused connection, a timeout, a
+  # 5xx. `:server_name` is caller-chosen on these endpoints, so distinct
+  # responses would turn them into an internal-network port scanner — the
+  # attacker learns from "connection refused" vs "blocked" vs "timed out"
+  # exactly what the guard exists to hide. The distinction stays in the
+  # server's own logs, where it belongs.
+  defp remote_fetch_failed(conn, origin_server, media_id, reason) do
+    Logger.warning(
+      "Remote media fetch failed for #{origin_server}/#{media_id}: #{inspect(reason)}"
+    )
+
+    conn
+    |> put_status(502)
+    |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to fetch remote media"})
   end
 
   # ---------------------------------------------------------------------------
