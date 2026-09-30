@@ -40,12 +40,18 @@ defmodule AxonCrypto.EventHash do
   """
   @spec content_hash(map()) :: binary()
   def content_hash(event) do
-    event |> content_hash_bytes() |> Base.encode64(padding: false)
+    event
+    |> content_hash_payload()
+    |> CanonicalJSON.encode_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode64(padding: false)
   end
 
   @doc """
   Checks an event's own `hashes.sha256` against a freshly computed content
-  hash. `:ok`, or `{:error, :missing_content_hash | :content_hash_mismatch}`.
+  hash. `:ok`, or `{:error, :missing_content_hash | :content_hash_mismatch}`
+  (`:invalid_canonical_json` when the event contains floats or other values
+  canonical JSON cannot represent). Never raises on malformed input.
 
   Unlike the signature — which is computed over the *redacted* event, and so
   says nothing about any field redaction strips — this covers the event
@@ -67,26 +73,23 @@ defmodule AxonCrypto.EventHash do
   a peer spelled them in is not something to fail an event over.
   """
   @spec verify_content_hash(map()) ::
-          :ok | {:error, :missing_content_hash | :content_hash_mismatch}
+          :ok
+          | {:error, :missing_content_hash | :content_hash_mismatch | :invalid_canonical_json}
   def verify_content_hash(event) when is_map(event) do
-    with claimed when is_binary(claimed) <- get_in(event, ["hashes", "sha256"]),
-         {:ok, claimed_bytes} <- decode_unpadded_base64(claimed) do
-      if claimed_bytes == content_hash_bytes(event),
+    with %{"hashes" => %{"sha256" => claimed}} when is_binary(claimed) <- event,
+         {:ok, claimed_bytes} <- decode_unpadded_base64(claimed),
+         {:ok, payload} <- CanonicalJSON.safe_encode_to_binary(content_hash_payload(event)) do
+      if claimed_bytes == :crypto.hash(:sha256, payload),
         do: :ok,
         else: {:error, :content_hash_mismatch}
     else
-      nil -> {:error, :missing_content_hash}
       :error -> {:error, :content_hash_mismatch}
+      {:error, _} = error -> error
       _ -> {:error, :missing_content_hash}
     end
   end
 
-  defp content_hash_bytes(event) do
-    event
-    |> Map.drop(["hashes" | @non_content_fields])
-    |> CanonicalJSON.encode_to_binary()
-    |> then(&:crypto.hash(:sha256, &1))
-  end
+  defp content_hash_payload(event), do: Map.drop(event, ["hashes" | @non_content_fields])
 
   defp decode_unpadded_base64(str) do
     case Base.decode64(str, padding: false) do
@@ -130,46 +133,22 @@ defmodule AxonCrypto.EventHash do
   """
   @spec sign_event(map(), binary(), binary(), binary(), binary()) :: map()
   def sign_event(event, server_name, key_id, private_key, room_version) do
-    signable =
-      event
-      |> Redaction.redact(room_version)
-      |> Map.drop(@non_content_fields)
-      |> CanonicalJSON.encode_to_binary()
-
-    sig_bytes = :crypto.sign(:eddsa, :none, signable, [private_key, :ed25519])
-    sig_b64 = Base.encode64(sig_bytes, padding: false)
-
-    existing_sigs = Map.get(event, "signatures", %{})
-    server_sigs = Map.get(existing_sigs, server_name, %{})
-    new_server_sigs = Map.put(server_sigs, key_id, sig_b64)
-    new_sigs = Map.put(existing_sigs, server_name, new_server_sigs)
-
-    Map.put(event, "signatures", new_sigs)
+    add_signature(event, signable_event(event, room_version), server_name, key_id, private_key)
   end
 
   @doc """
   Verifies a signature on an event.
 
-  Returns :ok or {:error, reason}.
+  Returns :ok or {:error, reason}; never raises on malformed input.
   """
   @spec verify_signature(map(), binary(), binary(), binary(), binary()) ::
           :ok | {:error, :invalid_signature | :missing_signature}
-  def verify_signature(event, server_name, key_id, public_key, room_version) do
-    with {:ok, sig_b64} <- get_signature(event, server_name, key_id),
-         {:ok, sig_bytes} <- Base.decode64(sig_b64, padding: false) do
-      signable =
-        event
-        |> Redaction.redact(room_version)
-        |> Map.drop(@non_content_fields)
-        |> CanonicalJSON.encode_to_binary()
-
-      if :crypto.verify(:eddsa, :none, signable, sig_bytes, [public_key, :ed25519]) do
-        :ok
-      else
-        {:error, :invalid_signature}
-      end
-    end
+  def verify_signature(event, server_name, key_id, public_key, room_version) when is_map(event) do
+    verify_signed(event, signable_event(event, room_version), server_name, key_id, public_key)
   end
+
+  def verify_signature(_event, _server_name, _key_id, _public_key, _room_version),
+    do: {:error, :missing_signature}
 
   @doc """
   Signs a plain JSON object that is **not** a room event — the counterpart of
@@ -177,20 +156,7 @@ defmodule AxonCrypto.EventHash do
   """
   @spec sign_json(map(), binary(), binary(), binary()) :: map()
   def sign_json(object, signer, key_id, private_key) do
-    signable =
-      object
-      |> Map.drop(["signatures", "unsigned"])
-      |> CanonicalJSON.encode_to_binary()
-
-    sig_bytes = :crypto.sign(:eddsa, :none, signable, [private_key, :ed25519])
-    sig_b64 = Base.encode64(sig_bytes, padding: false)
-
-    signatures =
-      object
-      |> Map.get("signatures", %{})
-      |> Map.update(signer, %{key_id => sig_b64}, &Map.put(&1, key_id, sig_b64))
-
-    Map.put(object, "signatures", signatures)
+    add_signature(object, signable_json(object), signer, key_id, private_key)
   end
 
   @doc """
@@ -204,27 +170,71 @@ defmodule AxonCrypto.EventHash do
   """
   @spec verify_json_signature(map(), binary(), binary(), binary()) ::
           :ok | {:error, :invalid_signature | :missing_signature}
-  def verify_json_signature(object, signer, key_id, public_key) do
-    with {:ok, sig_b64} <- get_signature(object, signer, key_id),
-         {:ok, sig_bytes} <- Base.decode64(sig_b64, padding: false) do
-      signable =
-        object
-        |> Map.drop(["signatures", "unsigned"])
-        |> CanonicalJSON.encode_to_binary()
+  def verify_json_signature(object, signer, key_id, public_key) when is_map(object) do
+    verify_signed(object, signable_json(object), signer, key_id, public_key)
+  end
 
-      if :crypto.verify(:eddsa, :none, signable, sig_bytes, [public_key, :ed25519]) do
-        :ok
-      else
-        {:error, :invalid_signature}
+  def verify_json_signature(_object, _signer, _key_id, _public_key),
+    do: {:error, :missing_signature}
+
+  @doc "Signs raw bytes with an Ed25519 private key; returns the unpadded base64 signature."
+  @spec sign_bytes(binary(), binary()) :: binary()
+  def sign_bytes(payload, private_key) do
+    :crypto.sign(:eddsa, :none, payload, [private_key, :ed25519])
+    |> Base.encode64(padding: false)
+  end
+
+  defp signable_event(event, room_version) do
+    event
+    |> Redaction.redact(room_version)
+    |> Map.drop(@non_content_fields)
+  end
+
+  defp signable_json(object), do: Map.drop(object, ["signatures", "unsigned"])
+
+  defp add_signature(object, signable, signer, key_id, private_key) do
+    sig_b64 = signable |> CanonicalJSON.encode_to_binary() |> sign_bytes(private_key)
+
+    signatures =
+      case object["signatures"] do
+        %{} = sigs -> sigs
+        _ -> %{}
       end
+      |> Map.update(signer, %{key_id => sig_b64}, &Map.put(&1, key_id, sig_b64))
+
+    Map.put(object, "signatures", signatures)
+  end
+
+  defp verify_signed(object, signable, signer, key_id, public_key) do
+    with {:ok, sig_bytes} <- fetch_signature(object, signer, key_id),
+         {:ok, payload} <- CanonicalJSON.safe_encode_to_binary(signable),
+         true <- ed25519_valid?(payload, sig_bytes, public_key) do
+      :ok
+    else
+      {:error, :missing_signature} = error -> error
+      _ -> {:error, :invalid_signature}
     end
   end
 
-  defp get_signature(event, server_name, key_id) do
-    case get_in(event, ["signatures", server_name, key_id]) do
-      nil -> {:error, :missing_signature}
-      sig -> {:ok, sig}
+  defp fetch_signature(%{"signatures" => %{} = signatures}, signer, key_id) do
+    case signatures do
+      %{^signer => %{^key_id => sig_b64}} when is_binary(sig_b64) ->
+        Base.decode64(sig_b64, padding: false)
+
+      %{^signer => %{^key_id => _}} ->
+        :error
+
+      _ ->
+        {:error, :missing_signature}
     end
+  end
+
+  defp fetch_signature(_object, _signer, _key_id), do: {:error, :missing_signature}
+
+  defp ed25519_valid?(payload, sig_bytes, public_key) do
+    :crypto.verify(:eddsa, :none, payload, sig_bytes, [public_key, :ed25519])
+  rescue
+    _ -> false
   end
 
   defp sha256_b64url(data) do

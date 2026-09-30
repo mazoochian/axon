@@ -1,18 +1,5 @@
 defmodule AxonCrypto do
   @moduledoc """
-  Documentation for `AxonCrypto`.
+  Matrix canonical JSON, redaction, event hashing and signing.
   """
-
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> AxonCrypto.hello()
-      :world
-
-  """
-  def hello do
-    :world
-  end
 end

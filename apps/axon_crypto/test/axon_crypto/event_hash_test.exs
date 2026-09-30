@@ -121,6 +121,24 @@ defmodule AxonCrypto.EventHashTest do
                  Map.put(event, "hashes", %{"sha256" => "not base64!!"})
                )
     end
+
+    test "malformed hashes or unencodable content return errors instead of raising" do
+      event = %{"type" => "m.room.message", "content" => %{"body" => "hello"}}
+
+      for hashes <- ["sha256", ["x"], 42] do
+        assert {:error, :missing_content_hash} ==
+                 EventHash.verify_content_hash(Map.put(event, "hashes", hashes))
+      end
+
+      hash = EventHash.content_hash(event)
+
+      float_event =
+        event
+        |> Map.put("hashes", %{"sha256" => hash})
+        |> put_in(["content", "n"], 1.5)
+
+      assert {:error, :invalid_canonical_json} == EventHash.verify_content_hash(float_event)
+    end
   end
 
   describe "reference_hash/2" do
@@ -214,6 +232,44 @@ defmodule AxonCrypto.EventHashTest do
                EventHash.verify_signature(event, "example.com", "ed25519:abc", pub, "11")
     end
 
+    test "malformed signatures return errors instead of raising", %{
+      public_key: pub,
+      private_key: priv
+    } do
+      event = %{"type" => "m.room.member", "content" => %{"membership" => "join"}}
+      verify = &EventHash.verify_signature(&1, "example.com", "ed25519:abc", pub, "11")
+
+      for sigs <- ["x", ["x"], %{"example.com" => "x"}, %{"example.com" => ["x"]}] do
+        assert {:error, :missing_signature} == verify.(Map.put(event, "signatures", sigs))
+      end
+
+      for sig <- [42, "not base64!!", "AAAA"] do
+        signed = Map.put(event, "signatures", %{"example.com" => %{"ed25519:abc" => sig}})
+        assert {:error, :invalid_signature} == verify.(signed)
+      end
+
+      signed = EventHash.sign_event(event, "example.com", "ed25519:abc", priv, "11")
+
+      assert {:error, :invalid_signature} == verify.(Map.put(signed, "depth", 1.5))
+
+      assert {:error, :invalid_signature} ==
+               EventHash.verify_signature(signed, "example.com", "ed25519:abc", "short", "11")
+
+      assert {:error, :missing_signature} ==
+               EventHash.verify_json_signature(%{"signatures" => "x"}, "a", "ed25519:k", pub)
+    end
+
+    test "sign_json/4 and verify_json_signature/4 round-trip", %{
+      public_key: pub,
+      private_key: priv
+    } do
+      signed = EventHash.sign_json(%{"a" => 1, "unsigned" => %{}}, "a", "ed25519:k", priv)
+      assert :ok == EventHash.verify_json_signature(signed, "a", "ed25519:k", pub)
+
+      assert {:error, :invalid_signature} ==
+               EventHash.verify_json_signature(Map.put(signed, "a", 2), "a", "ed25519:k", pub)
+    end
+
     test "signature is invalidated if a signed field changes", %{
       public_key: pub,
       private_key: priv
@@ -265,7 +321,8 @@ defmodule AxonCrypto.EventHashTest do
       event_id = EventHash.reference_hash(signed, "11")
       with_event_id = Map.put(signed, "event_id", event_id)
 
-      assert :ok == EventHash.verify_signature(with_event_id, "example.com", "ed25519:abc", pub, "11")
+      assert :ok ==
+               EventHash.verify_signature(with_event_id, "example.com", "ed25519:abc", pub, "11")
     end
   end
 end

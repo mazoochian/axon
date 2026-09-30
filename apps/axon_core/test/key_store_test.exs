@@ -217,6 +217,20 @@ defmodule AxonCore.KeyStoreTest do
       assert claim2 == claim1
     end
 
+    test "claiming the fallback key marks it used" do
+      insert_fallback_key(@alice, "DEV1", "curve25519", "curve25519:FALLBACK1", %{"key" => "v"})
+
+      assert %{"curve25519:FALLBACK1" => _} =
+               KeyStore.claim_one_time_key(@alice, "DEV1", "curve25519")
+
+      assert Repo.one(
+               from(fk in "fallback_keys",
+                 where: fk.user_id == ^@alice and fk.device_id == "DEV1",
+                 select: fk.used
+               )
+             )
+    end
+
     test "prefers a real OTK over the fallback key when both exist" do
       insert_otk(@alice, "DEV1", "curve25519", "curve25519:REAL1", %{"key" => "realval"})
 

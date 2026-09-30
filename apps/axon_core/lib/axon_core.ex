@@ -1,18 +1,5 @@
 defmodule AxonCore do
   @moduledoc """
-  Documentation for `AxonCore`.
+  Core persistence and shared helpers for the Axon homeserver.
   """
-
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> AxonCore.hello()
-      :world
-
-  """
-  def hello do
-    :world
-  end
 end

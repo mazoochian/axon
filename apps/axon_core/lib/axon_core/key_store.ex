@@ -116,7 +116,7 @@ defmodule AxonCore.KeyStore do
     end)
   end
 
-  @doc "Atomically claims one unused OTK, falling back to the (non-consumed) fallback key."
+  @doc "Atomically claims one unused OTK, falling back to the fallback key (reusable, but marked used)."
   def claim_one_time_key(user_id, device_id, algorithm) do
     result =
       Repo.transaction(fn ->
@@ -142,17 +142,20 @@ defmodule AxonCore.KeyStore do
 
           %{row.key_id => row.key_json}
         else
-          case Repo.one(
+          # Fallback keys are reusable, but a claim marks them used so /sync
+          # stops listing the algorithm in device_unused_fallback_key_types.
+          case Repo.update_all(
                  from(fk in "fallback_keys",
                    where:
                      fk.user_id == ^user_id and
                        fk.device_id == ^device_id and
                        fk.algorithm == ^algorithm,
                    select: %{key_id: fk.key_id, key_json: fk.key_json}
-                 )
+                 ),
+                 set: [used: true]
                ) do
-            nil -> nil
-            fk -> %{fk.key_id => fk.key_json}
+            {0, _} -> nil
+            {_, [fk | _]} -> %{fk.key_id => fk.key_json}
           end
         end
       end)

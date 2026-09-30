@@ -55,7 +55,7 @@ defmodule AxonCore.MatrixId do
 
   def from_server?(_id, _server), do: false
 
-  @server_name_re ~r/^(\[[0-9a-fA-F:]+\](:\d+)?|[^:\[\]]+(:\d+)?)$/
+  @server_name_re ~r/\A(\[[0-9a-fA-F:]+\](:\d+)?|[^:\[\]\s]+(:\d+)?)\z/
 
   @doc """
   True when `server` is a syntactically valid Matrix server name —
@@ -84,7 +84,7 @@ defmodule AxonCore.MatrixId do
   # anything outside it. Uppercase is tolerated here (and folded to lower
   # by the caller) because historical accounts exist with it — the spec
   # calls those "historical user IDs" that servers should still accept.
-  @localpart_re ~r/^[a-z0-9._\-=\/]+$/i
+  @localpart_re ~r/\A[a-z0-9._\-=\/]+\z/i
 
   @doc """
   True when `localpart` is a usable Matrix localpart.
@@ -109,4 +109,26 @@ defmodule AxonCore.MatrixId do
     do: Regex.match?(@localpart_re, localpart)
 
   def valid_localpart?(_), do: false
+
+  @doc """
+  True when `id` is a syntactically valid room ID: `!opaque:server`, or a
+  room-version-12 `!hash` with no server part (MSC4291).
+
+      iex> AxonCore.MatrixId.valid_room_id?("!abc:example.com")
+      true
+
+      iex> AxonCore.MatrixId.valid_room_id?("!Y2jV2Kbg0eDC5mDvNZKnJeFYUbkcQCvEfDREs3HAvlw")
+      true
+
+      iex> AxonCore.MatrixId.valid_room_id?("!:example.com")
+      false
+  """
+  def valid_room_id?("!" <> rest) do
+    case String.split(rest, ":", parts: 2) do
+      [opaque] -> opaque != ""
+      [opaque, server] -> opaque != "" and valid_server_name?(server)
+    end
+  end
+
+  def valid_room_id?(_), do: false
 end
