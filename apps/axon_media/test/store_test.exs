@@ -145,6 +145,24 @@ defmodule AxonMedia.StoreTest do
                {:error, :already_uploaded}
     end
 
+    test "concurrent fill-ins of one reservation: exactly one wins, and its content is kept" do
+      {:ok, media_id} = Store.create_pending("@alice:localhost", "localhost")
+
+      results =
+        1..5
+        |> Enum.map(fn i ->
+          Task.async(fn ->
+            {i, Store.complete_upload(media_id, "@alice:localhost", "text/plain", "body #{i}")}
+          end)
+        end)
+        |> Enum.map(&Task.await/1)
+
+      assert [{winner, {:ok, ^media_id}}] = Enum.filter(results, &match?({_, {:ok, _}}, &1))
+      assert Enum.count(results, &match?({_, {:error, :already_uploaded}}, &1)) == 4
+      winning_body = "body #{winner}"
+      assert {:ok, %{data: ^winning_body}} = Store.download(media_id)
+    end
+
     test "complete_upload_precheck reports :not_found for an unknown media_id" do
       assert Store.complete_upload_precheck("nonexistent", "@alice:localhost") ==
                {:error, :not_found}

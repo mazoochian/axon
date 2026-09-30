@@ -192,11 +192,6 @@ config :phoenix, :filter_parameters, ["password", "token", "mac", "secret"]
 # fixed convenience value. See AxonWeb.AuthController.
 config :axon_web, :registration_shared_secret, nil
 
-# Media storage backend: :local or :s3
-config :axon_media,
-  backend: :local,
-  local_path: "priv/media"
-
 # Logger
 config :logger, :console,
   format: "$time $metadata[$level] $message\n",

@@ -138,4 +138,19 @@ defmodule AxonMedia.ThumbnailerTest do
 
     assert {:error, _reason} = Thumbnailer.generate(id, src, "image/png", 20, 20, "scale")
   end
+
+  test "a file stored as image/png but actually SVG is not decoded by a sniffed coder", %{
+    media_id: id
+  } do
+    src = Path.join(AxonMedia.Store.base_dir(), "fake.png")
+    File.write!(src, ~s(<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>))
+
+    assert {:error, :convert_failed} = Thumbnailer.generate(id, src, "image/png", 8, 8, "scale")
+  end
+
+  test "no temp files are left behind in the thumbnail cache", %{source_path: src, media_id: id} do
+    assert {:ok, _} = Thumbnailer.generate(id, src, "image/png", 12, 12, "crop")
+    files = File.ls!(Path.join(AxonMedia.Store.base_dir(), "thumbnails"))
+    assert files == ["#{id}-12x12-crop.png"]
+  end
 end

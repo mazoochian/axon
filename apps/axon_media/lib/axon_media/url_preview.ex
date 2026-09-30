@@ -10,7 +10,7 @@ defmodule AxonMedia.UrlPreview do
       and *every* returned address is checked, against private/loopback/
       link-local/multicast/reserved ranges (IPv4 and IPv6, including
       IPv4-mapped IPv6)
-    - redirects are followed manually (capped at #{inspect(3)} hops) with
+    - redirects are followed manually (capped at 3 hops) with
       the same validation re-applied to every hop, rather than letting the
       HTTP client silently follow a redirect into a blocked address
     - response size and total time are capped
@@ -35,14 +35,17 @@ defmodule AxonMedia.UrlPreview do
   """
 
   require Logger
+  import Bitwise
   import Ecto.Query, only: [from: 2]
-  alias AxonCore.Repo
+  import AxonCore.MapUtil, only: [maybe_put: 3]
+  alias AxonCore.{NetworkAddress, Repo}
   alias AxonMedia.Store
 
   @max_body_bytes 5 * 1024 * 1024
   @max_redirects 3
   @fetch_timeout 10_000
   @cache_ttl_seconds 3600
+  @image_keys ~w(og:image matrix:image:size og:image:width og:image:height)
 
   @doc """
   Returns `{:ok, og_data}` (a map of "og:..." keys per spec, `og:image`
@@ -50,21 +53,36 @@ defmodule AxonMedia.UrlPreview do
   `server_name` is used only to mint the `mxc://` URI for a rehosted image.
   """
   def fetch(url, server_name) do
-    case cached(url) do
-      {:ok, data} ->
-        {:ok, data}
+    with_cache(url, fn -> fetch_and_parse(url, server_name) end)
+  end
 
-      :miss ->
-        with {:ok, data} <- fetch_and_parse(url, @max_redirects, server_name) do
-          cache_put(url, data)
-          {:ok, data}
-        end
+  # og:image is fetched through this image-only path: it never parses HTML,
+  # so a page whose og:image points back at itself (or at another page)
+  # can't recurse.
+  defp fetch_image(url, server_name) do
+    case with_cache(url, fn -> fetch_and_rehost_image(url, server_name) end) do
+      {:ok, %{"og:image" => "mxc://" <> _} = data} -> {:ok, Map.take(data, @image_keys)}
+      {:ok, _} -> {:error, :not_an_image}
+      err -> err
     end
   end
 
   # ---------------------------------------------------------------------------
   # Cache
   # ---------------------------------------------------------------------------
+
+  defp with_cache(url, fun) do
+    case cached(url) do
+      {:ok, data} ->
+        {:ok, data}
+
+      :miss ->
+        with {:ok, data} <- fun.() do
+          cache_put(url, data)
+          {:ok, data}
+        end
+    end
+  end
 
   defp cached(url) do
     cutoff = DateTime.add(DateTime.utc_now(), -@cache_ttl_seconds, :second)
@@ -93,24 +111,41 @@ defmodule AxonMedia.UrlPreview do
   # Fetch + redirect handling
   # ---------------------------------------------------------------------------
 
-  defp fetch_and_parse(_url, 0, _server_name), do: {:error, :too_many_redirects}
+  defp fetch_and_parse(url, server_name) do
+    with {:ok, content_type, body, final_url} <- get_following_redirects(url, @max_redirects) do
+      cond do
+        content_type == "text/html" -> {:ok, extract_og(body, server_name, final_url)}
+        image_type?(content_type) -> {:ok, rehost_image(body, content_type, server_name)}
+        true -> {:ok, %{}}
+      end
+    end
+  end
 
-  defp fetch_and_parse(url, redirects_left, server_name) do
+  defp fetch_and_rehost_image(url, server_name) do
+    with {:ok, content_type, body, _final_url} <- get_following_redirects(url, @max_redirects) do
+      if image_type?(content_type) do
+        {:ok, rehost_image(body, content_type, server_name)}
+      else
+        {:error, :not_an_image}
+      end
+    end
+  end
+
+  defp image_type?(content_type), do: String.starts_with?(content_type, "image/")
+
+  defp get_following_redirects(url, redirects_left) do
     with {:ok, address} <- validate_url(url),
          {:ok, status, headers, body} <- http_get(url, address) do
       cond do
         status in 300..399 ->
           case find_header(headers, "location") do
-            nil ->
-              {:error, :bad_redirect}
-
-            location ->
-              fetch_and_parse(resolve_redirect(url, location), redirects_left - 1, server_name)
+            nil -> {:error, :bad_redirect}
+            _ when redirects_left == 0 -> {:error, :too_many_redirects}
+            location -> get_following_redirects(resolve_url(url, location), redirects_left - 1)
           end
 
         status in 200..299 ->
-          content_type = find_header(headers, "content-type") || ""
-          parse_body(content_type, body, server_name, url)
+          {:ok, base_content_type(find_header(headers, "content-type")), body, url}
 
         true ->
           {:error, {:http_status, status}}
@@ -118,24 +153,16 @@ defmodule AxonMedia.UrlPreview do
     end
   end
 
-  defp resolve_redirect(base_url, location) do
+  defp base_content_type(nil), do: ""
+
+  defp base_content_type(value),
+    do: value |> String.split(";") |> hd() |> String.trim() |> String.downcase()
+
+  defp resolve_url(base_url, location) do
     base_url
     |> URI.parse()
     |> URI.merge(location)
     |> URI.to_string()
-  end
-
-  defp parse_body(content_type, body, server_name, page_url) do
-    cond do
-      String.starts_with?(content_type, "text/html") ->
-        {:ok, extract_og(body, server_name, page_url)}
-
-      String.starts_with?(content_type, "image/") ->
-        {:ok, rehost_image(body, content_type, server_name)}
-
-      true ->
-        {:ok, %{}}
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -143,7 +170,7 @@ defmodule AxonMedia.UrlPreview do
   # good enough for the handful of meta tags this cares about)
   # ---------------------------------------------------------------------------
 
-  @doc "Extracts og:title/description/site_name/type/url/image from an HTML document. `page_url`, when given, resolves an `og:image` that's a relative reference (common in the wild despite the OG spec requiring absolute URLs) against the page it came from. Public for direct unit testing of the parsing logic, independent of the SSRF-gated fetch."
+  @doc "Extracts og:title/description/site_name/type/url/image from an HTML document. `page_url`, when given, resolves an `og:image` that's a relative reference (common in the wild despite the OG spec requiring absolute URLs) against the page it came from. The image is only fetched and rehosted when `server_name` is given. Public for direct unit testing of the parsing logic, independent of the SSRF-gated fetch."
   def extract_og(html, server_name \\ nil, page_url \\ nil) do
     base =
       %{}
@@ -163,33 +190,18 @@ defmodule AxonMedia.UrlPreview do
         base
       end
 
-    case find_meta(html, "og:image") do
-      nil ->
-        base
-
-      image_url ->
-        resolved_image_url =
-          if page_url, do: resolve_redirect(page_url, image_url), else: image_url
-
-        case fetch(resolved_image_url, server_name) do
-          {:ok, %{"__image__" => image_map}} -> Map.merge(base, image_map)
-          _ -> base
-        end
+    with image_url when is_binary(image_url) and is_binary(server_name) <-
+           find_meta(html, "og:image"),
+         resolved = if(page_url, do: resolve_url(page_url, image_url), else: image_url),
+         {:ok, image} <- fetch_image(resolved, server_name) do
+      Map.merge(base, image)
+    else
+      _ -> base
     end
   end
 
   defp maybe_put_meta(acc, html, og_key, out_key) do
-    case find_meta(html, og_key) do
-      nil -> acc
-      value -> Map.put(acc, "og:#{out_key}", value)
-    end
-  end
-
-  defp maybe_put_meta_exact(acc, html, og_key, out_key) do
-    case find_meta(html, og_key) do
-      nil -> acc
-      value -> Map.put(acc, out_key, value)
-    end
+    maybe_put(acc, "og:#{out_key}", find_meta(html, og_key))
   end
 
   defp find_meta(html, property) do
@@ -212,150 +224,121 @@ defmodule AxonMedia.UrlPreview do
   end
 
   defp rehost_image(body, content_type, server_name) do
+    dimensions = get_image_dimensions(body, content_type) || %{}
+
     case Store.upload("url_preview", content_type, body, server_name) do
       {:ok, media_id} ->
-        dimensions = get_image_dimensions(body, content_type)
         %{
-          "__image__" => %{
-            "og:image" => "mxc://#{server_name}/#{media_id}",
-            "matrix:image:size" => byte_size(body),
-            "og:image:width" => dimensions[:width],
-            "og:image:height" => dimensions[:height]
-          }
+          "og:image" => "mxc://#{server_name}/#{media_id}",
+          "matrix:image:size" => byte_size(body)
         }
+        |> maybe_put("og:image:width", dimensions[:width])
+        |> maybe_put("og:image:height", dimensions[:height])
 
       {:error, _} ->
         %{}
     end
   end
 
-  @doc "Parses width/height out of raw image bytes, by `content_type`. Public for direct unit testing against real fixture bytes, independent of the SSRF-gated fetch."
-  def get_image_dimensions(body, content_type) do
-    case content_type do
-      "image/png" -> get_png_dimensions(body)
-      "image/jpeg" -> get_jpeg_dimensions(body)
-      "image/gif" -> get_gif_dimensions(body)
-      "image/webp" -> get_webp_dimensions(body)
-      _ -> %{width: 0, height: 0}
+  # ---------------------------------------------------------------------------
+  # Image dimensions
+  # ---------------------------------------------------------------------------
+
+  @jpeg_sof_markers [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF]
+
+  @doc "Parses width/height out of raw image bytes, by `content_type`. Returns `%{width:, height:}`, or `nil` for an unsupported type or malformed/truncated data. Public for direct unit testing against real fixture bytes, independent of the SSRF-gated fetch."
+  def get_image_dimensions(body, content_type) when is_binary(body) do
+    case dimensions(base_content_type(content_type), body) do
+      {width, height} -> %{width: width, height: height}
+      nil -> nil
     end
   end
 
-  defp get_png_dimensions(body) do
-    # PNG: 8-byte signature + 4-byte IHDR length + 4-byte "IHDR" type, then
-    # width/height at bytes 16-23 (4 bytes each, big-endian).
-    <<_::binary-size(16), width::32, height::32, _::binary>> = body
-    %{width: width, height: height}
-  end
+  defp dimensions(
+         "image/png",
+         <<0x89, "PNG\r\n", 0x1A, "\n", _len::32, "IHDR", w::32, h::32, _::binary>>
+       ),
+       do: {w, h}
 
-  defp get_jpeg_dimensions(body) do
-    # JPEG: scan for SOF markers (0xFFC0-0xFFCF except 0xFFC4, 0xFFC8, 0xFFCC)
-    # After marker: 2 bytes length, 1 byte precision, 2 bytes height, 2 bytes width
-    get_jpeg_dimensions(body, 0)
-  end
+  defp dimensions("image/gif", <<"GIF8", v, "a", w::16-little, h::16-little, _::binary>>)
+       when v in [?7, ?9],
+       do: {w, h}
 
-  defp get_jpeg_dimensions(<<0xFF, marker, length::16, 0x08, height::16, width::16, _::binary>>, _offset) when marker in [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF] do
-    %{width: width, height: height}
-  end
+  defp dimensions(type, <<0xFF, 0xD8, rest::binary>>) when type in ["image/jpeg", "image/jpg"],
+    do: jpeg_dimensions(rest)
 
-  defp get_jpeg_dimensions(<<0xFF, marker, length::16, rest::binary>>, offset) when marker in [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF] do
-    # This is a SOF marker but we couldn't match the pattern, skip it
-    skip = length - 2
-    <<_::binary-size(skip), rest2::binary>> = rest
-    get_jpeg_dimensions(rest2, offset + 2 + length)
-  end
+  defp dimensions(
+         "image/webp",
+         <<"RIFF", _::32, "WEBP", chunk::binary-size(4), _::32, data::binary>>
+       ),
+       do: webp_dimensions(chunk, data)
 
-  defp get_jpeg_dimensions(<<0xFF, marker, length::16, rest::binary>>, offset) when marker >= 0xD0 and marker <= 0xD9 do
-    # RST markers (0xD0-0xD7) and EOI (0xD9) have no length field
-    get_jpeg_dimensions(rest, offset + 2)
-  end
+  defp dimensions(_type, _body), do: nil
 
-  defp get_jpeg_dimensions(<<0xFF, marker, length::16, rest::binary>>, offset) do
-    # Other markers have length field, skip payload
-    skip = length - 2
-    <<_::binary-size(skip), rest2::binary>> = rest
-    get_jpeg_dimensions(rest2, offset + 2 + length)
-  end
+  # Fill bytes before a marker.
+  defp jpeg_dimensions(<<0xFF, 0xFF, rest::binary>>), do: jpeg_dimensions(<<0xFF, rest::binary>>)
 
-  defp get_jpeg_dimensions(<<_::1, rest::binary>>, offset) do
-    get_jpeg_dimensions(rest, offset + 1)
-  end
+  defp jpeg_dimensions(<<0xFF, marker, _len::16, _precision, h::16, w::16, _::binary>>)
+       when marker in @jpeg_sof_markers,
+       do: {w, h}
 
-  defp get_jpeg_dimensions(<<>>, _offset) do
-    %{width: 0, height: 0}
-  end
+  # Standalone markers (TEM, RSTn) carry no length field.
+  defp jpeg_dimensions(<<0xFF, marker, rest::binary>>)
+       when marker == 0x01 or marker in 0xD0..0xD7,
+       do: jpeg_dimensions(rest)
 
-  defp get_gif_dimensions(body) do
-    # GIF: width/height at bytes 6-9 (2 bytes each, little-endian)
-    <<_::6, width::16-little, height::16-little, _::binary>> = body
-    %{width: width, height: height}
-  end
+  defp jpeg_dimensions(<<0xFF, marker, len::16, rest::binary>>)
+       when marker not in [0xD9, 0xDA] and len >= 2 and byte_size(rest) >= len - 2,
+       do: jpeg_dimensions(binary_part(rest, len - 2, byte_size(rest) - (len - 2)))
 
-  defp get_webp_dimensions(body) do
-    # WebP: VP8/VP8L chunk after RIFF header
-    # RIFF: "RIFF" (4), file_size (4), "WEBP" (4)
-    # Then VP8: "VP8 " (4), chunk_size (4), then 10 bytes header with width/height
-    # Or VP8L: "VP8L" (4), chunk_size (4), then 1 byte signature + width/height (14 bits each)
-    get_webp_dimensions(body, 0)
-  end
+  defp jpeg_dimensions(_), do: nil
 
-  defp get_webp_dimensions(<<0x52, 0x49, 0x46, 0x46, _file_size::32, 0x57, 0x45, 0x42, 0x50, 0x38, 0x20, _chunk_size::32, _::8, width::24-little, height::24-little, _::binary>>, _offset) do
-    # VP8 (lossy) format
-    %{width: width, height: height}
-  end
+  defp webp_dimensions(
+         "VP8 ",
+         <<_frame_tag::24, 0x9D, 0x01, 0x2A, w::16-little, h::16-little, _::binary>>
+       ),
+       do: {w &&& 0x3FFF, h &&& 0x3FFF}
 
-  defp get_webp_dimensions(<<0x52, 0x49, 0x46, 0x46, _file_size::32, 0x57, 0x45, 0x42, 0x50, 0x38, 0x4C, _chunk_size::32, _::8, width_bits::14-little, height_bits::14-little, _::binary>>, _offset) do
-    # VP8L (lossless) format
-    %{width: width_bits, height: height_bits}
-  end
+  defp webp_dimensions("VP8L", <<0x2F, bits::32-little, _::binary>>),
+    do: {(bits &&& 0x3FFF) + 1, (bits >>> 14 &&& 0x3FFF) + 1}
 
-  defp get_webp_dimensions(<<_::1, rest::binary>>, offset) when offset < 100 do
-    get_webp_dimensions(rest, offset + 1)
-  end
+  defp webp_dimensions("VP8X", <<_flags::32, w::24-little, h::24-little, _::binary>>),
+    do: {w + 1, h + 1}
 
-  defp get_webp_dimensions(_body, _offset) do
-    %{width: 0, height: 0}
-  end
+  defp webp_dimensions(_chunk, _data), do: nil
 
   # ---------------------------------------------------------------------------
   # SSRF validation
   # ---------------------------------------------------------------------------
 
   # Returns {:ok, address} — the single literal address the actual
-  # connection must be pinned to (see moduledoc "DNS rebinding"), not just
-  # `:ok`. Still blocks if *any* resolved address is private, not only the
-  # one we'd pin to: an attacker-controlled resolver returning a mix of
-  # public/private answers for one hostname is itself a red flag worth
-  # rejecting outright, even though pinning alone would already prevent
-  # the private one from ever being dialed.
+  # connection must be pinned to (see moduledoc "DNS rebinding").
+  # NetworkAddress.check/1 rejects the host if *any* resolved address is
+  # private, not only the one we'd pin to.
   defp validate_url(url) do
-    with %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) <-
-           URI.parse(url),
-         {:ok, addresses} <- resolve(host),
-         false <- private_addresses_blocked?() and Enum.any?(addresses, &private_address?/1) do
-      {:ok, hd(addresses)}
-    else
-      %URI{} -> {:error, :invalid_url}
-      {:error, _} = err -> err
-      true -> {:error, :blocked_address}
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host}
+      when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+        with {:ok, [address | _]} <- check_host(host), do: {:ok, address}
+
+      _ ->
+        {:error, :invalid_url}
     end
+  end
+
+  defp check_host(host) do
+    if private_addresses_blocked?(),
+      do: NetworkAddress.check(host),
+      else: NetworkAddress.resolve(host)
   end
 
   # Off only for the Complement test harness (complement/start.sh sets
   # URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES, consumed in config/runtime.exs) —
   # Complement's own test webserver is only reachable via the Docker host
-  # gateway, which is itself a private address. Every real deployment keeps
-  # this on; there's no equivalent knob wired up for a real admin to flip.
+  # gateway, which is itself a private address.
   defp private_addresses_blocked? do
     not Application.get_env(:axon_media, :url_preview_allow_private_addresses, false)
   end
-
-  # Resolution and the private/reserved-range predicate both live in
-  # AxonCore.NetworkAddress — shared verbatim with the remote-media SSRF
-  # guard (AxonFederation.AddressGuard), so the two can't drift apart on
-  # which ranges count as reachable.
-  defp resolve(host), do: AxonCore.NetworkAddress.resolve(host)
-
-  defp private_address?(address), do: AxonCore.NetworkAddress.private?(address)
 
   # ---------------------------------------------------------------------------
   # HTTP fetch (size + time capped)
@@ -416,27 +399,33 @@ defmodule AxonMedia.UrlPreview do
 
       true ->
         timeout = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+        socket = Mint.HTTP.get_socket(conn)
 
+        # Only this connection's socket messages — anything else in the
+        # caller's mailbox is left alone.
         receive do
-          message ->
-            case Mint.HTTP.stream(conn, message) do
-              {:ok, conn, responses} ->
-                receive_response(
-                  conn,
-                  ref,
-                  Enum.reduce(responses, acc, &apply_response(&1, &2, ref)),
-                  deadline_ms
-                )
+          {tag, ^socket, _} = message when tag in [:tcp, :ssl, :tcp_error, :ssl_error] ->
+            stream_message(conn, ref, acc, deadline_ms, message)
 
-              {:error, _conn, reason, _responses} ->
-                {:error, reason}
-
-              :unknown ->
-                receive_response(conn, ref, acc, deadline_ms)
-            end
+          {tag, ^socket} = message when tag in [:tcp_closed, :ssl_closed] ->
+            stream_message(conn, ref, acc, deadline_ms, message)
         after
           timeout -> {:error, :timeout}
         end
+    end
+  end
+
+  defp stream_message(conn, ref, acc, deadline_ms, message) do
+    case Mint.HTTP.stream(conn, message) do
+      {:ok, conn, responses} ->
+        acc = Enum.reduce(responses, acc, &apply_response(&1, &2, ref))
+        receive_response(conn, ref, acc, deadline_ms)
+
+      {:error, _conn, reason, _responses} ->
+        {:error, reason}
+
+      :unknown ->
+        receive_response(conn, ref, acc, deadline_ms)
     end
   end
 

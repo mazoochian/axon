@@ -1,7 +1,7 @@
 import Config
 
 if config_env() == :prod do
-  server_name = System.get_env("SERVER_NAME") || System.get_env("AXON_SERVER_NAME") || "localhost"
+  server_name = System.get_env("AXON_SERVER_NAME") || System.get_env("SERVER_NAME") || "localhost"
 
   secret_key_base =
     System.get_env("SECRET_KEY_BASE") ||
@@ -86,7 +86,12 @@ if config_env() == :prod do
   # URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES=true because Complement's own
   # `TestUrlPreview` webserver is only reachable via the Docker host gateway
   # address, which is itself private — see AxonMedia.UrlPreview.
+  #
+  # Uploaded media lives under MEDIA_STORE_PATH, which must be persistent
+  # storage; the default sits on the /axon/data volume the Dockerfile and
+  # docker-compose.yml set up.
   config :axon_media,
+    storage_path: System.get_env("MEDIA_STORE_PATH", "/axon/data/media"),
     url_preview_allow_private_addresses:
       System.get_env("URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES", "false") == "true"
 
@@ -101,6 +106,9 @@ if config_env() == :prod do
   config :axon_federation,
     allow_private_addresses:
       System.get_env("FEDERATION_ALLOW_PRIVATE_ADDRESSES", "false") == "true"
+
+  config :axon_push,
+    allow_private_addresses: System.get_env("PUSH_ALLOW_PRIVATE_ADDRESSES", "false") == "true"
 
   # Optional — leave AXON_APPSERVICE_DIR unset outside Complement.
   # complement/start.sh sets this to /complement/appservice, the fixed

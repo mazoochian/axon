@@ -4,19 +4,22 @@
 # Required env vars:
 #   AXON_SERVER_NAME   — e.g. matrix.example.com
 #   SECRET_KEY_BASE    — 64+ random bytes (generate with: mix phx.gen.secret)
+#   DB_PASS            — PostgreSQL password (no default)
 #
 # Optional env vars (defaults shown):
-#   DB_HOST=localhost  DB_NAME=axon_prod  DB_USER=axon  DB_PASS=axon
+#   DB_HOST=localhost  DB_NAME=axon_prod  DB_USER=axon
 #   POOL_SIZE=20
+#   MEDIA_STORE_PATH=/axon/data/media  (must exist or be creatable, and persistent)
 #
 # Usage:
-#   AXON_SERVER_NAME=matrix.example.com SECRET_KEY_BASE=... ./bin/deploy
+#   AXON_SERVER_NAME=matrix.example.com SECRET_KEY_BASE=... DB_PASS=... ./bin/deploy
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 : "${AXON_SERVER_NAME:?AXON_SERVER_NAME must be set}"
 : "${SECRET_KEY_BASE:?SECRET_KEY_BASE must be set (run: mix phx.gen.secret)}"
+: "${DB_PASS:?DB_PASS must be set}"
 
 export MIX_ENV=prod
 
