@@ -11,68 +11,40 @@ defmodule AxonFederation.HttpClient do
 
   @user_agent "Axon/1.0"
 
+  @doc "The User-Agent header value for every outbound request this server makes."
+  def user_agent, do: @user_agent
+
   @doc """
   GET request to a remote server's federation endpoint.
   Returns {:ok, body_map} or {:error, reason}.
   """
-  def get(server_name, path) do
-    url = build_url(server_name, path)
-    auth = build_auth_header(server_name, "GET", path, nil)
+  def get(server_name, path), do: request(:get, server_name, path)
 
-    req =
-      Finch.build(:get, url, [
-        {"authorization", auth},
-        {"user-agent", @user_agent},
-        {"accept", "application/json"}
-      ])
+  @doc "PUT request to a remote server's federation endpoint with a JSON body."
+  def put(server_name, path, body_map), do: request(:put, server_name, path, body_map)
 
-    execute(req)
-  end
+  @doc "POST request to a remote server's federation endpoint with a JSON body."
+  def post(server_name, path, body_map), do: request(:post, server_name, path, body_map)
 
   @doc """
-  PUT request to a remote server's federation endpoint with a JSON body.
+  Signed JSON request to a remote server's federation endpoint; `body_map`
+  (if any) is sent as the JSON body. Returns {:ok, body_map} or {:error, reason}.
   """
-  def put(server_name, path, body_map) do
-    url = build_url(server_name, path)
-    body_json = Jason.encode!(body_map)
-    auth = build_auth_header(server_name, "PUT", path, body_map)
+  def request(method, server_name, path, body_map \\ nil) do
+    method_name = method |> Atom.to_string() |> String.upcase()
 
-    req =
-      Finch.build(
-        :put,
-        url,
-        [
-          {"authorization", auth},
-          {"content-type", "application/json"},
-          {"user-agent", @user_agent}
-        ],
-        body_json
-      )
+    headers = [
+      {"authorization", build_auth_header(server_name, method_name, path, body_map)},
+      {"user-agent", @user_agent},
+      {"accept", "application/json"}
+    ]
 
-    execute(req)
-  end
+    {headers, body} =
+      if body_map == nil,
+        do: {headers, nil},
+        else: {[{"content-type", "application/json"} | headers], Jason.encode!(body_map)}
 
-  @doc """
-  POST request to a remote server's federation endpoint with a JSON body.
-  """
-  def post(server_name, path, body_map) do
-    url = build_url(server_name, path)
-    body_json = Jason.encode!(body_map)
-    auth = build_auth_header(server_name, "POST", path, body_map)
-
-    req =
-      Finch.build(
-        :post,
-        url,
-        [
-          {"authorization", auth},
-          {"content-type", "application/json"},
-          {"user-agent", @user_agent}
-        ],
-        body_json
-      )
-
-    execute(req)
+    execute(Finch.build(method, build_url(server_name, path), headers, body))
   end
 
   @doc """

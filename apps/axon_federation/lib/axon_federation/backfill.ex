@@ -28,7 +28,6 @@ defmodule AxonFederation.Backfill do
   require Logger
 
   alias AxonCore.EventStore
-  alias AxonCrypto.EventHash
   alias AxonFederation.{EventVerification, HttpClient}
   alias AxonRoom.RoomProcess
 
@@ -54,7 +53,7 @@ defmodule AxonFederation.Backfill do
   def fetch_and_apply_event(room_id, origin, event_id) do
     path = "/_matrix/federation/v1/event/#{URI.encode(event_id)}"
 
-    room_version = AxonCore.EventStore.get_room_version(room_id)
+    room_version = EventStore.get_room_version(room_id)
 
     # `verified` is the event as fetched, or its redacted form if the
     # content hash didn't check out — a proactively *fetched* event is at
@@ -62,24 +61,22 @@ defmodule AxonFederation.Backfill do
     # arriving over /send, since `origin` here is simply whichever server
     # answered, not necessarily the author. See
     # AxonFederation.EventVerification.verify/2.
-    case HttpClient.get(origin, path) do
-      {:ok, %{"pdus" => [pdu | _]}} ->
-        case EventVerification.verify(pdu, room_version) do
-          {:ok, verified} ->
-            catch_up(room_id, origin, verified)
-            RoomProcess.apply_remote_event(room_id, verified)
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      {:ok, _} ->
-        {:error, :malformed_event_response}
-
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, %{"pdus" => [pdu | _]}} when is_map(pdu) <- HttpClient.get(origin, path),
+         :ok <- check_room(pdu, room_id),
+         ^event_id <- EventVerification.event_id(pdu, room_version),
+         {:ok, verified} <- EventVerification.verify(pdu, room_version) do
+      verified = Map.put(verified, "event_id", event_id)
+      catch_up(room_id, origin, verified)
+      RoomProcess.apply_remote_event(room_id, verified)
+    else
+      {:error, reason} -> {:error, reason}
+      id when is_binary(id) -> {:error, :event_id_mismatch}
+      _ -> {:error, :malformed_event_response}
     end
   end
+
+  defp check_room(%{"room_id" => room_id}, room_id), do: :ok
+  defp check_room(_pdu, _room_id), do: {:error, :wrong_room}
 
   @doc """
   Given a PDU about to be applied and the `origin` server it arrived from,
@@ -174,7 +171,9 @@ defmodule AxonFederation.Backfill do
 
     body = %{
       "earliest_events" => known_head_ids(room_id),
-      "latest_events" => [pdu_event_id(pdu, room_id)],
+      "latest_events" => [
+        pdu["event_id"] || EventVerification.event_id(pdu, EventStore.get_room_version(room_id))
+      ],
       "limit" => @get_missing_events_limit,
       "min_depth" => 0
     }
@@ -194,17 +193,6 @@ defmodule AxonFederation.Backfill do
         err
     end
   end
-
-  # event_id as-is when the wire carried one (room v1/v2), otherwise the
-  # reference hash room versions 3+ derive it from — same pattern
-  # AxonWeb.FederationController.compute_event_id/1 and
-  # AxonFederation.RoomJoin use for the same wire-format gap.
-  defp pdu_event_id(pdu, room_id) do
-    pdu_event_id(pdu, room_id, EventStore.get_room_version(room_id))
-  end
-
-  defp pdu_event_id(%{"event_id" => id}, _room_id, _room_version) when is_binary(id), do: id
-  defp pdu_event_id(pdu, _room_id, room_version), do: EventHash.reference_hash(pdu, room_version)
 
   # Our own resident room process's current head, as a single-element
   # `earliest_events` boundary — best-effort: an empty list here just means
@@ -252,15 +240,14 @@ defmodule AxonFederation.Backfill do
     room_version = EventStore.get_room_version(room_id)
 
     events
-    |> Enum.map(&Map.put(&1, "event_id", pdu_event_id(&1, room_id, room_version)))
+    |> Enum.filter(&(is_map(&1) and &1["room_id"] == room_id))
+    |> Enum.map(&Map.put(&1, "event_id", EventVerification.event_id(&1, room_version)))
     |> Enum.uniq_by(& &1["event_id"])
     |> Enum.sort_by(&(&1["depth"] || 0))
-    |> Enum.each(&verify_and_apply(room_id, origin, &1))
+    |> Enum.each(&verify_and_apply(room_id, origin, &1, room_version))
   end
 
-  defp verify_and_apply(room_id, origin, event) do
-    room_version = AxonCore.EventStore.get_room_version(room_id)
-
+  defp verify_and_apply(room_id, origin, event, room_version) do
     with {:ok, verified} <- EventVerification.verify(event, room_version),
          {:ok, _event_id} <- RoomProcess.apply_remote_event(room_id, verified) do
       :ok

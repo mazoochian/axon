@@ -8,109 +8,59 @@ defmodule AxonFederation.RoomKnock do
      /sync can show the user something for a room they haven't joined yet.
   """
 
+  alias AxonCore.EventStore
+  alias AxonFederation.MembershipHandshake
+  alias AxonRoom.RoomVersions
+
   require Logger
-
-  alias AxonCore.{EventStore, Repo}
-  alias AxonCrypto.{EventHash, KeyServer}
-  alias AxonFederation.HttpClient
-
-  @supported_versions ~w(7 8 9 10 11 12)
 
   @doc """
   Knocks on a remote room for a local user. `via_servers` is a list of
   server names to try. Returns {:ok, room_id} or {:error, reason}.
   """
   def knock_via_federation(room_id, user_id, via_servers, reason) do
-    version_query = Enum.map_join(@supported_versions, "&", &"ver=#{&1}")
-
-    Enum.find_value(via_servers, {:error, :all_servers_failed}, fn server ->
-      case try_knock(room_id, user_id, server, version_query, reason) do
-        {:ok, result} ->
-          {:ok, result}
-
-        {:error, reason} ->
-          Logger.warning("Federation knock via #{server} failed: #{inspect(reason)}")
-          false
-      end
-    end)
+    MembershipHandshake.via_servers(
+      via_servers,
+      "knock",
+      &try_knock(room_id, user_id, &1, reason)
+    )
   end
 
-  defp try_knock(room_id, user_id, server, version_query, reason) do
-    path =
-      "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(user_id)}?#{version_query}"
-
-    with {:ok, make_knock_resp} <- HttpClient.get(server, path),
-         {:ok, template, room_version} <- extract_template(make_knock_resp),
-         {:ok, knock_event} <- build_and_sign_knock(template, user_id, reason, room_version),
-         {:ok, send_knock_resp} <- send_knock(server, room_id, knock_event),
-         :ok <- import_knock(send_knock_resp, room_id, room_version, knock_event) do
-      {:ok, room_id}
-    end
-  end
-
-  defp extract_template(%{"event" => template, "room_version" => version}),
-    do: {:ok, template, version}
-
-  defp extract_template(%{"event" => template}), do: {:ok, template, "11"}
-  defp extract_template(_), do: {:error, :invalid_make_knock_response}
-
-  defp build_and_sign_knock(template, user_id, reason, room_version) do
-    extra_content =
+  defp try_knock(room_id, user_id, server, reason) do
+    content =
       if reason,
         do: %{"membership" => "knock", "reason" => reason},
         else: %{"membership" => "knock"}
 
-    knock_event =
-      template
-      |> Map.put("sender", user_id)
-      |> Map.put("state_key", user_id)
-      |> Map.update("content", extra_content, &Map.merge(&1, extra_content))
-      |> Map.put("origin", KeyServer.server_name())
-      |> Map.put("origin_server_ts", System.os_time(:millisecond))
-
-    content_hash = EventHash.content_hash(knock_event)
-    knock_event = Map.put(knock_event, "hashes", %{"sha256" => content_hash})
-    signed = KeyServer.sign_event(knock_event, room_version)
-    event_id = EventHash.reference_hash(signed, room_version)
-    {:ok, Map.put(signed, "event_id", event_id)}
+    with {:ok, template, room_version} <-
+           MembershipHandshake.make(server, "knock", room_id, user_id, knock_versions()),
+         knock_event = MembershipHandshake.sign(template, user_id, content, room_version),
+         {:ok, send_knock_resp} <-
+           MembershipHandshake.send(
+             server,
+             "/_matrix/federation/v1/send_knock",
+             room_id,
+             knock_event
+           ) do
+      import_knock(send_knock_resp, room_id, room_version, knock_event)
+      {:ok, room_id}
+    end
   end
 
-  defp send_knock(server, room_id, knock_event) do
-    event_id = knock_event["event_id"]
-    path = "/_matrix/federation/v1/send_knock/#{URI.encode(room_id)}/#{URI.encode(event_id)}"
-    HttpClient.put(server, path, knock_event)
-  end
+  # Knocking was introduced in room version 7.
+  defp knock_versions, do: Enum.filter(RoomVersions.supported(), &RoomVersions.at_least?(&1, 7))
 
   defp import_knock(resp, room_id, room_version, knock_event) do
-    knock_room_state = resp["knock_room_state"] || []
     user_id = knock_event["sender"]
 
-    # Ensure the room row exists locally (FK target for the events table) —
-    # we may have no other state for this room at all yet.
-    now = DateTime.utc_now(:microsecond)
+    # The rooms row is the FK target for the events table — we may have no
+    # other state for this room at all yet.
+    MembershipHandshake.ensure_room(room_id, room_version, user_id)
 
-    Repo.insert_all(
-      "rooms",
-      [
-        %{
-          room_id: room_id,
-          version: room_version,
-          creator: user_id,
-          is_public: false,
-          inserted_at: now,
-          updated_at: now
-        }
-      ],
-      on_conflict: :nothing
-    )
-
-    case EventStore.insert_event(knock_event, room_version) do
-      {:ok, _} -> :ok
-      {:error, :already_exists} -> :ok
-      {:error, reason} -> Logger.warning("Failed to insert knock event: #{inspect(reason)}")
+    with {:error, reason} <- MembershipHandshake.insert_event(knock_event, room_version) do
+      Logger.warning("Failed to insert knock event: #{inspect(reason)}")
     end
 
-    EventStore.set_knock_preview_state(room_id, user_id, knock_room_state)
-    :ok
+    EventStore.set_knock_preview_state(room_id, user_id, resp["knock_room_state"] || [])
   end
 end

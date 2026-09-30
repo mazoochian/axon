@@ -205,7 +205,12 @@ defmodule AxonRoom.RestrictedJoinTest do
       insert_membership(@space_room, @alice, "join")
       current_state = %{{"m.room.member", @creator} => member_event(@creator, "join")}
 
-      allow = ["invalid", 42, %{"no_type" => "here"}, %{"type" => "m.room_membership", "room_id" => @space_room}]
+      allow = [
+        "invalid",
+        42,
+        %{"no_type" => "here"},
+        %{"type" => "m.room_membership", "room_id" => @space_room}
+      ]
 
       assert RestrictedJoin.authorise(%{"allow" => allow}, @alice, current_state) ==
                {:ok, @creator}

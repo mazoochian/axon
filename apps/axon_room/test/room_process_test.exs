@@ -357,6 +357,40 @@ defmodule AxonRoom.RoomProcessTest do
     end
   end
 
+  describe "apply_remote_event/2 — malformed PDUs" do
+    test "a PDU for a different room is refused without being stored" do
+      creator = new_user("alice")
+      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost")
+      {:ok, other_room} = CreateRoom.execute(creator, server_name: "localhost")
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      pdu = %{
+        "event_id" => "$cross_#{System.unique_integer([:positive])}",
+        "room_id" => other_room,
+        "type" => "m.room.message",
+        "sender" => creator,
+        "content" => %{"body" => "hi"},
+        "depth" => depth + 1,
+        "prev_events" => [last_event_id],
+        "auth_events" => []
+      }
+
+      assert RoomProcess.apply_remote_event(room_id, pdu) == {:error, :wrong_room}
+      assert {:error, :not_found} = AxonCore.EventStore.get_event(pdu["event_id"])
+      assert RoomProcess.get_position(room_id) == {last_event_id, depth}
+    end
+
+    test "a PDU without an event_id is refused instead of crashing the process" do
+      creator = new_user("alice")
+      {:ok, room_id} = CreateRoom.execute(creator, server_name: "localhost")
+      {:ok, pid} = RoomProcess.get_or_start(room_id)
+
+      pdu = %{"room_id" => room_id, "type" => "m.room.message", "sender" => creator}
+      assert RoomProcess.apply_remote_event(room_id, pdu) == {:error, :missing_event_id}
+      assert Process.alive?(pid)
+    end
+  end
+
   describe "apply_remote_event/2 — unknown ancestor (unresolvable prev_events)" do
     test "a PDU whose only prev_event is unfetchable is refused, stored rejected, and never applied" do
       creator = new_user("alice")

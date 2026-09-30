@@ -181,6 +181,45 @@ defmodule AxonFederation.OutboundQueueTest do
            "expected the next attempt to be scheduled ~5s out, got #{delay_ms}ms"
   end
 
+  test "a sweep skips destinations behind an open circuit and still delivers the rest" do
+    blocked = "blocked-#{System.unique_integer([:positive])}.test"
+    table = :axon_federation_outbound_concurrency
+
+    :ets.insert(
+      table,
+      {{:circuit_open_until, blocked}, System.monotonic_time(:millisecond) + 60_000}
+    )
+
+    on_exit(fn -> :ets.delete(table, {:circuit_open_until, blocked}) end)
+
+    FakeRemoteMatrixServer.put_response(
+      @port,
+      {"PUT", ~r{^/_matrix/federation/v1/send/}},
+      200,
+      %{"pdus" => %{}}
+    )
+
+    rows =
+      for destination <- [blocked, @server_name] do
+        %{
+          destination: destination,
+          payload: %{"pdus" => [], "edus" => []},
+          attempts: 0,
+          next_attempt_at: DateTime.add(DateTime.utc_now(), -60, :second),
+          inserted_at: DateTime.utc_now()
+        }
+      end
+
+    Repo.insert_all("federation_outbound_transactions", rows)
+    send(OutboundQueue, :sweep)
+
+    wait_until(System.monotonic_time(:millisecond) + 2_000, fn ->
+      if fetch_row(@server_name), do: :error, else: {:ok, :delivered}
+    end)
+
+    assert %{attempts: 0} = fetch_row(blocked)
+  end
+
   test "an unrecognized message is ignored without crashing the process" do
     pid = Process.whereis(OutboundQueue)
     send(OutboundQueue, {:some_unexpected_message, :whatever})

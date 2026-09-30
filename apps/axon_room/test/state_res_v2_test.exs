@@ -121,10 +121,12 @@ defmodule AxonRoom.StateResV2Test do
   describe "a key present in only some state sets is conflicted" do
     test "a legitimately-authorized single-branch value still survives" do
       create = create_event()
-      # The room creator's own join is authorized unconditionally (initial
-      # join before join_rules exists) regardless of join_rule, so this
-      # must survive the now-mandatory auth check.
-      creator_join = member_event("$m1", @creator, "join", 1, [create["event_id"]])
+      # The room creator's own initial join (only prev_event is the create
+      # event) is authorized regardless of join_rule, so this must survive
+      # the now-mandatory auth check.
+      creator_join =
+        member_event("$m1", @creator, "join", 1, [create["event_id"]])
+        |> Map.put("prev_events", [create["event_id"]])
 
       set_a = %{{"m.room.create", ""} => create}
       set_b = %{{"m.room.create", ""} => create, {"m.room.member", @creator} => creator_join}
@@ -524,6 +526,82 @@ defmodule AxonRoom.StateResV2Test do
       # bug. Asserting the *newer* event specifically also re-confirms the
       # depth tie-break direction this module fixed elsewhere.
       assert v12[{"m.room.join_rules", ""}]["event_id"] == "$jr_newer"
+    end
+  end
+
+  describe "auth chain traversal" do
+    # A ladder of power_levels events where each rung cites both previous
+    # rungs: a per-path walk revisits shared ancestors exponentially often.
+    test "each ancestor is fetched at most once, even through a wide diamond DAG" do
+      store = events_store()
+      create = put_event(store, create_event())
+      join = put_event(store, member_event("$m1", @creator, "join", 1, ["$create"]))
+
+      {rungs, _} =
+        Enum.map_reduce(1..40, ["$create", "$m1"], fn i, [a, b] ->
+          ev = put_event(store, pl_event("$pl#{i}", @creator, i + 1, [a, b], %{@creator => 100}))
+          {ev, [b, ev["event_id"]]}
+        end)
+
+      top = List.last(rungs)
+      topic_a = put_event(store, topic_event("$ta", @creator, 50, [top["event_id"], "$m1"], "A"))
+      topic_b = put_event(store, topic_event("$tb", @creator, 51, [top["event_id"], "$m1"], "B"))
+
+      counter = :counters.new(1, [])
+      lookup = get_event_fn(store)
+
+      counting_fn = fn id ->
+        :counters.add(counter, 1, 1)
+        lookup.(id)
+      end
+
+      base = %{
+        {"m.room.create", ""} => create,
+        {"m.room.member", @creator} => join,
+        {"m.room.power_levels", ""} => top
+      }
+
+      resolved =
+        StateResV2.resolve(
+          [
+            Map.put(base, {"m.room.topic", ""}, topic_a),
+            Map.put(base, {"m.room.topic", ""}, topic_b)
+          ],
+          counting_fn
+        )
+
+      assert resolved[{"m.room.topic", ""}] == topic_b
+      assert :counters.get(counter, 1) <= :ets.info(store, :size)
+    end
+
+    test "a batch fetch function is used for the auth closure when given" do
+      store = events_store()
+      create = put_event(store, create_event())
+      join = put_event(store, member_event("$m1", @creator, "join", 1, ["$create"]))
+      topic_a = put_event(store, topic_event("$ta", @creator, 2, ["$create", "$m1"], "A"))
+      topic_b = put_event(store, topic_event("$tb", @creator, 3, ["$create", "$m1"], "B"))
+      base = %{{"m.room.create", ""} => create, {"m.room.member", @creator} => join}
+      lookup = get_event_fn(store)
+      test_pid = self()
+
+      batch = fn ids ->
+        send(test_pid, {:batch, ids})
+        for id <- ids, event <- [lookup.(id)], event != nil, into: %{}, do: {id, event}
+      end
+
+      resolved =
+        StateResV2.resolve(
+          [
+            Map.put(base, {"m.room.topic", ""}, topic_a),
+            Map.put(base, {"m.room.topic", ""}, topic_b)
+          ],
+          fn _ -> flunk("single-event fetch used") end,
+          "11",
+          batch
+        )
+
+      assert resolved[{"m.room.topic", ""}] == topic_b
+      assert_received {:batch, _}
     end
   end
 end

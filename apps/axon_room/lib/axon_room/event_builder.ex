@@ -23,7 +23,14 @@ defmodule AxonRoom.EventBuilder do
       end
 
     auth_event_ids =
-      select_auth_events(type, state_key, sender, room_ctx.current_state, room_ctx.room_version)
+      select_auth_events(
+        type,
+        state_key,
+        sender,
+        content,
+        room_ctx.current_state,
+        room_ctx.room_version
+      )
 
     skeleton = %{
       "type" => type,
@@ -68,7 +75,7 @@ defmodule AxonRoom.EventBuilder do
   # Spec: https://spec.matrix.org/latest/server-server-api/#auth-events-selection
   # ---------------------------------------------------------------------------
 
-  defp select_auth_events(type, state_key, sender, current_state, room_version) do
+  defp select_auth_events(type, state_key, sender, content, current_state, room_version) do
     # Room v12 (MSC4297/rule 3.2): m.room.create MUST NOT be selected as an
     # auth event for anything — its authority is implicit via room_id now
     # (rule 2: room_id must itself be the create event's ID). Versions
@@ -93,7 +100,8 @@ defmodule AxonRoom.EventBuilder do
 
           [
             lookup(current_state, "m.room.join_rules", ""),
-            lookup(current_state, "m.room.member", target)
+            lookup(current_state, "m.room.member", target),
+            authoriser_member(content, current_state)
           ]
 
         _ ->
@@ -107,6 +115,15 @@ defmodule AxonRoom.EventBuilder do
     end)
     |> Enum.uniq()
   end
+
+  defp authoriser_member(
+         %{"membership" => "join", "join_authorised_via_users_server" => authoriser},
+         current_state
+       )
+       when is_binary(authoriser),
+       do: lookup(current_state, "m.room.member", authoriser)
+
+  defp authoriser_member(_content, _current_state), do: nil
 
   defp lookup(current_state, type, state_key) do
     Map.get(current_state, {type, state_key})

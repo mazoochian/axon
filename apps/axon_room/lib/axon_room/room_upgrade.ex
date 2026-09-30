@@ -37,7 +37,7 @@ defmodule AxonRoom.RoomUpgrade do
     # accounts for this (and for pre-v12's "no power_levels event yet ->
     # creator implicitly 100" case) via effective_power/4.
     state_map = EventStore.get_current_state_map(room_id)
-    version = room_version(state_map)
+    version = AuthRules.room_version(state_map)
 
     if AuthRules.can_send_state?(user_id, "m.room.tombstone", state_map, version),
       do: :ok,
@@ -213,13 +213,6 @@ defmodule AxonRoom.RoomUpgrade do
       ev ->
         ev
     end)
-  end
-
-  defp room_version(state_map) do
-    case state_map[{"m.room.create", ""}] do
-      %{"content" => %{"room_version" => v}} -> v
-      _ -> "11"
-    end
   end
 
   defp fetch_create_extras(room_id) do

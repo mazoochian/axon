@@ -65,7 +65,7 @@ defmodule AxonRoom.RestrictedJoin do
   # AuthRules trusts on every other server that later validates it.
   defp pick_authoriser(current_state) do
     local_server = Application.get_env(:axon_web, :server_name, "localhost")
-    version = room_version(current_state)
+    version = AxonRoom.AuthRules.room_version(current_state)
 
     current_state
     |> Enum.filter(fn
@@ -78,17 +78,6 @@ defmodule AxonRoom.RestrictedJoin do
     end)
     |> Enum.map(fn {{_type, target_user_id}, _event} -> target_user_id end)
     |> Enum.find(&AxonRoom.AuthRules.can_invite?(&1, current_state, version))
-  end
-
-  # A creator's implicit infinite power (room v12) only kicks in when
-  # AuthRules knows the room's actual version — current_state carries it via
-  # the create event's own content, so there's no need for callers to thread
-  # a separate room_version parameter through just for this.
-  defp room_version(current_state) do
-    case current_state[{"m.room.create", ""}] do
-      %{"content" => %{"room_version" => v}} -> v
-      _ -> "11"
-    end
   end
 
   defp server_of(user_id), do: user_id |> AxonCore.MatrixId.server_name()

@@ -174,8 +174,17 @@ defmodule AxonRoom.StateResolver do
       # Had prev_events, but every single one was unresolvable.
       {_, []} -> :unresolvable
       {_, [single]} -> {:ok, single}
-      {_, many} -> {:ok, StateResV2.resolve(many, &EventStore.get_event_map/1, room_version)}
+      {_, many} -> {:ok, resolve_many(many, room_version)}
     end
+  end
+
+  defp resolve_many(state_sets, room_version) do
+    StateResV2.resolve(
+      state_sets,
+      &EventStore.get_event_map/1,
+      room_version,
+      &EventStore.get_event_maps/1
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -285,7 +294,7 @@ defmodule AxonRoom.StateResolver do
           case Enum.uniq(branch_states) do
             [] -> %{}
             [single] -> single
-            many -> StateResV2.resolve(many, &EventStore.get_event_map/1, room_version)
+            many -> resolve_many(many, room_version)
           end
 
         state_after = StateApplicator.apply(event, resolved_before)

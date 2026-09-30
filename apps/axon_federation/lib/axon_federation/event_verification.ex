@@ -52,8 +52,10 @@ defmodule AxonFederation.EventVerification do
   that it happened at all.
   """
 
+  alias AxonCore.MatrixId
   alias AxonCrypto.{EventHash, Redaction}
   alias AxonFederation.KeyCache
+  alias AxonRoom.RoomVersions
 
   require Logger
 
@@ -74,10 +76,36 @@ defmodule AxonFederation.EventVerification do
   """
   @spec verify(map(), binary()) :: {:ok, map()} | {:error, atom()}
   def verify(event, room_version) do
-    with :ok <- verify_signature(event, room_version) do
+    with :ok <- verify_signature(event, room_version),
+         :ok <- verify_authoriser_signature(event, room_version) do
       {:ok, content_hash_checked(event, room_version)}
     end
   end
+
+  @doc """
+  Room versions 8+: a join carrying `join_authorised_via_users_server` must
+  also be signed by the authorising user's server. `:ok` for any other event.
+  """
+  def verify_authoriser_signature(
+        %{
+          "type" => "m.room.member",
+          "content" => %{"membership" => "join", "join_authorised_via_users_server" => authoriser}
+        } = event,
+        room_version
+      ) do
+    cond do
+      not RoomVersions.at_least?(room_version, 8) ->
+        :ok
+
+      server = is_binary(authoriser) && MatrixId.server_name(authoriser) ->
+        verify_signature_from(event, server, room_version)
+
+      true ->
+        {:error, :missing_signature}
+    end
+  end
+
+  def verify_authoriser_signature(_event, _room_version), do: :ok
 
   @doc """
   `event` if its content hash is correct, otherwise its redacted form.
@@ -110,9 +138,17 @@ defmodule AxonFederation.EventVerification do
     end
   end
 
+  @doc """
+  The id of a PDU received over federation: the wire `event_id` for room
+  versions 1/2, the reference hash for 3+ (where a wire-supplied id is never
+  trusted).
+  """
+  def event_id(pdu, room_version) when room_version in ["1", "2"], do: pdu["event_id"]
+  def event_id(pdu, room_version), do: EventHash.reference_hash(pdu, room_version)
+
   @doc "Verifies `event`'s signature from its sender's server. Returns :ok or {:error, reason}."
   def verify_signature(event, room_version) do
-    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
+    sender_server = event["sender"] |> to_string() |> MatrixId.server_name()
 
     if is_nil(sender_server) do
       {:error, :missing_sender}
@@ -143,7 +179,8 @@ defmodule AxonFederation.EventVerification do
           :ok ->
             :ok
 
-          {:error, _} -> {:error, :bad_signature}
+          {:error, _} ->
+            {:error, :bad_signature}
         end
       end
     end

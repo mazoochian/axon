@@ -8,6 +8,8 @@ defmodule AxonRoom.AuthRules do
   Spec: https://spec.matrix.org/latest/rooms/v11/#authorization-rules
   """
 
+  alias AxonRoom.RoomVersions
+
   # ---------------------------------------------------------------------------
   # Public API
   # ---------------------------------------------------------------------------
@@ -17,9 +19,17 @@ defmodule AxonRoom.AuthRules do
 
   Returns `:ok` or `{:error, atom}`.
   """
-  def check(event, current_state, room_version \\ "11") do
-    with :ok <- check_type_specific(event, current_state, room_version) do
-      :ok
+  def check(event, current_state, room_version \\ "11"),
+    do: check_type_specific(event, current_state, room_version)
+
+  @doc """
+  The room version recorded in `current_state`'s create event. Per spec a
+  create event without `room_version` denotes room version "1".
+  """
+  def room_version(current_state) do
+    case current_state[{"m.room.create", ""}] do
+      %{"content" => %{"room_version" => v}} when is_binary(v) -> v
+      _ -> "1"
     end
   end
 
@@ -34,14 +44,27 @@ defmodule AxonRoom.AuthRules do
   `check/3` uses for state events — including room-v12 creator infinite
   power — rather than reimplementing power-level arithmetic themselves.
   """
-  def can_send_state?(user_id, event_type, current_state, version \\ "11") do
+  def can_send_state?(user_id, event_type, current_state, version \\ "11"),
+    do: can_send?(user_id, event_type, true, current_state, version)
+
+  @doc "Whether `user_id` is a syntactically valid user ID (`@localpart:server_name`)."
+  def valid_user_id?(id) when is_binary(id) do
+    case String.split(id, ":", parts: 2) do
+      ["@" <> localpart, domain] -> localpart != "" and valid_server_name?(domain)
+      _ -> false
+    end
+  end
+
+  def valid_user_id?(_), do: false
+
+  defp can_send?(user_id, event_type, state?, current_state, version) do
     pl = power_levels(current_state)
+    effective_power(user_id, pl, current_state, version) >= required_level(pl, event_type, state?)
+  end
 
-    required =
-      get_in(pl, ["events", event_type]) ||
-        Map.get(pl, "state_default", 50)
-
-    effective_power(user_id, pl, current_state, version) >= required
+  defp required_level(pl, event_type, state?) do
+    {key, default} = if state?, do: {"state_default", 50}, else: {"events_default", 0}
+    to_level(as_map(pl["events"])[event_type]) || level(pl, key, default)
   end
 
   # ---------------------------------------------------------------------------
@@ -81,8 +104,9 @@ defmodule AxonRoom.AuthRules do
     with :ok <- check_sender_joined(event, current_state),
          :ok <- check_power_level_values_in_range(event),
          :ok <- check_power_level_for_state(event, current_state, version),
+         :ok <- check_power_levels_content(event["content"], version),
          :ok <- check_creators_excluded_from_power_levels(event, current_state, version) do
-      :ok
+      check_power_levels_changes(event, current_state, version)
     end
   end
 
@@ -102,17 +126,17 @@ defmodule AxonRoom.AuthRules do
 
   defp check_type_specific(%{"state_key" => _} = event, current_state, version) do
     # Generic state event
-    with :ok <- check_sender_joined(event, current_state),
-         :ok <- check_power_level_for_state(event, current_state, version) do
-      :ok
+    with :ok <- check_sender_joined(event, current_state) do
+      check_power_level_for_state(event, current_state, version)
     end
   end
 
   defp check_type_specific(event, current_state, version) do
     # Message / non-state event
-    with :ok <- check_sender_joined(event, current_state),
-         :ok <- check_power_level_for_send(event, current_state, version) do
-      :ok
+    with :ok <- check_sender_joined(event, current_state) do
+      if can_send?(event["sender"], event["type"], false, current_state, version),
+        do: :ok,
+        else: {:error, :insufficient_power}
     end
   end
 
@@ -123,15 +147,6 @@ defmodule AxonRoom.AuthRules do
       _ -> false
     end
   end
-
-  defp valid_user_id?(id) when is_binary(id) do
-    case String.split(id, ":", parts: 2) do
-      ["@" <> localpart, domain] -> localpart != "" and valid_server_name?(domain)
-      _ -> false
-    end
-  end
-
-  defp valid_user_id?(_), do: false
 
   # Server name grammar (hostname / IPv4 / bracketed IPv6, optional :port —
   # see the Matrix spec's server name grammar). Deliberately conservative:
@@ -169,6 +184,9 @@ defmodule AxonRoom.AuthRules do
       sender != target ->
         {:error, :cannot_join_for_another}
 
+      initial_creator_join?(event, sender, current_state) ->
+        :ok
+
       true ->
         sender_membership = current_membership(sender, current_state)
         join_rule = join_rule(current_state)
@@ -187,13 +205,10 @@ defmodule AxonRoom.AuthRules do
             :ok
 
           join_rule == "invite" ->
-            # Allow if invited OR if a room creator (initial join before join_rules event exists)
-            if sender_membership == "invite" or room_creator?(sender, current_state, version),
-              do: :ok,
-              else: {:error, :not_invited}
+            if sender_membership == "invite", do: :ok, else: {:error, :not_invited}
 
           join_rule in ["restricted", "knock_restricted"] ->
-            check_restricted_join(event, sender, sender_membership, current_state, version)
+            check_restricted_join(event, sender_membership, current_state, version)
 
           join_rule == "knock" ->
             # Spec rule 4.3.4: "If the join_rule is invite or knock then
@@ -210,6 +225,28 @@ defmodule AxonRoom.AuthRules do
         end
     end
   end
+
+  # Rule 4.3.1: the creator's own first join, whose only prev_event is the
+  # create event. This is the only way a creator joins without an invite.
+  defp initial_creator_join?(event, sender, current_state) do
+    case current_state[{"m.room.create", ""}] do
+      %{"sender" => ^sender, "event_id" => create_id} when is_binary(create_id) ->
+        prev_event_ids(event["prev_events"]) == [create_id]
+
+      _ ->
+        false
+    end
+  end
+
+  # Room versions 1/2 encode prev_events as [event_id, hashes] pairs.
+  defp prev_event_ids(prev_events) when is_list(prev_events),
+    do:
+      Enum.map(prev_events, fn
+        [id | _] -> id
+        id -> id
+      end)
+
+  defp prev_event_ids(_), do: []
 
   # Third-party invites: a join whose content.third_party_invite.signed
   # names this sender, references a token matching a live
@@ -281,11 +318,11 @@ defmodule AxonRoom.AuthRules do
   # `join_authorised_via_users_server` user who is currently joined to *this*
   # room with at least invite power. Trusting that stamp is safe because the
   # event is signed by the authorising user's own homeserver.
-  defp check_restricted_join(event, sender, sender_membership, current_state, version) do
+  defp check_restricted_join(event, sender_membership, current_state, version) do
     authoriser = get_in(event, ["content", "join_authorised_via_users_server"])
 
     cond do
-      sender_membership == "invite" or room_creator?(sender, current_state, version) ->
+      sender_membership == "invite" ->
         :ok
 
       is_binary(authoriser) and current_membership(authoriser, current_state) == "join" and
@@ -408,33 +445,7 @@ defmodule AxonRoom.AuthRules do
   end
 
   defp check_power_level_for_state(event, current_state, version) do
-    sender = event["sender"]
-    event_type = event["type"]
-    pl = power_levels(current_state)
-
-    required =
-      get_in(pl, ["events", event_type]) ||
-        Map.get(pl, "state_default", 50)
-
-    sender_pl = effective_power(sender, pl, current_state, version)
-
-    if sender_pl >= required,
-      do: :ok,
-      else: {:error, :insufficient_power}
-  end
-
-  defp check_power_level_for_send(event, current_state, version) do
-    sender = event["sender"]
-    event_type = event["type"]
-    pl = power_levels(current_state)
-
-    required =
-      get_in(pl, ["events", event_type]) ||
-        Map.get(pl, "events_default", 0)
-
-    sender_pl = effective_power(sender, pl, current_state, version)
-
-    if sender_pl >= required,
+    if can_send_state?(event["sender"], event["type"], current_state, version),
       do: :ok,
       else: {:error, :insufficient_power}
   end
@@ -467,6 +478,86 @@ defmodule AxonRoom.AuthRules do
     do: Enum.flat_map(value, &collect_integers/1)
 
   defp collect_integers(_value), do: []
+
+  @pl_levels ~w(users_default events_default state_default ban redact kick invite)
+
+  # Rules 10.1-10.3: top-level levels must be integers; events,
+  # notifications and users must be objects of integers, users keyed by
+  # user ID. Room versions before 10 also accept integer-valued strings.
+  defp check_power_levels_content(content, version) when is_map(content) do
+    valid? =
+      Enum.all?(@pl_levels, &(not Map.has_key?(content, &1) or level?(content[&1], version))) and
+        Enum.all?(
+          ["events", "notifications", "users"],
+          &(not Map.has_key?(content, &1) or level_map?(content[&1], version))
+        ) and
+        Enum.all?(Map.keys(as_map(content["users"])), &power_levels_user_key?/1)
+
+    if valid?, do: :ok, else: {:error, :invalid_power_levels}
+  end
+
+  defp check_power_levels_content(_content, _version), do: {:error, :invalid_power_levels}
+
+  defp level?(value, version) do
+    if RoomVersions.at_least?(version, 10), do: is_integer(value), else: to_level(value) != nil
+  end
+
+  defp level_map?(map, version) when is_map(map),
+    do: Enum.all?(Map.values(map), &level?(&1, version))
+
+  defp level_map?(_map, _version), do: false
+
+  defp power_levels_user_key?("@" <> _ = user_id),
+    do: AxonCore.MatrixId.server_name(user_id) != nil
+
+  defp power_levels_user_key?(_), do: false
+
+  # Rules 10.5-10.10: with a previous power_levels event, every changed
+  # level must be within the sender's own power, both before and after the
+  # change; another user's entry may only be changed while it is below the
+  # sender's power.
+  defp check_power_levels_changes(event, current_state, version) do
+    case current_state[{"m.room.power_levels", ""}] do
+      %{"content" => old} when is_map(old) ->
+        new = event["content"]
+        sender = event["sender"]
+
+        sender_level =
+          effective_power(sender, power_levels(current_state), current_state, version)
+
+        sections =
+          if RoomVersions.at_least?(version, 6), do: ["events", "notifications"], else: ["events"]
+
+        user_changes = changed_levels(as_map(old["users"]), as_map(new["users"]))
+
+        changes =
+          changed_levels(old, new, @pl_levels) ++
+            Enum.flat_map(sections, &changed_levels(as_map(old[&1]), as_map(new[&1]))) ++
+            user_changes
+
+        allowed? =
+          Enum.all?(changes, fn {_key, old_level, new_level} ->
+            within?(old_level, sender_level) and within?(new_level, sender_level)
+          end) and
+            Enum.all?(user_changes, fn {user_id, old_level, _new_level} ->
+              user_id == sender or old_level == nil or old_level < sender_level
+            end)
+
+        if allowed?, do: :ok, else: {:error, :insufficient_power}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp changed_levels(old, new, keys \\ nil) do
+    (keys || Enum.uniq(Map.keys(old) ++ Map.keys(new)))
+    |> Enum.map(&{&1, to_level(old[&1]), to_level(new[&1])})
+    |> Enum.reject(fn {_key, old_level, new_level} -> old_level == new_level end)
+  end
+
+  defp within?(nil, _sender_level), do: true
+  defp within?(level, sender_level), do: level <= sender_level
 
   # Rule 10.4 (room v12): the users map in a new m.room.power_levels event
   # must not contain the sender of m.room.create or any of the
@@ -535,10 +626,28 @@ defmodule AxonRoom.AuthRules do
 
   defp power_levels(current_state) do
     case current_state[{"m.room.power_levels", ""}] do
-      nil -> %{}
-      event -> event["content"] || %{}
+      %{"content" => content} when is_map(content) -> content
+      _ -> %{}
     end
   end
+
+  defp as_map(value) when is_map(value), do: value
+  defp as_map(_value), do: %{}
+
+  # A malformed (or pre-v10 string-valued) level never crashes a
+  # comparison: integer-valued strings are parsed, anything else is absent.
+  defp to_level(value) when is_integer(value), do: value
+
+  defp to_level(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {n, ""} -> n
+      _ -> nil
+    end
+  end
+
+  defp to_level(_value), do: nil
+
+  defp level(pl, key, default), do: to_level(pl[key]) || default
 
   # Room v12: creators have unconditional, infinite power — never listed in
   # power_levels.users, can never be outranked or demoted (rule: "cannot be
@@ -574,28 +683,23 @@ defmodule AxonRoom.AuthRules do
     end
   end
 
-  defp sender_power(user_id, pl) do
-    users = Map.get(pl, "users", %{})
-    Map.get(users, user_id, Map.get(pl, "users_default", 0))
-  end
+  defp sender_power(user_id, pl),
+    do: to_level(as_map(pl["users"])[user_id]) || level(pl, "users_default", 0)
 
   defp has_power?(user_id, action, current_state, version) do
     pl = power_levels(current_state)
-    required = Map.get(pl, action, default_pl_for(action))
-    effective_power(user_id, pl, current_state, version) >= required
+
+    effective_power(user_id, pl, current_state, version) >=
+      level(pl, action, default_pl_for(action))
   end
 
   defp has_power_over?(sender, target, action, current_state, version) do
     pl = power_levels(current_state)
-    required = Map.get(pl, action, default_pl_for(action))
     sender_pl = effective_power(sender, pl, current_state, version)
     target_pl = effective_power(target, pl, current_state, version)
-    sender_pl >= required && sender_pl > target_pl
+    sender_pl >= level(pl, action, default_pl_for(action)) && sender_pl > target_pl
   end
 
   defp default_pl_for("invite"), do: 0
-  defp default_pl_for("kick"), do: 50
-  defp default_pl_for("ban"), do: 50
-  defp default_pl_for("redact"), do: 50
   defp default_pl_for(_), do: 50
 end

@@ -116,7 +116,7 @@ defmodule AxonFederation.KeyCache do
   end
 
   defp do_get(url) do
-    req = Finch.build(:get, url, [{"user-agent", "Axon/1.0"}])
+    req = Finch.build(:get, url, [{"user-agent", AxonFederation.HttpClient.user_agent()}])
 
     case Finch.request(req, Axon.Finch, receive_timeout: 10_000) do
       {:ok, %{status: 200, body: body}} -> {:ok, body}
