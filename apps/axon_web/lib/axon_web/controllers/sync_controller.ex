@@ -41,7 +41,7 @@ defmodule AxonWeb.SyncController do
     user_id = conn.assigns.current_user_id
     device_id = conn.assigns.current_device_id
     since = params["since"]
-    timeout = min(String.to_integer(params["timeout"] || "0"), 30_000)
+    timeout = AxonWeb.Params.int(params["timeout"], 0, 0, 30_000)
 
     if params["set_presence"] in ["online", "unavailable", "offline"] do
       Presence.set_presence(user_id, params["set_presence"])
@@ -142,22 +142,25 @@ defmodule AxonWeb.SyncController do
   defp load_filter(_user_id, nil), do: %{}
 
   defp load_filter(user_id, filter_param) do
-    # filter_param can be an ID (stored) or inline JSON
+    # filter_param is either inline JSON or the ID of a stored filter
     case Jason.decode(filter_param) do
-      {:ok, inline} ->
-        inline
+      {:ok, inline} when is_map(inline) -> inline
+      _ -> load_stored_filter(user_id, filter_param)
+    end
+  end
 
-      {:error, _} ->
-        # treat as filter_id
-        case Repo.one(
-               from(f in "user_filters",
-                 where: f.filter_id == ^filter_param and f.user_id == ^user_id,
-                 select: f.filter
-               )
-             ) do
-          nil -> %{}
-          json_str -> Jason.decode!(json_str)
-        end
+  defp load_stored_filter(user_id, filter_id) do
+    stored =
+      Repo.one(
+        from(f in "user_filters",
+          where: f.filter_id == ^filter_id and f.user_id == ^user_id,
+          select: f.filter
+        )
+      )
+
+    case stored && Jason.decode(stored) do
+      {:ok, filter} when is_map(filter) -> filter
+      _ -> %{}
     end
   end
 
@@ -367,17 +370,10 @@ defmodule AxonWeb.SyncController do
     {state_events, timeline_events, limited, prev_batch} =
       cond do
         is_initial_sync ->
-          build_initial_room_data(room_id, room_events, tl_limit, since_ordering)
+          build_initial_room_data(room_id, room_events, tl_limit)
 
         newly_joined ->
-          build_newly_joined_room_data(
-            room_id,
-            user_id,
-            room_events,
-            tl_limit,
-            tl_filter,
-            since_ordering
-          )
+          build_newly_joined_room_data(room_id, user_id, room_events, tl_limit)
 
         true ->
           build_incremental_room_data(room_events, tl_limit, since_ordering)
@@ -393,7 +389,7 @@ defmodule AxonWeb.SyncController do
     filtered_timeline = apply_event_filter(timeline_events, tl_filter)
 
     ephemeral =
-      SyncHelpers.build_receipt_events(room_id) ++
+      SyncHelpers.build_receipt_events(room_id, user_id) ++
         SyncHelpers.build_typing_event(room_id, is_initial_sync)
 
     room_account_data = SyncHelpers.build_room_account_data(room_id, user_id)
@@ -428,7 +424,7 @@ defmodule AxonWeb.SyncController do
   end
 
   # Initial sync: state = full current state, timeline = most recent events
-  defp build_initial_room_data(room_id, room_events, tl_limit, _since_ordering) do
+  defp build_initial_room_data(room_id, room_events, tl_limit) do
     full_state = EventStore.get_current_state(room_id) |> Enum.map(&EventStore.event_to_map/1)
 
     {limited, tl_events} =
@@ -482,14 +478,7 @@ defmodule AxonWeb.SyncController do
   end
 
   # Newly joined room: state = full room state, timeline = events after join (limited=true for history)
-  defp build_newly_joined_room_data(
-         room_id,
-         user_id,
-         room_events,
-         tl_limit,
-         _tl_filter,
-         since_ordering
-       ) do
+  defp build_newly_joined_room_data(room_id, user_id, room_events, tl_limit) do
     full_state = EventStore.get_current_state(room_id) |> Enum.map(&EventStore.event_to_map/1)
 
     # Find the join event ordering
@@ -519,12 +508,9 @@ defmodule AxonWeb.SyncController do
         {true, events_after_join}
       end
 
-    # suppress unused warning
-    _ = since_ordering
-
     prev =
       if tl_events != [] do
-        # No `- 1` — see build_initial_room_data/4's matching branch for
+        # No `- 1` — see build_initial_room_data/3's matching branch for
         # why: get_messages/4's dir=b bound is already exclusive of
         # `from_ordering`, so the earliest timeline event's own ordering
         # is already the correct "everything strictly before here"
@@ -563,13 +549,13 @@ defmodule AxonWeb.SyncController do
         limited and tl_events != [] ->
           # No `- 1` — same boundary this function's own `cutoff` above
           # already uses with a strict `<`, and the same reasoning as
-          # build_initial_room_data/4's matching branch: get_messages/4's
+          # build_initial_room_data/3's matching branch: get_messages/4's
           # dir=b bound is already exclusive of `from_ordering`
           # (Complement: TestNetworkPartitionOrdering).
           Integer.to_string(hd(tl_events).stream_ordering)
 
         tl_events != [] ->
-          # Not limited: see build_initial_room_data/4's matching branch —
+          # Not limited: see build_initial_room_data/3's matching branch —
           # same "this token must mean *as of this response*" reasoning.
           Integer.to_string(List.last(tl_events).stream_ordering)
 
@@ -658,7 +644,7 @@ defmodule AxonWeb.SyncController do
     end
   end
 
-  defp invite_from_ignored?(room_id, _user_id, ignored_users) do
+  defp invite_from_ignored?(room_id, user_id, ignored_users) do
     if MapSet.size(ignored_users) == 0 do
       false
     else
@@ -668,6 +654,7 @@ defmodule AxonWeb.SyncController do
             where:
               e.room_id == ^room_id and
                 e.type == "m.room.member" and
+                e.state_key == ^user_id and
                 fragment("?->>'membership'", e.content) == "invite",
             order_by: [desc: e.stream_ordering],
             limit: 1,

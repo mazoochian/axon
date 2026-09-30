@@ -1,7 +1,7 @@
 defmodule AxonWeb.ServerNotices do
   @moduledoc """
   Synapse-style server notices: a reserved system account
-  (`@server-notices:<server_name>`) that an admin can use to push a message
+  (`@_server:<server_name>`) that an admin can use to push a message
   into a dedicated, auto-created room with any local user — e.g. "your
   account will be deactivated", "this server is shutting down for
   maintenance". Lazily provisions both the system account and, per
@@ -23,8 +23,7 @@ defmodule AxonWeb.ServerNotices do
   @provision_lock_timeout_ms 1_000
 
   def system_user_id do
-    server_name = Application.fetch_env!(:axon_web, :server_name)
-    "@#{@system_localpart}:#{server_name}"
+    "@#{@system_localpart}:#{AxonWeb.ServerName.get()}"
   end
 
   @doc "Sends `content` (a full m.room.message-shaped map) to `user_id`'s server notices room, creating it if needed. Returns {:ok, event_id} or {:error, reason}."
@@ -48,10 +47,8 @@ defmodule AxonWeb.ServerNotices do
     if Repo.exists?(from(u in "users", where: u.user_id == ^system_user_id())) do
       :ok
     else
-      server_name = Application.fetch_env!(:axon_web, :server_name)
-
       case UserStore.register(@system_localpart, nil,
-             server_name: server_name,
+             server_name: AxonWeb.ServerName.get(),
              display_name: "Server Notices"
            ) do
         {:ok, _} -> :ok
@@ -141,11 +138,9 @@ defmodule AxonWeb.ServerNotices do
   end
 
   defp create_room(user_id) do
-    server_name = Application.fetch_env!(:axon_web, :server_name)
-
     with {:ok, room_id} <-
            CreateRoom.execute(system_user_id(),
-             server_name: server_name,
+             server_name: AxonWeb.ServerName.get(),
              preset: "trusted_private_chat",
              name: "Server Notices",
              invite: [user_id],

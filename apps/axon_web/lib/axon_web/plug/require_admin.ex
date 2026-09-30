@@ -24,9 +24,9 @@ defmodule AxonWeb.Plug.RequireAdmin do
     end
   end
 
-  defp admin?(nil), do: false
+  def admin?(nil), do: false
 
-  defp admin?(user_id) do
+  def admin?(user_id) do
     import Ecto.Query
     Repo.one(from(u in "users", where: u.user_id == ^user_id, select: u.admin)) || false
   end

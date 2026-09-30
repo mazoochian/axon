@@ -142,7 +142,9 @@ defmodule AxonWeb.SearchControllerTest do
     send_message(alice.token, room_id, "three")
     send_message(alice.token, room_id, "four")
 
-    conn = search(alice.token, unique, %{"event_context" => %{"before_limit" => 2, "after_limit" => 2}})
+    conn =
+      search(alice.token, unique, %{"event_context" => %{"before_limit" => 2, "after_limit" => 2}})
+
     [result] = decode(conn)["search_categories"]["room_events"]["results"]
 
     before_bodies = Enum.map(result["context"]["events_before"], & &1["content"]["body"])

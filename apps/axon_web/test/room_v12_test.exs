@@ -105,14 +105,18 @@ defmodule AxonWeb.RoomV12Test do
       pl = decode(pl_conn)
 
       # 2^53, one past the largest integer canonical JSON can round-trip.
-      too_big = Map.put(pl, "users", Map.put(pl["users"] || %{}, bob.user_id, 9_007_199_254_740_992))
+      too_big =
+        Map.put(pl, "users", Map.put(pl["users"] || %{}, bob.user_id, 9_007_199_254_740_992))
+
       conn = send_state(alice.token, room_id, "m.room.power_levels", "", too_big)
 
       assert conn.status == 400
       assert %{"errcode" => "M_BAD_JSON"} = decode(conn)
 
       # The largest value that *does* fit is accepted.
-      ok_pl = Map.put(pl, "users", Map.put(pl["users"] || %{}, bob.user_id, 9_007_199_254_740_991))
+      ok_pl =
+        Map.put(pl, "users", Map.put(pl["users"] || %{}, bob.user_id, 9_007_199_254_740_991))
+
       conn = send_state(alice.token, room_id, "m.room.power_levels", "", ok_pl)
 
       assert conn.status == 200
@@ -248,12 +252,15 @@ defmodule AxonWeb.RoomV12Test do
       assert is_binary(event_id)
 
       fresh_sync = authed(alice.token) |> get("/_matrix/client/v3/sync")
-      fresh_events = get_in(decode(fresh_sync), ["rooms", "join", room_id, "timeline", "events"]) || []
+
+      fresh_events =
+        get_in(decode(fresh_sync), ["rooms", "join", room_id, "timeline", "events"]) || []
 
       assert Enum.any?(fresh_events, &(&1["event_id"] == event_id)),
              "expected #{event_id} in a fresh sync's timeline, got #{inspect(Enum.map(fresh_events, & &1["event_id"]))}"
 
-      incremental_sync = authed(alice.token) |> get("/_matrix/client/v3/sync?since=#{since}&timeout=0")
+      incremental_sync =
+        authed(alice.token) |> get("/_matrix/client/v3/sync?since=#{since}&timeout=0")
 
       incremental_events =
         get_in(decode(incremental_sync), ["rooms", "join", room_id, "timeline", "events"]) || []
@@ -360,10 +367,11 @@ defmodule AxonWeb.RoomV12Test do
 
       assert conn.status == 200
 
-      target_event_id = send_event(alice.token, room_id, "m.room.message", %{
-        "msgtype" => "m.text",
-        "body" => "redact me"
-      })
+      target_event_id =
+        send_event(alice.token, room_id, "m.room.message", %{
+          "msgtype" => "m.text",
+          "body" => "redact me"
+        })
 
       txn_id = "txn_redact_#{System.unique_integer([:positive])}"
 
@@ -442,7 +450,10 @@ defmodule AxonWeb.RoomV12Test do
           "power_level_content_override" => %{"users" => %{bob.user_id => 100}}
         })
 
-      conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+      conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+
       assert conn.status == 200
       assert decode(conn)["users"] == %{bob.user_id => 100}
     end
@@ -477,7 +488,10 @@ defmodule AxonWeb.RoomV12Test do
       alice = register("v12_upgrade_alice_#{System.unique_integer([:positive])}")
       room_id = create_room(alice.token, %{"room_version" => "12", "preset" => "public_chat"})
 
-      pl_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+      pl_conn =
+        authed(alice.token)
+        |> get("/_matrix/client/v3/rooms/#{room_id}/state/m.room.power_levels")
+
       refute Map.has_key?(decode(pl_conn)["users"] || %{}, alice.user_id)
 
       conn =

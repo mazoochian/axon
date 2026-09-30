@@ -44,7 +44,9 @@ defmodule AxonWeb.AuthController do
   )
 
   import Ecto.Query, only: [from: 2]
+  import AxonCore.MapUtil, only: [maybe_put: 3]
   alias AxonCore.{UserStore, Repo}
+  alias AxonWeb.{Devices, UIA}
 
   # POST /_matrix/client/v3/register
   def register(conn, params) do
@@ -82,7 +84,7 @@ defmodule AxonWeb.AuthController do
       username = params["username"]
       password = params["password"]
 
-      if username && !valid_localpart?(username) do
+      if username && !allowed_localpart?(username) do
         conn
         |> put_status(400)
         |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
@@ -101,25 +103,33 @@ defmodule AxonWeb.AuthController do
             |> put_status(401)
             |> json(%{
               "flows" => [%{"stages" => ["m.login.dummy"]}],
-              "session" => gen_session(),
+              "session" => UIA.session(),
               "params" => %{}
             })
           else
-            unless username do
-              conn
-              |> put_status(400)
-              |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
-            else
-              opts = [
-                server_name: server_name(),
-                device_id: params["device_id"],
-                display_name: username,
-                refresh_token: refresh_requested?(params)
-              ]
+            cond do
+              is_nil(username) ->
+                conn
+                |> put_status(400)
+                |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
 
-              with {:ok, result} <- UserStore.register(String.downcase(username), password, opts) do
-                conn |> put_status(200) |> json(login_response(result))
-              end
+              not (is_nil(password) or is_binary(password)) ->
+                conn
+                |> put_status(400)
+                |> json(%{"errcode" => "M_INVALID_PARAM", "error" => "password must be a string"})
+
+              true ->
+                opts = [
+                  server_name: server_name(),
+                  device_id: params["device_id"],
+                  display_name: username,
+                  refresh_token: refresh_requested?(params)
+                ]
+
+                with {:ok, result} <-
+                       UserStore.register(String.downcase(username), password, opts) do
+                  conn |> put_status(200) |> json(login_response(result))
+                end
             end
           end
         end
@@ -145,7 +155,7 @@ defmodule AxonWeb.AuthController do
         |> put_status(400)
         |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "username required"})
 
-      !valid_localpart?(username) ->
+      !allowed_localpart?(username) ->
         conn
         |> put_status(400)
         |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
@@ -178,53 +188,25 @@ defmodule AxonWeb.AuthController do
     auth = params["auth"]
     logout_devices = Map.get(params, "logout_devices", true)
 
-    if is_nil(new_password) do
+    if not is_binary(new_password) do
       conn
       |> put_status(400)
       |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "new_password required"})
     else
-      if is_nil(auth) do
-        conn
-        |> put_status(401)
-        |> json(%{
-          "session" => gen_session(),
-          "flows" => [%{"stages" => ["m.login.password"]}],
-          "params" => %{}
-        })
-      else
-        if validate_ui_auth(user_id, auth) == :ok do
-          new_hash = Argon2.hash_pwd_salt(new_password)
+      UIA.authorize(conn, user_id, auth, fn ->
+        new_hash = Argon2.hash_pwd_salt(new_password)
 
-          Repo.update_all(from(u in "users", where: u.user_id == ^user_id),
-            set: [password_hash: new_hash]
-          )
+        Repo.update_all(from(u in "users", where: u.user_id == ^user_id),
+          set: [password_hash: new_hash]
+        )
 
-          if logout_devices do
-            UserStore.logout_all(user_id, conn.assigns.current_token)
-
-            # Pushers on the device making this request survive (that device
-            # isn't being logged out); pushers registered under any other
-            # device — now logged out — are deleted along with it.
-            Repo.delete_all(
-              from(p in "pushers",
-                where: p.user_id == ^user_id and p.device_id != ^conn.assigns.current_device_id
-              )
-            )
-          end
-
-          json(conn, %{})
-        else
-          conn
-          |> put_status(401)
-          |> json(%{
-            "session" => gen_session(),
-            "flows" => [%{"stages" => ["m.login.password"]}],
-            "params" => %{},
-            "errcode" => "M_FORBIDDEN",
-            "error" => "Invalid credentials"
-          })
+        if logout_devices do
+          UserStore.logout_all(user_id, conn.assigns.current_token)
+          Devices.delete_pushers_except(user_id, conn.assigns.current_device_id)
         end
-      end
+
+        json(conn, %{})
+      end)
     end
   end
 
@@ -236,37 +218,14 @@ defmodule AxonWeb.AuthController do
     user_id = conn.assigns.current_user_id
     auth = params["auth"]
 
-    cond do
-      AxonWeb.Oidc.enabled?() ->
-        do_deactivate(conn, user_id)
-
-      is_nil(auth) ->
-        conn
-        |> put_status(401)
-        |> json(%{
-          "session" => gen_session(),
-          "flows" => [%{"stages" => ["m.login.password"]}],
-          "params" => %{}
-        })
-
-      validate_ui_auth(user_id, auth) == :ok ->
-        do_deactivate(conn, user_id)
-
-      true ->
-        conn
-        |> put_status(401)
-        |> json(%{
-          "session" => gen_session(),
-          "flows" => [%{"stages" => ["m.login.password"]}],
-          "params" => %{},
-          "errcode" => "M_FORBIDDEN",
-          "error" => "Invalid credentials"
-        })
-    end
+    if AxonWeb.Oidc.enabled?(),
+      do: do_deactivate(conn, user_id),
+      else: UIA.authorize(conn, user_id, auth, fn -> do_deactivate(conn, user_id) end)
   end
 
   defp do_deactivate(conn, user_id) do
     UserStore.deactivate(user_id)
+    Devices.delete_pushers_except(user_id, nil)
     json(conn, %{"id_server_unbind_result" => "success"})
   end
 
@@ -324,7 +283,15 @@ defmodule AxonWeb.AuthController do
     is_admin = params["admin"] == true
 
     cond do
-      is_nil(username) || !valid_localpart?(username) ->
+      not is_binary(password) or not is_binary(nonce) ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_INVALID_PARAM",
+          "error" => "password and nonce must be strings"
+        })
+
+      is_nil(username) || !allowed_localpart?(username) ->
         conn
         |> put_status(400)
         |> json(%{"errcode" => "M_INVALID_USERNAME", "error" => "Invalid username"})
@@ -382,7 +349,7 @@ defmodule AxonWeb.AuthController do
         user = identifier["user"] || params["user"]
         password = params["password"]
 
-        unless user && password do
+        unless is_binary(user) and is_binary(password) do
           conn
           |> put_status(400)
           |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "user and password required"})
@@ -468,9 +435,6 @@ defmodule AxonWeb.AuthController do
     |> maybe_put("refresh_token", result[:refresh_token])
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
   # GET /_matrix/client/v3/login (list supported login types)
   def login_types(conn, _params) do
     flows = if AxonWeb.Oidc.enabled?(), do: [], else: [%{"type" => "m.login.password"}]
@@ -497,12 +461,14 @@ defmodule AxonWeb.AuthController do
   # POST /_matrix/client/v3/logout
   def logout(conn, _params) do
     UserStore.logout(conn.assigns.current_token)
+    Devices.delete_pushers(conn.assigns.current_user_id, [conn.assigns.current_device_id])
     json(conn, %{})
   end
 
   # POST /_matrix/client/v3/logout/all
   def logout_all(conn, _params) do
     UserStore.logout_all(conn.assigns.current_user_id)
+    Devices.delete_pushers_except(conn.assigns.current_user_id, nil)
     json(conn, %{})
   end
 
@@ -526,7 +492,10 @@ defmodule AxonWeb.AuthController do
     if user_id != conn.assigns.current_user_id do
       conn
       |> put_status(403)
-      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Cannot request an OpenID token for another user"})
+      |> json(%{
+        "errcode" => "M_FORBIDDEN",
+        "error" => "Cannot request an OpenID token for another user"
+      })
     else
       {token, expires_in} = AxonWeb.OpenidTokens.issue(user_id)
 
@@ -539,50 +508,24 @@ defmodule AxonWeb.AuthController do
     end
   end
 
-  defp server_name, do: Application.fetch_env!(:axon_web, :server_name)
+  defp server_name, do: AxonWeb.ServerName.get()
 
   # Moved to AxonCore.MatrixId so AxonWeb.Oidc can apply the *same* rule to
   # the `username` claim it takes off an introspection response, rather than
   # trusting it verbatim while /register refuses the identical string.
   defp valid_localpart?(localpart), do: AxonCore.MatrixId.valid_localpart?(localpart)
 
+  # A leading "_" is reserved for system accounts (the server-notices sender,
+  # appservice senders) and "guest_" for guest accounts, so neither can be
+  # claimed through registration ahead of the server provisioning it.
+  defp allowed_localpart?(localpart) do
+    valid_localpart?(localpart) and
+      not String.starts_with?(String.downcase(localpart), ["_", "guest_"])
+  end
+
   defp user_exists?(user_id) do
     Repo.one(from(u in "users", where: u.user_id == ^user_id, select: u.user_id)) != nil
   end
-
-  defp gen_session, do: :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
-
-  defp validate_ui_auth(current_user_id, %{"type" => "m.login.password"} = auth) do
-    identifier =
-      case auth["identifier"] do
-        %{} = m -> m
-        _ -> %{}
-      end
-
-    auth_user = identifier["user"] || auth["user"]
-    password = auth["password"]
-
-    auth_user_id =
-      if auth_user && String.starts_with?(auth_user, "@"),
-        do: auth_user,
-        else: "@#{auth_user}:#{server_name()}"
-
-    if auth_user_id != current_user_id do
-      :error
-    else
-      case UserStore.get_user(current_user_id) do
-        {:ok, user} ->
-          if user.password_hash && Argon2.verify_pass(password, user.password_hash),
-            do: :ok,
-            else: :error
-
-        _ ->
-          :error
-      end
-    end
-  end
-
-  defp validate_ui_auth(_user_id, _auth), do: :error
 
   # Constant-time comparison (Plug.Crypto.secure_compare/2) rather than `==`,
   # so a MAC guess can't be refined a byte at a time off the response timing.

@@ -3,6 +3,8 @@ defmodule AxonWeb.ReceiptController do
 
   alias AxonCore.{EventStore, Repo}
 
+  @receipt_types ["m.read", "m.read.private", "m.fully_read"]
+
   # POST /_matrix/client/v3/rooms/:room_id/receipt/:receipt_type/:event_id
   def receipt(conn, %{
         "room_id" => room_id,
@@ -10,44 +12,67 @@ defmodule AxonWeb.ReceiptController do
         "event_id" => event_id
       }) do
     user_id = conn.assigns.current_user_id
-    ts = System.system_time(:millisecond)
 
-    store_receipt(room_id, user_id, receipt_type, event_id, ts)
+    cond do
+      receipt_type not in @receipt_types ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_INVALID_PARAM",
+          "error" => "Receipt type must be one of #{Enum.join(@receipt_types, ", ")}"
+        })
 
-    json(conn, %{})
+      not EventStore.joined?(room_id, user_id) ->
+        not_joined(conn)
+
+      true ->
+        put_marker(room_id, user_id, receipt_type, event_id, System.system_time(:millisecond))
+        json(conn, %{})
+    end
   end
 
   # POST /_matrix/client/v3/rooms/:room_id/read_markers
   def read_markers(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
-    ts = System.system_time(:millisecond)
 
-    if event_id = params["m.read"] do
-      store_receipt(room_id, user_id, "m.read", event_id, ts)
+    if EventStore.joined?(room_id, user_id) do
+      ts = System.system_time(:millisecond)
+
+      for type <- @receipt_types, event_id = params[type] do
+        put_marker(room_id, user_id, type, event_id, ts)
+      end
+
+      json(conn, %{})
+    else
+      not_joined(conn)
     end
-
-    if event_id = params["m.read.private"] do
-      store_receipt(room_id, user_id, "m.read.private", event_id, ts)
-    end
-
-    if event_id = params["m.fully_read"] do
-      Repo.insert_all(
-        "room_account_data",
-        [
-          %{
-            user_id: user_id,
-            room_id: room_id,
-            type: "m.fully_read",
-            content: %{"event_id" => event_id}
-          }
-        ],
-        on_conflict: {:replace, [:content]},
-        conflict_target: [:user_id, :room_id, :type]
-      )
-    end
-
-    json(conn, %{})
   end
+
+  defp not_joined(conn) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+  end
+
+  # m.fully_read is a room account-data marker, not a receipt.
+  defp put_marker(room_id, user_id, "m.fully_read", event_id, _ts) do
+    Repo.insert_all(
+      "room_account_data",
+      [
+        %{
+          user_id: user_id,
+          room_id: room_id,
+          type: "m.fully_read",
+          content: %{"event_id" => event_id}
+        }
+      ],
+      on_conflict: {:replace, [:content]},
+      conflict_target: [:user_id, :room_id, :type]
+    )
+  end
+
+  defp put_marker(room_id, user_id, receipt_type, event_id, ts),
+    do: store_receipt(room_id, user_id, receipt_type, event_id, ts)
 
   # Wakes any long-polling /sync for the room's members (previously nothing
   # broadcast at all, so a receipt with no accompanying new timeline event
@@ -84,8 +109,7 @@ defmodule AxonWeb.ReceiptController do
   # that owns the receipt's own user (dispatch_ephemeral/5's `private?: true`)
   # — it is never broadcast to every AS bridging the room the way a public
   # m.read receipt is.
-  defp dispatch_appservice_receipt(room_id, user_id, receipt_type, event_id, ts)
-       when receipt_type in ["m.read", "m.read.private"] do
+  defp dispatch_appservice_receipt(room_id, user_id, receipt_type, event_id, ts) do
     content = %{event_id => %{receipt_type => %{user_id => %{"ts" => ts}}}}
 
     AxonWeb.AppService.Manager.dispatch_ephemeral(
@@ -96,8 +120,6 @@ defmodule AxonWeb.ReceiptController do
       private?: receipt_type == "m.read.private"
     )
   end
-
-  defp dispatch_appservice_receipt(_room_id, _user_id, _receipt_type, _event_id, _ts), do: :ok
 
   defp federate_receipt(room_id, user_id, event_id, ts) do
     case EventStore.remote_servers_for_room(room_id) do

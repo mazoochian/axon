@@ -168,7 +168,12 @@ defmodule AxonWeb.E2E.E2eeMultiDeviceTest do
       authed(alice_1.token)
       |> jp(
         "/_matrix/client/v3/keys/device_signing/upload",
-        Map.put(rotated_payload, "auth", %{"type" => "m.login.dummy", "session" => session})
+        Map.put(rotated_payload, "auth", %{
+          "type" => "m.login.password",
+          "identifier" => %{"type" => "m.id.user", "user" => alice_1.user_id},
+          "password" => "Test1234!",
+          "session" => session
+        })
       )
 
     assert rotated_ok_conn.status == 200

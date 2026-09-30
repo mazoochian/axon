@@ -32,8 +32,7 @@ defmodule AxonWeb.IdentityServer do
   `id_access_token` — see `AxonWeb.OpenidTokens` and
   `AxonWeb.FederationController.openid_userinfo/2`).
 
-  `pubkey_valid?/2` results are cached (same GenServer+ETS shape
-  `AxonWeb.Oidc.Discovery` uses for its discovery documents) — a proof
+  `pubkey_valid?/2` results are cached in an ETS table this GenServer owns — a proof
   gets checked at every join attempt against a room's still-live
   `m.room.third_party_invite`, and identity servers don't expect every
   homeserver in a room to re-validate the same ephemeral key on every
@@ -45,7 +44,7 @@ defmodule AxonWeb.IdentityServer do
 
   @table :axon_identity_server_pubkey_cache
   @ttl_ms :timer.hours(1)
-  @timeout 10_000
+  @hostname_re ~r/\A(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+)(:\d{1,5})?\z/
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -63,21 +62,24 @@ defmodule AxonWeb.IdentityServer do
   Resolves the identity server base URL to use: the client's own
   `id_server` param (a bare domain per spec, e.g. `"vector.im"`) if
   given, else the configured `DEFAULT_IDENTITY_SERVER` (already a full
-  base URL). `{:error, :missing_id_server}` when neither is available —
-  the caller maps that to `M_MISSING_PARAM`, matching Synapse's own
-  `"id_server` and `id_access_token` are required when doing 3pid
-  invite"` rejection.
+  base URL). A client-supplied `id_server` must be a bare `host[:port]`
+  and is always contacted over https; anything else is
+  `{:error, :invalid_input}`. `{:error, :missing_id_server}` when neither
+  is available — the caller maps that to `M_MISSING_PARAM`, matching
+  Synapse's own `"id_server` and `id_access_token` are required when doing
+  3pid invite"` rejection.
   """
-  @spec resolve_id_server(map()) :: {:ok, String.t()} | {:error, :missing_id_server}
+  @spec resolve_id_server(map()) ::
+          {:ok, String.t()} | {:error, :missing_id_server | :invalid_input}
   def resolve_id_server(params) do
     case params["id_server"] do
       domain when is_binary(domain) and domain != "" ->
-        {:ok, normalize_base_url(domain)}
+        if domain =~ @hostname_re, do: {:ok, "https://" <> domain}, else: {:error, :invalid_input}
 
       _ ->
-        case Application.get_env(:axon_web, :default_identity_server) do
-          url when is_binary(url) and url != "" -> {:ok, normalize_base_url(url)}
-          _ -> {:error, :missing_id_server}
+        case default_base_url() do
+          nil -> {:error, :missing_id_server}
+          url -> {:ok, url}
         end
     end
   end
@@ -95,21 +97,21 @@ defmodule AxonWeb.IdentityServer do
   @spec resolve_id_access_token(map(), String.t(), String.t()) ::
           {:ok, String.t() | nil} | {:error, term()}
   def resolve_id_access_token(params, id_server, requester_user_id) do
-    default = Application.get_env(:axon_web, :default_identity_server)
-
     case params["id_access_token"] do
       token when is_binary(token) and token != "" ->
         {:ok, token}
 
-      _ when is_binary(default) and default != "" ->
-        if normalize_base_url(default) == id_server do
-          ensure_access_token(id_server, requester_user_id)
-        else
-          {:error, :missing_id_access_token}
-        end
-
       _ ->
-        {:error, :missing_id_access_token}
+        if default_base_url() == id_server,
+          do: ensure_access_token(id_server, requester_user_id),
+          else: {:error, :missing_id_access_token}
+    end
+  end
+
+  defp default_base_url do
+    case Application.get_env(:axon_web, :default_identity_server) do
+      url when is_binary(url) and url != "" -> normalize_base_url(url)
+      _ -> nil
     end
   end
 
@@ -267,39 +269,27 @@ defmodule AxonWeb.IdentityServer do
         valid?
 
       _ ->
-        GenServer.call(__MODULE__, {:check_pubkey, key_validity_url, public_key}, @timeout + 1000)
+        valid? = fetch_pubkey_valid?(key_validity_url, public_key)
+        :ets.insert(@table, {key, valid?, now + @ttl_ms})
+        valid?
     end
-  end
-
-  @impl true
-  def handle_call({:check_pubkey, key_validity_url, public_key}, _from, state) do
-    key = {key_validity_url, public_key}
-    now = System.monotonic_time(:millisecond)
-
-    # Re-check the cache: another caller may have already resolved this
-    # while we were waiting for the GenServer.
-    result =
-      case :ets.lookup(@table, key) do
-        [{^key, valid?, expires_at}] when expires_at > now ->
-          valid?
-
-        _ ->
-          valid? = fetch_pubkey_valid?(key_validity_url, public_key)
-          :ets.insert(@table, {key, valid?, now + @ttl_ms})
-          valid?
-      end
-
-    {:reply, result, state}
   end
 
   defp fetch_pubkey_valid?(key_validity_url, public_key) do
     url = key_validity_url <> "?public_key=" <> URI.encode_www_form(public_key)
 
     case get(url, nil) do
-      {:ok, %{"valid" => true}} -> true
-      {:ok, _} -> false
+      {:ok, %{"valid" => true}} ->
+        true
+
+      {:ok, _} ->
+        false
+
       {:error, reason} ->
-        Logger.warning("identity server pubkey validity check failed (#{key_validity_url}): #{inspect(reason)}")
+        Logger.warning(
+          "identity server pubkey validity check failed (#{key_validity_url}): #{inspect(reason)}"
+        )
+
         false
     end
   end
@@ -316,28 +306,27 @@ defmodule AxonWeb.IdentityServer do
     request(:post, url, access_token, body)
   end
 
+  # Client-named identity servers and key_validity_urls taken from room
+  # state are untrusted destinations; only the operator's configured
+  # DEFAULT_IDENTITY_SERVER may live on a private address.
   defp request(method, url, access_token, body) do
-    headers =
-      [{"accept", "application/json"}] ++
-        if(body, do: [{"content-type", "application/json"}], else: []) ++
-        if(access_token, do: [{"authorization", "Bearer " <> access_token}], else: [])
+    with :ok <- check_destination(url) do
+      case AxonWeb.HttpJson.request(method, url, AxonWeb.HttpJson.bearer(access_token), body) do
+        {:error, {:http_error, status, resp_body}} ->
+          {:error, {:http_error, status, safe_decode(resp_body)}}
 
-    encoded_body = if body, do: Jason.encode!(body), else: nil
-    req = Finch.build(method, url, headers, encoded_body)
-
-    case Finch.request(req, Axon.Finch, receive_timeout: @timeout) do
-      {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
-        case Jason.decode(resp_body) do
-          {:ok, decoded} -> {:ok, decoded}
-          {:error, _} -> {:error, :invalid_json}
-        end
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, {:http_error, status, safe_decode(resp_body)}}
-
-      {:error, reason} ->
-        {:error, reason}
+        other ->
+          other
+      end
     end
+  end
+
+  defp check_destination(url) do
+    base = default_base_url()
+
+    if base && (url == base or String.starts_with?(url, base <> "/")),
+      do: :ok,
+      else: AxonFederation.AddressGuard.check_base_url(url)
   end
 
   defp safe_decode(body) do

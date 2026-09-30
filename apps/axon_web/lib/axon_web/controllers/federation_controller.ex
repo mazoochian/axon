@@ -8,60 +8,29 @@ defmodule AxonWeb.FederationController do
   use Phoenix.Controller, formats: [:json]
 
   import Ecto.Query, only: [from: 2]
+  import AxonCore.MapUtil, only: [maybe_put: 3]
   alias AxonCore.{EventStore, KeyStore, Repo}
   alias AxonCore.Schema.Event
   alias AxonCrypto.{EventHash, KeyServer}
   alias AxonRoom.{RestrictedJoin, RoomProcess, ServerAcl}
   alias AxonFederation.{Backfill, EventVerification}
-  alias AxonWeb.EventController
+  alias AxonWeb.{EventController, Params}
   require Logger
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/make_join/:room_id/:user_id
   # ---------------------------------------------------------------------------
 
-  def make_join(conn, %{"room_id" => room_id, "user_id" => user_id} = params) do
-    supported_versions = (params["ver"] || ["1", "11"]) |> List.wrap()
-
-    # Verify the origin server is allowed to make this request
-    # (user_id's server must match origin)
-    origin = conn.assigns[:origin_server]
-    user_server = user_id |> AxonCore.MatrixId.server_name()
-
-    cond do
-      user_server != origin ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "User ID domain does not match origin"})
-
-      not room_exists?(room_id) ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
-
-      not acl_allowed?(room_id, origin) ->
-        acl_forbidden(conn)
-
-      true ->
-        room_ctx = RoomProcess.get_room_ctx(room_id)
-
-        case join_member_content(room_ctx.current_state, user_id) do
-          {:error, _reason} ->
-            conn
-            |> put_status(403)
-            |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Join not allowed"})
-
-          {:ok, member_content} ->
-            version = pick_room_version(room_id, supported_versions)
-
-            # Build partial join event (no hashes/signatures — remote fills those in)
-            template = build_join_template(room_id, user_id, member_content)
-
-            json(conn, %{
-              "room_version" => version,
-              "event" => template
-            })
-        end
+  def make_join(conn, %{"room_id" => room_id, "user_id" => user_id}) do
+    with {:ok, room_ctx, version} <-
+           prepare_make_membership(conn, room_id, user_id, supported_room_versions(conn)),
+         {:ok, member_content} <- join_member_content(room_ctx.current_state, user_id) do
+      json(conn, %{
+        "room_version" => version,
+        "event" => membership_template(room_id, room_ctx, user_id, member_content)
+      })
+    else
+      {:error, reason} -> render_error(conn, reason)
     end
   end
 
@@ -80,7 +49,7 @@ defmodule AxonWeb.FederationController do
 
     cond do
       sender_membership == "ban" ->
-        {:error, :banned}
+        {:error, :join_not_allowed}
 
       sender_membership in ["invite", "join"] ->
         {:ok, %{"membership" => "join"}}
@@ -95,156 +64,91 @@ defmodule AxonWeb.FederationController do
           {:ok, authoriser} ->
             {:ok, %{"membership" => "join", "join_authorised_via_users_server" => authoriser}}
 
-          {:error, _} = err ->
-            err
+          {:error, _} ->
+            {:error, :join_not_allowed}
         end
 
       true ->
-        {:error, :not_invited}
+        {:error, :join_not_allowed}
     end
   end
 
   # ---------------------------------------------------------------------------
   # PUT /_matrix/federation/v2/send_join/:room_id/:event_id
+  # PUT /_matrix/federation/v1/send_join/:room_id/:event_id (deprecated)
   # ---------------------------------------------------------------------------
 
-  def send_join(conn, %{"room_id" => room_id, "event_id" => _event_id} = params) do
-    # The request body IS the join event (room_id/event_id are legitimate
-    # event fields, not just routing params to be stripped — dropping them
-    # here used to make validate_join_event's room_id check always fail and
-    # left the event with no event_id to persist under).
-    join_event = params
-    origin = conn.assigns[:origin_server]
+  def send_join(conn, params), do: respond(conn, do_send_join(conn, params))
 
-    with :ok <- check_acl(room_id, origin),
-         :ok <- validate_join_event(join_event, room_id, origin),
-         :ok <- verify_event_signature(join_event),
-         {:ok, event_id} <- apply_join_event(room_id, join_event, origin) do
-      # Build response: full room state + auth chain
+  def send_join_v1(conn, params), do: respond_v1(conn, do_send_join(conn, params))
+
+  # The request body IS the join event (room_id/event_id are legitimate
+  # event fields, not just routing params to be stripped).
+  defp do_send_join(conn, %{"room_id" => room_id} = join_event) do
+    join_event = countersign_restricted_join(join_event, room_id)
+
+    with {:ok, event_id} <- receive_membership_event(conn, join_event, "join") do
       state_events = EventStore.get_current_state(room_id)
-      state_maps = Enum.map(state_events, &EventStore.event_to_pdu/1)
 
-      auth_chain = build_auth_chain_for_state(state_events)
-
-      json(conn, %{
-        "origin" => KeyServer.server_name(),
-        "auth_chain" => auth_chain,
-        "state" => state_maps,
-        "event" => EventStore.event_to_pdu_by_id(event_id)
-      })
-    else
-      {:error, :acl_denied} ->
-        acl_forbidden(conn)
-
-      {:error, :invalid_join} ->
-        conn
-        |> put_status(400)
-        |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid join event"})
-
-      # Distinct messages per reason: these three fail for completely
-      # different operational causes (bad crypto vs an unsigned event vs not
-      # being able to fetch the origin's keys at all) and collapsing them
-      # into one string makes a signature problem indistinguishable from a
-      # key-fetch problem when debugging against a real peer.
-      {:error, sig_error}
-      when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => sig_error_message(sig_error)})
-
-      {:error, :auth_failed} ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Event failed auth check"})
-
-      _ ->
-        conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
+      {:ok,
+       %{
+         "origin" => KeyServer.server_name(),
+         "auth_chain" => auth_chain_pdus(state_events),
+         "state" => Enum.map(state_events, &EventStore.event_to_pdu/1),
+         "event" => EventStore.event_to_pdu_by_id(event_id)
+       }}
     end
   end
+
+  defp countersign_restricted_join(
+         %{"content" => %{"join_authorised_via_users_server" => authoriser}} = event,
+         room_id
+       )
+       when is_binary(authoriser) do
+    if AxonCore.MatrixId.server_name(authoriser) == KeyServer.server_name(),
+      do: KeyServer.sign_event(event, EventStore.get_room_version(room_id, "11")),
+      else: event
+  end
+
+  defp countersign_restricted_join(event, _room_id), do: event
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/make_leave/:room_id/:user_id
   # ---------------------------------------------------------------------------
 
   def make_leave(conn, %{"room_id" => room_id, "user_id" => user_id}) do
-    origin = conn.assigns[:origin_server]
-    user_server = user_id |> AxonCore.MatrixId.server_name()
-
-    cond do
-      user_server != origin ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "User ID domain does not match origin"})
-
-      not room_exists?(room_id) ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
-
-      not acl_allowed?(room_id, origin) ->
-        acl_forbidden(conn)
-
-      true ->
-        version = get_room_version(room_id)
-        template = build_leave_template(room_id, user_id)
-
+    case prepare_make_membership(conn, room_id, user_id, :any) do
+      {:ok, room_ctx, version} ->
         json(conn, %{
           "room_version" => version,
-          "event" => template
+          "event" => membership_template(room_id, room_ctx, user_id, %{"membership" => "leave"})
         })
+
+      {:error, reason} ->
+        render_error(conn, reason)
     end
   end
 
   # ---------------------------------------------------------------------------
   # PUT /_matrix/federation/v2/send_leave/:room_id/:event_id
+  # PUT /_matrix/federation/v1/send_leave/:room_id/:event_id (deprecated)
   # ---------------------------------------------------------------------------
 
-  def send_leave(conn, %{"room_id" => room_id} = params) do
-    # See send_join/2 — the body IS the leave event; don't strip its fields.
-    leave_event = params
-    origin = conn.assigns[:origin_server]
+  def send_leave(conn, params), do: respond(conn, do_send_leave(conn, params))
 
-    with :ok <- check_acl(room_id, origin),
-         :ok <- validate_leave_event(leave_event, room_id, origin),
-         :ok <- verify_event_signature(leave_event),
-         {:ok, _} <- apply_leave_event(room_id, leave_event, origin) do
-      json(conn, %{})
-    else
-      {:error, :acl_denied} ->
-        acl_forbidden(conn)
+  def send_leave_v1(conn, params), do: respond_v1(conn, do_send_leave(conn, params))
 
-      {:error, :invalid_leave} ->
-        conn
-        |> put_status(400)
-        |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid leave event"})
-
-      # Distinct messages per reason: these three fail for completely
-      # different operational causes (bad crypto vs an unsigned event vs not
-      # being able to fetch the origin's keys at all) and collapsing them
-      # into one string makes a signature problem indistinguishable from a
-      # key-fetch problem when debugging against a real peer.
-      {:error, sig_error}
-      when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => sig_error_message(sig_error)})
-
-      {:error, :auth_failed} ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Event failed auth check"})
-
-      _ ->
-        conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
+  defp do_send_leave(conn, leave_event) do
+    with {:ok, _event_id} <- receive_membership_event(conn, leave_event, "leave") do
+      {:ok, %{}}
     end
   end
 
   # ---------------------------------------------------------------------------
   # PUT /_matrix/federation/v2/invite/:room_id/:event_id
+  # PUT /_matrix/federation/v1/invite/:room_id/:event_id (deprecated)
   #
-  # A remote resident server inviting one of our local users. Previously
-  # unimplemented entirely — no route, no handler — so a federated invite
-  # 404'd outright and a local user could never learn one existed. Unlike
+  # A remote resident server inviting one of our local users. Unlike
   # make_join/send_join, we don't (and structurally can't) already have
   # this room's state: we may be seeing it for the very first time. We
   # don't become resident just from an invite — only the bare membership
@@ -254,27 +158,40 @@ defmodule AxonWeb.FederationController do
   # ---------------------------------------------------------------------------
 
   def invite(conn, %{"room_id" => room_id} = params) do
+    respond(
+      conn,
+      do_invite(
+        conn,
+        room_id,
+        params["event"],
+        params["room_version"] || "11",
+        params["invite_room_state"] || []
+      )
+    )
+  end
+
+  # v1 carries the bare event as the body, with the stripped state preview
+  # in its `unsigned`, and is only used for room versions 1 and 2.
+  def invite_v1(conn, %{"room_id" => room_id} = event) do
+    respond_v1(
+      conn,
+      do_invite(
+        conn,
+        room_id,
+        event,
+        EventStore.get_room_version(room_id, "1"),
+        get_in(event, ["unsigned", "invite_room_state"]) || []
+      )
+    )
+  end
+
+  defp do_invite(conn, room_id, event, room_version, invite_room_state) do
     origin = conn.assigns[:origin_server]
-    event = params["event"]
-    room_version = params["room_version"] || "11"
-    invite_room_state = params["invite_room_state"] || []
 
     with :ok <- check_acl(room_id, origin),
          :ok <- validate_invite_event(event, room_id, origin),
-         {:ok, signed_event} <-
-           accept_invite(room_id, room_version, event, invite_room_state) do
-      json(conn, %{"event" => signed_event})
-    else
-      {:error, :acl_denied} ->
-        acl_forbidden(conn)
-
-      {:error, :invalid_invite} ->
-        conn
-        |> put_status(400)
-        |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid invite event"})
-
-      _ ->
-        conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
+         {:ok, signed_event} <- accept_invite(room_id, room_version, event, invite_room_state) do
+      {:ok, %{"event" => signed_event}}
     end
   end
 
@@ -284,16 +201,16 @@ defmodule AxonWeb.FederationController do
     sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
 
     cond do
-      event["type"] != "m.room.member" -> {:error, :invalid_invite}
-      event["room_id"] != room_id -> {:error, :invalid_invite}
-      get_in(event, ["content", "membership"]) != "invite" -> {:error, :invalid_invite}
-      target_server != local_server -> {:error, :invalid_invite}
-      sender_server != origin -> {:error, :invalid_invite}
+      event["type"] != "m.room.member" -> {:error, {:invalid_event, "invite"}}
+      event["room_id"] != room_id -> {:error, {:invalid_event, "invite"}}
+      get_in(event, ["content", "membership"]) != "invite" -> {:error, {:invalid_event, "invite"}}
+      target_server != local_server -> {:error, {:invalid_event, "invite"}}
+      sender_server != origin -> {:error, {:invalid_event, "invite"}}
       true -> :ok
     end
   end
 
-  defp validate_invite_event(_event, _room_id, _origin), do: {:error, :invalid_invite}
+  defp validate_invite_event(_event, _room_id, _origin), do: {:error, {:invalid_event, "invite"}}
 
   defp accept_invite(room_id, room_version, event, invite_room_state) do
     signed_event =
@@ -318,14 +235,7 @@ defmodule AxonWeb.FederationController do
       on_conflict: :nothing
     )
 
-    result =
-      case EventStore.insert_event(signed_event, room_version) do
-        {:ok, _persisted} -> :ok
-        {:error, :already_exists} -> :ok
-        {:error, reason} -> {:error, reason}
-      end
-
-    with :ok <- result do
+    with {:ok, _persisted} <- EventStore.insert_event(signed_event, room_version) do
       EventStore.set_invite_preview_state(room_id, signed_event["state_key"], invite_room_state)
       {:ok, signed_event}
     end
@@ -335,9 +245,7 @@ defmodule AxonWeb.FederationController do
   # the reference hash) — the inviting server's event has none, and signing
   # it here doesn't add one either. Without this, EventStore.insert_event/2
   # gets a nil event_id and the changeset's NOT NULL violation surfaces as
-  # an opaque 500 to the inviting server (Complement:
-  # TestIsDirectFlagFederation and most of TestFederationRoomsInvite's
-  # subtests). Same pattern as AxonFederation.RoomJoin's auth-chain storage.
+  # an opaque 500 to the inviting server.
   defp ensure_event_id(%{"event_id" => id} = event, _room_version) when is_binary(id), do: event
 
   defp ensure_event_id(event, room_version) do
@@ -348,54 +256,82 @@ defmodule AxonWeb.FederationController do
   # GET /_matrix/federation/v1/make_knock/:room_id/:user_id
   # ---------------------------------------------------------------------------
 
-  def make_knock(conn, %{"room_id" => room_id, "user_id" => user_id} = params) do
-    supported_versions = (params["ver"] || ["7", "8", "9", "10", "11"]) |> List.wrap()
-    origin = conn.assigns[:origin_server]
-    user_server = user_id |> AxonCore.MatrixId.server_name()
-
-    cond do
-      user_server != origin ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "User ID domain does not match origin"})
-
-      not room_exists?(room_id) ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
-
-      not acl_allowed?(room_id, origin) ->
-        acl_forbidden(conn)
-
-      true ->
-        room_ctx = RoomProcess.get_room_ctx(room_id)
-
-        join_rule =
-          get_in(room_ctx.current_state[{"m.room.join_rules", ""}], ["content", "join_rule"])
-
-        if join_rule not in ["knock", "knock_restricted"] do
-          conn
-          |> put_status(403)
-          |> json(%{"errcode" => "M_FORBIDDEN", "error" => "This room does not support knocking"})
-        else
-          version = pick_room_version(room_id, supported_versions)
-          template = build_knock_template(room_id, user_id)
-          json(conn, %{"room_version" => version, "event" => template})
-        end
+  def make_knock(conn, %{"room_id" => room_id, "user_id" => user_id}) do
+    with {:ok, room_ctx, version} <-
+           prepare_make_membership(conn, room_id, user_id, supported_room_versions(conn)),
+         :ok <- check_knockable(room_ctx.current_state) do
+      json(conn, %{
+        "room_version" => version,
+        "event" => membership_template(room_id, room_ctx, user_id, %{"membership" => "knock"})
+      })
+    else
+      {:error, reason} -> render_error(conn, reason)
     end
   end
 
-  defp build_knock_template(room_id, user_id) do
-    room_ctx = RoomProcess.get_room_ctx(room_id)
+  defp check_knockable(current_state) do
+    join_rule = get_in(current_state[{"m.room.join_rules", ""}], ["content", "join_rule"])
+    if join_rule in ["knock", "knock_restricted"], do: :ok, else: {:error, :knock_not_allowed}
+  end
 
+  # ---------------------------------------------------------------------------
+  # PUT /_matrix/federation/v1/send_knock/:room_id/:event_id
+  # ---------------------------------------------------------------------------
+
+  def send_knock(conn, %{"room_id" => room_id} = knock_event) do
+    result =
+      with {:ok, _event_id} <- receive_membership_event(conn, knock_event, "knock") do
+        {:ok, %{"knock_room_state" => EventStore.stripped_state_events(room_id)}}
+      end
+
+    respond(conn, result)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers — make_*/send_* membership handshakes
+  # ---------------------------------------------------------------------------
+
+  # Every value of the repeatable `ver` query parameter; the spec default
+  # when the caller sends none is room version 1 only.
+  defp supported_room_versions(conn) do
+    case Params.query_values(conn, "ver") do
+      [] -> ["1"]
+      versions -> versions
+    end
+  end
+
+  defp prepare_make_membership(conn, room_id, user_id, supported_versions) do
+    origin = conn.assigns[:origin_server]
+
+    cond do
+      AxonCore.MatrixId.server_name(user_id) != origin ->
+        {:error, :origin_mismatch}
+
+      not EventStore.room_exists?(room_id) ->
+        {:error, :room_not_found}
+
+      not acl_allowed?(room_id, origin) ->
+        {:error, :acl_denied}
+
+      true ->
+        version = EventStore.get_room_version(room_id)
+
+        if supported_versions == :any or version in supported_versions,
+          do: {:ok, RoomProcess.get_room_ctx(room_id), version},
+          else: {:error, {:incompatible_room_version, version}}
+    end
+  end
+
+  # Partial membership event (no hashes/signatures — the remote fills those in).
+  defp membership_template(room_id, room_ctx, user_id, content) do
     %{
       "type" => "m.room.member",
       "room_id" => room_id,
       "sender" => user_id,
       "state_key" => user_id,
-      "content" => %{"membership" => "knock"},
+      "content" => content,
       "origin_server_ts" => System.os_time(:millisecond),
-      "origin" => user_id |> AxonCore.MatrixId.server_name(),
+      "origin" => AxonCore.MatrixId.server_name(user_id),
       "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
       "auth_events" =>
         select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
@@ -403,76 +339,42 @@ defmodule AxonWeb.FederationController do
     }
   end
 
-  # ---------------------------------------------------------------------------
-  # PUT /_matrix/federation/v1/send_knock/:room_id/:event_id
-  # ---------------------------------------------------------------------------
-
-  def send_knock(conn, %{"room_id" => room_id} = params) do
-    # See send_join/2 — the body IS the knock event; don't strip its fields.
-    knock_event = params
+  defp receive_membership_event(conn, %{"room_id" => room_id} = event, membership) do
     origin = conn.assigns[:origin_server]
 
     with :ok <- check_acl(room_id, origin),
-         :ok <- validate_knock_event(knock_event, room_id, origin),
-         :ok <- verify_event_signature(knock_event),
-         {:ok, _event_id} <- apply_knock_event(room_id, knock_event, origin) do
-      json(conn, %{"knock_room_state" => EventStore.stripped_state_events(room_id)})
-    else
-      {:error, :acl_denied} ->
-        acl_forbidden(conn)
-
-      {:error, :invalid_knock} ->
-        conn
-        |> put_status(400)
-        |> json(%{"errcode" => "M_BAD_JSON", "error" => "Invalid knock event"})
-
-      # Distinct messages per reason: these three fail for completely
-      # different operational causes (bad crypto vs an unsigned event vs not
-      # being able to fetch the origin's keys at all) and collapsing them
-      # into one string makes a signature problem indistinguishable from a
-      # key-fetch problem when debugging against a real peer.
-      {:error, sig_error}
-      when sig_error in [:bad_signature, :missing_signature, :key_not_found] ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => sig_error_message(sig_error)})
-
-      {:error, :auth_failed} ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Event failed auth check"})
-
-      _ ->
-        conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Internal error"})
+         :ok <- validate_membership_event(event, room_id, origin, membership),
+         :ok <- verify_event_signature(event) do
+      apply_membership_event(room_id, event, origin)
     end
   end
 
-  # See validate_join_event/3's comment on why `origin` must equal the
-  # event's own sender domain.
-  defp validate_knock_event(event, room_id, origin) do
+  # send_join/send_leave/send_knock only ever accept a self-targeted
+  # membership of the endpoint's own kind (a kick/ban is a local action,
+  # never routed through these). `origin` (the authenticated X-Matrix
+  # caller) must be the same server as the event's own `sender` — otherwise
+  # any federating server could relay another server's membership event to
+  # us untouched except for its unsigned `displayname`/`avatar_url` fields
+  # (both dropped by redaction, so the signature doesn't cover them),
+  # impersonating the user's profile without ever holding their key.
+  defp validate_membership_event(event, room_id, origin, membership) do
     sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
 
-    cond do
-      event["type"] != "m.room.member" -> {:error, :invalid_knock}
-      event["room_id"] != room_id -> {:error, :invalid_knock}
-      get_in(event, ["content", "membership"]) != "knock" -> {:error, :invalid_knock}
-      event["state_key"] != event["sender"] -> {:error, :invalid_knock}
-      sender_server != origin -> {:error, :invalid_knock}
-      true -> :ok
-    end
+    if event["type"] == "m.room.member" and event["room_id"] == room_id and
+         get_in(event, ["content", "membership"]) == membership and
+         event["state_key"] == event["sender"] and sender_server == origin,
+       do: :ok,
+       else: {:error, {:invalid_event, membership}}
   end
 
-  # Goes through RoomProcess.apply_remote_event/3 (not a direct
-  # EventStore.insert_event) so the room's live GenServer state, local
-  # /sync fan-out, and federation fan-out all learn about the knock
-  # immediately — a direct DB write would leave them stale until the next
-  # restart, silently breaking auth checks for that user's subsequent
-  # events and federation fan-out to them. relay_exclude: origin — this
-  # resident server is the only one positioned to relay the new knock on
-  # to every OTHER server with a member in the room (the knocking user's
-  # own server only knows about us, not them yet); see apply_remote_event/3.
-  defp apply_knock_event(room_id, knock_event, origin) do
-    case RoomProcess.apply_remote_event(room_id, knock_event, relay_exclude: origin) do
+  # Must go through RoomProcess.apply_remote_event/3, not a direct
+  # EventStore.insert_event, or the room's live GenServer never learns
+  # about the membership change (fan-out, /sync and later auth checks all
+  # go stale). relay_exclude: origin — this resident server is the only
+  # one positioned to relay the event on to every OTHER server with a
+  # member in the room; without it a room with 3+ servers never converges.
+  defp apply_membership_event(room_id, event, origin) do
+    case RoomProcess.apply_remote_event(room_id, event, relay_exclude: origin) do
       {:ok, event_id} -> {:ok, event_id}
       {:error, _reason} -> {:error, :auth_failed}
     end
@@ -485,8 +387,8 @@ defmodule AxonWeb.FederationController do
 
   def send_transaction(conn, %{"txn_id" => txn_id} = params) do
     origin = conn.assigns[:origin_server]
-    pdus = params["pdus"] || []
-    edus = params["edus"] || []
+    pdus = list_param(params["pdus"])
+    edus = list_param(params["edus"])
 
     # Check idempotency
     already_processed =
@@ -502,28 +404,23 @@ defmodule AxonWeb.FederationController do
     else
       # Process each PDU
       pdu_results =
-        Enum.into(pdus, %{}, fn pdu ->
-          # Room versions 3+ never carry "event_id" on the wire (it's the
-          # reference hash) — event_id was computed here for the response
-          # map's key, but the *pdu itself* went on to process_inbound_pdu/2
-          # still missing it, all the way down through
-          # AxonFederation.Backfill and AxonRoom.RoomProcess to
-          # AxonCore.EventStore.insert_event/2, which got a nil event_id
-          # and NOT-NULL-violated on every single such PDU. Every axon test
-          # covering this path hand-supplied a fake "event_id" on its test
-          # PDUs (a convenience that happens to also paper over this
-          # exact bug), which is why this went uncaught until traced from
-          # a real Complement failure that sends a spec-correct wire PDU.
-          event_id = pdu["event_id"] || compute_event_id(pdu)
-          pdu = Map.put(pdu, "event_id", event_id)
-          result = process_inbound_pdu(pdu, origin)
+        Enum.flat_map(pdus, fn pdu ->
+          case inbound_event_id(pdu) do
+            {:ok, event_id} ->
+              [
+                {event_id,
+                 pdu_result(process_inbound_pdu(Map.put(pdu, "event_id", event_id), origin))}
+              ]
 
-          {event_id,
-           case result do
-             :ok -> %{}
-             {:error, reason} -> %{"error" => inspect(reason)}
-           end}
+            {:error, nil, reason} ->
+              Logger.warning("Dropping unidentifiable PDU from #{origin}: #{inspect(reason)}")
+              []
+
+            {:error, key, reason} ->
+              [{key, pdu_result({:error, reason})}]
+          end
         end)
+        |> Map.new()
 
       Enum.each(edus, &process_inbound_edu(&1, origin))
 
@@ -543,6 +440,45 @@ defmodule AxonWeb.FederationController do
 
       json(conn, %{"pdus" => pdu_results})
     end
+  end
+
+  defp list_param(list) when is_list(list), do: list
+  defp list_param(_), do: []
+
+  defp pdu_result(:ok), do: %{}
+  defp pdu_result({:error, reason}), do: %{"error" => inspect(reason)}
+
+  # Room versions 1 and 2 carry their event_id on the wire. From version 3
+  # on it is the reference hash, always computed here; a wire event_id that
+  # disagrees is rejected rather than trusted. Returns the key to report an
+  # error under (nil when the PDU can't be identified at all).
+  defp inbound_event_id(%{"room_id" => room_id} = pdu) when is_binary(room_id) do
+    wire_id = pdu["event_id"]
+
+    case EventStore.get_room_version(room_id) do
+      version when version in ["1", "2"] ->
+        if is_binary(wire_id), do: {:ok, wire_id}, else: {:error, nil, :missing_event_id}
+
+      version ->
+        case safe_reference_hash(pdu, version) do
+          {:ok, computed} when wire_id in [nil, computed] -> {:ok, computed}
+          {:ok, _computed} when is_binary(wire_id) -> {:error, wire_id, :event_id_mismatch}
+          {:ok, computed} -> {:error, computed, :event_id_mismatch}
+          :error when is_binary(wire_id) -> {:error, wire_id, :invalid_pdu}
+          :error -> {:error, nil, :invalid_pdu}
+        end
+    end
+  end
+
+  defp inbound_event_id(%{"event_id" => wire_id}) when is_binary(wire_id),
+    do: {:error, wire_id, :invalid_pdu}
+
+  defp inbound_event_id(_pdu), do: {:error, nil, :invalid_pdu}
+
+  defp safe_reference_hash(pdu, version) do
+    {:ok, EventHash.reference_hash(pdu, version)}
+  rescue
+    ArgumentError -> :error
   end
 
   defp process_inbound_edu(%{"edu_type" => "m.typing", "content" => content}, origin) do
@@ -640,149 +576,110 @@ defmodule AxonWeb.FederationController do
   # ---------------------------------------------------------------------------
 
   def get_event(conn, %{"event_id" => event_id}) do
-    case EventStore.get_event(event_id) do
-      {:ok, event} ->
-        json(conn, %{
-          "origin" => KeyServer.server_name(),
-          "origin_server_ts" => event.origin_server_ts,
-          "pdus" => [EventStore.event_to_pdu(event)]
-        })
-
-      {:error, :not_found} ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Event not found"})
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # GET /_matrix/federation/v1/state/:room_id
-  # ---------------------------------------------------------------------------
-
-  def get_state(conn, %{"room_id" => room_id}) do
     origin = conn.assigns[:origin_server]
 
-    if acl_allowed?(room_id, origin) do
-      state_events = EventStore.get_current_state(room_id)
-      auth_chain = build_auth_chain_for_state(state_events)
-
+    with {:ok, event} <- fetch_event(event_id),
+         :ok <- authorize_room_read(event.room_id, origin) do
       json(conn, %{
-        "pdus" => Enum.map(state_events, &EventStore.event_to_pdu/1),
-        "auth_chain" => auth_chain
+        "origin" => KeyServer.server_name(),
+        "origin_server_ts" => event.origin_server_ts,
+        "pdus" => pdus_for_origin([event], event.room_id, origin)
       })
     else
-      acl_forbidden(conn)
+      {:error, reason} -> render_error(conn, reason)
     end
   end
 
   # ---------------------------------------------------------------------------
-  # GET /_matrix/federation/v1/state_ids/:room_id
+  # GET /_matrix/federation/v1/state/:room_id?event_id=...
+  # ---------------------------------------------------------------------------
+
+  def get_state(conn, %{"room_id" => room_id} = params) do
+    case state_at_event(conn, room_id, params["event_id"]) do
+      {:ok, state_events} ->
+        json(conn, %{
+          "pdus" => Enum.map(state_events, &EventStore.event_to_pdu/1),
+          "auth_chain" => auth_chain_pdus(state_events)
+        })
+
+      {:error, reason} ->
+        render_error(conn, reason)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GET /_matrix/federation/v1/state_ids/:room_id?event_id=...
   # ---------------------------------------------------------------------------
 
   def get_state_ids(conn, %{"room_id" => room_id} = params) do
-    _event_id = params["event_id"]
-    origin = conn.assigns[:origin_server]
+    case state_at_event(conn, room_id, params["event_id"]) do
+      {:ok, state_events} ->
+        json(conn, %{
+          "pdu_ids" => Enum.map(state_events, & &1.event_id),
+          "auth_chain_ids" => auth_chain_ids(state_events)
+        })
 
-    if acl_allowed?(room_id, origin) do
-      state_events = EventStore.get_current_state(room_id)
-      state_ids = Enum.map(state_events, & &1.event_id)
+      {:error, reason} ->
+        render_error(conn, reason)
+    end
+  end
 
-      auth_chain_ids =
-        state_events
-        |> Enum.flat_map(&get_auth_chain_ids(&1))
-        |> Enum.uniq()
-
-      json(conn, %{
-        "pdu_ids" => state_ids,
-        "auth_chain_ids" => auth_chain_ids
-      })
-    else
-      acl_forbidden(conn)
+  # The room state *before* `event_id` (the event itself excluded), same as
+  # the reference implementations answer these two endpoints.
+  defp state_at_event(conn, room_id, event_id) do
+    with :ok <- authorize_room_read(room_id, conn.assigns[:origin_server]),
+         {:ok, event} <- fetch_room_event(room_id, event_id) do
+      {:ok, EventStore.get_room_state_at(room_id, event.stream_ordering - 1)}
     end
   end
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/event_auth/:room_id/:event_id
   #
-  # Previously entirely unimplemented (no route at all, so any request
-  # here 404'd generically) — one of the endpoints the Server-Server API's
-  # ACL section explicitly lists as MUST-protect. Returns the complete
-  # transitive auth chain for the given event (its auth_events plus theirs,
-  # recursively — NOT including the event itself), same computation
-  # get_state/get_state_ids already do per state event, just entered from
-  # a single event_id instead.
+  # The complete transitive auth chain for the given event (its
+  # auth_events plus theirs, recursively — NOT including the event itself).
   # ---------------------------------------------------------------------------
 
   def event_auth(conn, %{"room_id" => room_id, "event_id" => event_id}) do
-    origin = conn.assigns[:origin_server]
-
-    if acl_allowed?(room_id, origin) do
-      case EventStore.get_event(event_id) do
-        {:ok, %{room_id: ^room_id} = event} ->
-          auth_chain =
-            event
-            |> get_auth_chain_ids()
-            |> Enum.flat_map(fn id ->
-              case EventStore.get_event(id) do
-                {:ok, e} -> [EventStore.event_to_pdu(e)]
-                _ -> []
-              end
-            end)
-
-          json(conn, %{"auth_chain" => auth_chain})
-
-        _ ->
-          conn
-          |> put_status(404)
-          |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Event not found"})
-      end
+    with :ok <- authorize_room_read(room_id, conn.assigns[:origin_server]),
+         {:ok, event} <- fetch_room_event(room_id, event_id) do
+      json(conn, %{"auth_chain" => auth_chain_pdus([event])})
     else
-      acl_forbidden(conn)
+      {:error, reason} -> render_error(conn, reason)
     end
   end
 
   # ---------------------------------------------------------------------------
-  # GET /_matrix/federation/v1/backfill/:room_id
+  # GET /_matrix/federation/v1/backfill/:room_id?v=...&v=...&limit=...
+  #
+  # The `v` events themselves plus their ancestors, walking prev_events
+  # backwards, up to `limit` events.
   # ---------------------------------------------------------------------------
+
+  @max_backfill_limit 100
 
   def backfill(conn, %{"room_id" => room_id} = params) do
     origin = conn.assigns[:origin_server]
+    limit = Params.int(params["limit"], @max_backfill_limit, 1, @max_backfill_limit)
 
-    if acl_allowed?(room_id, origin) do
-      v_param = params["v"] || []
-      limit = String.to_integer(params["limit"] || "100")
-
-      # Find the ordering of the v events, then return events before them
-      from_ordering =
-        case v_param do
-          [] ->
-            EventStore.room_max_stream_ordering(room_id)
-
-          ids ->
-            Repo.one(
-              from(e in Event,
-                where: e.event_id in ^ids and e.room_id == ^room_id,
-                select: min(e.stream_ordering)
-              )
-            ) || 0
-        end
-
-      events =
-        Repo.all(
-          from(e in Event,
-            where: e.room_id == ^room_id and e.stream_ordering < ^from_ordering,
-            order_by: [desc: e.stream_ordering],
-            limit: ^limit
-          )
-        )
+    with :ok <- authorize_room_read(room_id, origin),
+         {:ok, from_ids} <- required_query_values(conn, "v") do
+      events = walk_prev_events(room_id, from_ids, MapSet.new(), limit, MapSet.new())
 
       json(conn, %{
         "origin" => KeyServer.server_name(),
         "origin_server_ts" => System.os_time(:millisecond),
-        "pdus" => Enum.map(events, &EventStore.event_to_pdu/1)
+        "pdus" => pdus_for_origin(events, room_id, origin)
       })
     else
-      acl_forbidden(conn)
+      {:error, reason} -> render_error(conn, reason)
+    end
+  end
+
+  defp required_query_values(conn, key) do
+    case Params.query_values(conn, key) do
+      [] -> {:error, {:missing_param, key}}
+      values -> {:ok, values}
     end
   end
 
@@ -790,111 +687,100 @@ defmodule AxonWeb.FederationController do
   # POST /_matrix/federation/v1/get_missing_events/:room_id
   # ---------------------------------------------------------------------------
 
+  @max_missing_events_limit 100
+
   def get_missing_events(conn, %{"room_id" => room_id} = params) do
     origin = conn.assigns[:origin_server]
 
-    if acl_allowed?(room_id, origin) do
-      earliest_events = MapSet.new(params["earliest_events"] || [])
-      latest_events = params["latest_events"] || []
-      limit = params["limit"] || 10
+    case authorize_room_read(room_id, origin) do
+      :ok ->
+        earliest_events = MapSet.new(list_param(params["earliest_events"]))
+        latest_events = list_param(params["latest_events"])
+        limit = Params.int(params["limit"], 10, 0, @max_missing_events_limit)
 
-      # Per spec: "a breadth first walk of the prev_events for
-      # latest_events" — latest_events are events the requester already
-      # has (that's the whole reason it's naming them as the near edge of
-      # the gap it wants filled), so the walk starts at *their*
-      # prev_events, not at latest_events themselves. Seeding the queue
-      # with latest_events directly (as this used to do) made every
-      # latest_event get emitted as part of the response — an extra,
-      # already-known event tacked onto the end that the requester never
-      # asked for and (per the Complement inbound-missing-events suite)
-      # breaks index-based assertions on what comes back.
-      seed_prev_events =
-        latest_events
-        |> Enum.flat_map(fn event_id ->
-          case Repo.get_by(Event, event_id: event_id, room_id: room_id) do
-            nil -> []
-            event -> event.prev_event_ids
-          end
-        end)
+        # Per spec: "a breadth first walk of the prev_events for
+        # latest_events" — latest_events are events the requester already
+        # has, so the walk starts at *their* prev_events, and they go into
+        # `seen` up front so a diamond in the DAG can't emit them either.
+        seed_prev_events =
+          latest_events
+          |> Enum.flat_map(fn event_id ->
+            case Repo.get_by(Event, event_id: event_id, room_id: room_id) do
+              nil -> []
+              event -> event.prev_event_ids
+            end
+          end)
 
-      # latest_events go into `seen` up front (not just as a queue seed)
-      # so that if the walk reaches one of them again via some other path
-      # (a diamond in the DAG), it's still skipped rather than emitted.
-      seen = MapSet.new(latest_events)
+        events =
+          walk_prev_events(
+            room_id,
+            seed_prev_events,
+            earliest_events,
+            limit,
+            MapSet.new(latest_events)
+          )
 
-      events = walk_missing_events(room_id, seed_prev_events, earliest_events, limit, seen)
+        json(conn, %{"events" => pdus_for_origin(events, room_id, origin)})
 
-      # get_missing_events fills gaps in a REMOTE server's copy of the DAG,
-      # so — same as any other backfill-shaped federation response — each
-      # event's history_visibility applies, judged against that origin
-      # server (was any of *its* users in the room, visible-enough, at the
-      # point of this event?), not against the local room membership. An
-      # event outside what the origin may see comes back redacted, never
-      # omitted: dropping it instead would break prev_events continuity
-      # for whichever room member on the other end can't fill the gap any
-      # other way.
-      room_version = EventStore.get_room_version(room_id)
-      origin_bounds = origin_visibility_bounds(room_id, origin)
-
-      pdus =
-        Enum.map(events, fn event ->
-          pdu = EventStore.event_to_pdu(event)
-
-          if Enum.any?(origin_bounds, &EventController.event_visible?(&1, event)) do
-            pdu
-          else
-            AxonCrypto.Redaction.redact(pdu, room_version)
-          end
-        end)
-
-      json(conn, %{"events" => pdus})
-    else
-      acl_forbidden(conn)
+      {:error, reason} ->
+        render_error(conn, reason)
     end
   end
 
-  # Per spec: walk backward from latest_events' prev_events, collecting up
-  # to `limit` events, without stepping past earliest_events (the
-  # requester's own fork point — excluded from the result, and its
-  # ancestors are never visited, since the requester already has those
-  # too). Not a stream_ordering range scan: the caller's earliest/latest
-  # boundaries name a specific slice of the DAG, and an unrelated event
-  # from elsewhere in the room's history — even one that happens to sort
-  # between them by ordering — must never be returned.
+  # Breadth-first walk backwards through prev_events from `queue`,
+  # collecting up to `limit` events, without stepping past `stop_at`
+  # (excluded from the result, and its ancestors are never visited). Not a
+  # stream_ordering range scan: the caller names a specific slice of the
+  # DAG, and an unrelated event from elsewhere in the room's history must
+  # never be returned.
   #
-  # `acc` is built by prepending each event as it's visited, so the
-  # *last*-visited event (the one deepest in the walk, i.e. chronologically
-  # earliest) ends up first in the list — which is exactly the order the
-  # spec wants back: earliest to latest, without an explicit reverse.
-  defp walk_missing_events(room_id, queue, earliest_events, limit, seen, acc \\ [])
+  # `acc` is built by prepending each event as it's visited, so the result
+  # comes out earliest to latest without an explicit reverse.
+  defp walk_prev_events(room_id, queue, stop_at, limit, seen, acc \\ [])
 
-  defp walk_missing_events(_room_id, [], _earliest, _limit, _seen, acc), do: acc
+  defp walk_prev_events(_room_id, [], _stop_at, _limit, _seen, acc), do: acc
 
-  defp walk_missing_events(_room_id, _queue, _earliest, limit, _seen, acc)
+  defp walk_prev_events(_room_id, _queue, _stop_at, limit, _seen, acc)
        when length(acc) >= limit,
        do: acc
 
-  defp walk_missing_events(room_id, [event_id | rest], earliest_events, limit, seen, acc) do
-    cond do
-      MapSet.member?(seen, event_id) or MapSet.member?(earliest_events, event_id) ->
-        walk_missing_events(room_id, rest, earliest_events, limit, seen, acc)
+  defp walk_prev_events(room_id, [event_id | rest], stop_at, limit, seen, acc) do
+    event =
+      not MapSet.member?(seen, event_id) and not MapSet.member?(stop_at, event_id) and
+        Repo.get_by(Event, event_id: event_id, room_id: room_id)
 
-      true ->
-        case Repo.get_by(Event, event_id: event_id, room_id: room_id) do
-          nil ->
-            walk_missing_events(room_id, rest, earliest_events, limit, seen, acc)
+    case event do
+      %Event{} ->
+        walk_prev_events(
+          room_id,
+          rest ++ event.prev_event_ids,
+          stop_at,
+          limit,
+          MapSet.put(seen, event_id),
+          [event | acc]
+        )
 
-          event ->
-            walk_missing_events(
-              room_id,
-              rest ++ event.prev_event_ids,
-              earliest_events,
-              limit,
-              MapSet.put(seen, event_id),
-              [event | acc]
-            )
-        end
+      _ ->
+        walk_prev_events(room_id, rest, stop_at, limit, seen, acc)
     end
+  end
+
+  # Every backfill-shaped response fills gaps in a REMOTE server's copy of
+  # the DAG, so each event's history_visibility is judged against that
+  # origin server, not against local room membership. An event outside
+  # what the origin may see comes back redacted, never omitted: dropping it
+  # would break prev_events continuity on the other end.
+  defp pdus_for_origin(events, room_id, origin) do
+    room_version = EventStore.get_room_version(room_id)
+    origin_bounds = origin_visibility_bounds(room_id, origin)
+
+    Enum.map(events, fn event ->
+      pdu = EventStore.event_to_pdu(event)
+
+      if Enum.any?(origin_bounds, &EventController.event_visible?(&1, event)),
+        do: pdu,
+        else: AxonCrypto.Redaction.redact(pdu, room_version)
+    end)
   end
 
   # `AxonWeb.EventController.visibility_bounds/2` was built for a single
@@ -906,16 +792,11 @@ defmodule AxonWeb.FederationController do
   # `filter_events_for_server` shape — union of visibility over the
   # server's own members, not just its "current" one).
   #
-  # Bounds are computed once per request, not once per event: same reason
-  # `visibility_bounds/2` itself split "figure out the rules" from
-  # "apply them" — an O(events) fan-out of membership queries here would
-  # undo exactly the batching that function exists for.
+  # Bounds are computed once per request, not once per event.
   #
   # A synthetic never-a-member id is always included alongside any real
   # members found, so a `world_readable` room answers correctly even for
-  # an origin with no member in the room at all (its bounds carry
-  # `membership: nil`, which `event_visible?/2` only cares about once
-  # `world_readable` has already short-circuited to `true`).
+  # an origin with no member in the room at all.
   defp origin_visibility_bounds(room_id, origin) do
     real_member_ids =
       Repo.all(from(m in "room_memberships", where: m.room_id == ^room_id, select: m.user_id))
@@ -928,6 +809,45 @@ defmodule AxonWeb.FederationController do
 
   defp synthetic_non_member_id(origin), do: "@_get_missing_events_probe:#{origin}"
 
+  # Gate for the endpoints that read room history/state on behalf of a
+  # remote server: the room must exist here, the origin must pass the
+  # room's ACL, and it must currently have a joined member in the room.
+  defp authorize_room_read(room_id, origin) do
+    cond do
+      not EventStore.room_exists?(room_id) -> {:error, :room_not_found}
+      not acl_allowed?(room_id, origin) -> {:error, :acl_denied}
+      not server_joined?(room_id, origin) -> {:error, :not_in_room}
+      true -> :ok
+    end
+  end
+
+  # Compares the full server name (everything after the user ID's first
+  # colon), so a server name carrying a port matches correctly.
+  defp server_joined?(room_id, server_name) do
+    Repo.exists?(
+      from(m in "room_memberships",
+        where: m.room_id == ^room_id and m.membership == "join",
+        where: fragment("substr(?, strpos(?, ':') + 1)", m.user_id, m.user_id) == ^server_name
+      )
+    )
+  end
+
+  defp fetch_event(event_id) do
+    case EventStore.get_event(event_id) do
+      {:ok, event} -> {:ok, event}
+      {:error, :not_found} -> {:error, :event_not_found}
+    end
+  end
+
+  defp fetch_room_event(_room_id, nil), do: {:error, {:missing_param, "event_id"}}
+
+  defp fetch_room_event(room_id, event_id) do
+    case fetch_event(event_id) do
+      {:ok, %Event{room_id: ^room_id} = event} -> {:ok, event}
+      _ -> {:error, :event_not_found}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/timestamp_to_event/:room_id
   #
@@ -937,19 +857,17 @@ defmodule AxonWeb.FederationController do
   # joined too late to hold history around a given timestamp asks a server
   # that does — this is the side that answers. Same local search
   # (EventStore.find_event_by_timestamp/3) the client endpoint uses, gated
-  # by ACL only: unlike the client endpoint there's no membership check,
-  # because what's being authorized here is the requesting *server*, same
-  # as get_state/get_event/backfill above.
+  # by ACL only.
   # ---------------------------------------------------------------------------
 
   def timestamp_to_event(conn, %{"room_id" => room_id} = params) do
     origin = conn.assigns[:origin_server]
 
-    with {:ok, ts} <- parse_ts_param(params["ts"]),
-         {:ok, dir} <- parse_dir_param(params["dir"]) do
+    with {:ok, ts} <- Params.timestamp(params["ts"]),
+         {:ok, dir} <- Params.direction(params["dir"]) do
       cond do
         not acl_allowed?(room_id, origin) ->
-          acl_forbidden(conn)
+          render_error(conn, :acl_denied)
 
         event = EventStore.find_event_by_timestamp(room_id, ts, dir) ->
           json(conn, %{
@@ -970,21 +888,6 @@ defmodule AxonWeb.FederationController do
         conn |> put_status(400) |> json(%{"errcode" => errcode, "error" => message})
     end
   end
-
-  defp parse_ts_param(ts) when is_binary(ts) do
-    case Integer.parse(ts) do
-      {value, ""} when value >= 0 -> {:ok, value}
-      _ -> {:error, "M_INVALID_PARAM", "Query parameter ts must be a non-negative integer"}
-    end
-  end
-
-  defp parse_ts_param(_), do: {:error, "M_MISSING_PARAM", "Missing required parameter: ts"}
-
-  defp parse_dir_param(dir) when dir in ["f", "b"], do: {:ok, dir}
-  defp parse_dir_param(nil), do: {:ok, "f"}
-
-  defp parse_dir_param(_),
-    do: {:error, "M_INVALID_PARAM", "Query parameter dir must be one of \"f\" or \"b\""}
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/federation/v1/query/directory?room_alias=...
@@ -1275,63 +1178,12 @@ defmodule AxonWeb.FederationController do
   end
 
   # ---------------------------------------------------------------------------
-  # Helpers — event validation & application
+  # Helpers — event verification & application
   # ---------------------------------------------------------------------------
 
-  # `origin` (the authenticated X-Matrix caller) must be the same server as
-  # the event's own `sender` — otherwise any federating server could relay
-  # another server's join event to us untouched except for its unsigned
-  # `displayname`/`avatar_url` fields (both dropped by redaction, so the
-  # signature over the redacted event doesn't cover them), impersonating
-  # the joining user's profile without ever holding their key. Real content-
-  # hash tampering is caught by EventVerification.verify/2 upstream of this
-  # (M1), but join/leave/knock go straight through verify_event_signature/1
-  # instead (see that function's own moduledoc note) specifically because
-  # they're meant to be authored directly by the calling server with no
-  # relay in between — which this check is what actually enforces.
-  defp validate_join_event(event, room_id, origin) do
-    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
-
-    cond do
-      event["type"] != "m.room.member" -> {:error, :invalid_join}
-      event["room_id"] != room_id -> {:error, :invalid_join}
-      get_in(event, ["content", "membership"]) != "join" -> {:error, :invalid_join}
-      event["state_key"] != event["sender"] -> {:error, :invalid_join}
-      sender_server != origin -> {:error, :invalid_join}
-      true -> :ok
-    end
-  end
-
-  # send_leave is specifically for a remote user lodging their own
-  # departure (make_leave/send_leave only ever build/accept a self-leave —
-  # a kick/ban is a *local* action taken by someone with sufficient power,
-  # never routed through this endpoint), so state_key must equal sender
-  # exactly like join/knock. Previously this endpoint had no type/content
-  # validation at all — any signed, auth-valid event (e.g. an ordinary
-  # message) from a joined member would be silently accepted and applied.
-  # See validate_join_event/3's comment on why `origin` must equal the
-  # event's own sender domain.
-  defp validate_leave_event(event, room_id, origin) do
-    sender_server = event["sender"] |> to_string() |> AxonCore.MatrixId.server_name()
-
-    cond do
-      event["type"] != "m.room.member" -> {:error, :invalid_leave}
-      event["room_id"] != room_id -> {:error, :invalid_leave}
-      get_in(event, ["content", "membership"]) != "leave" -> {:error, :invalid_leave}
-      event["state_key"] != event["sender"] -> {:error, :invalid_leave}
-      sender_server != origin -> {:error, :invalid_leave}
-      true -> :ok
-    end
-  end
-
   # The room version drives redaction, which drives what was actually signed.
-  # Falls back to the room's stored version when the caller doesn't already
-  # know it (an inbound PDU for a room we're resident in).
   defp verify_event_signature(event),
-    do: verify_event_signature(event, EventStore.get_room_version(event["room_id"]))
-
-  defp verify_event_signature(event, room_version),
-    do: EventVerification.verify_signature(event, room_version)
+    do: EventVerification.verify_signature(event, EventStore.get_room_version(event["room_id"]))
 
   # Signature *and* content hash, for the one path where an event can have
   # been relayed by a server other than its author: a PDU in a /send
@@ -1348,37 +1200,11 @@ defmodule AxonWeb.FederationController do
   defp verify_event(event),
     do: EventVerification.verify(event, EventStore.get_room_version(event["room_id"]))
 
-  # See apply_knock_event/3 — must go through RoomProcess.apply_remote_event/3,
-  # not a direct EventStore.insert_event, or the room's live GenServer never
-  # learns the remote user joined (federation fan-out silently excludes them,
-  # /sync doesn't show the join in real time, and their next event over
-  # send_transaction gets wrongly auth-rejected as "not_joined" until the
-  # room process happens to restart). relay_exclude: origin relays the join
-  # on to this room's other resident servers — without it, a room with 3+
-  # servers never converges (see apply_remote_event/3's doc).
-  defp apply_join_event(room_id, join_event, origin) do
-    case RoomProcess.apply_remote_event(room_id, join_event, relay_exclude: origin) do
-      {:ok, event_id} -> {:ok, event_id}
-      {:error, _reason} -> {:error, :auth_failed}
-    end
-  end
-
-  # relay_exclude: origin — see apply_join_event/3. A self-leave via
-  # send_leave has the exact same "acting server can't fan out to peers it
-  # doesn't know" shape as a join.
-  defp apply_leave_event(room_id, leave_event, origin) do
-    case RoomProcess.apply_remote_event(room_id, leave_event, relay_exclude: origin) do
-      {:ok, event_id} -> {:ok, event_id}
-      {:error, _reason} -> {:error, :auth_failed}
-    end
-  end
-
   defp process_inbound_pdu(pdu, origin) do
     room_id = pdu["room_id"]
 
     cond do
-      not room_exists?(room_id) ->
-        # Soft-fail: we don't know this room
+      not EventStore.room_exists?(room_id) ->
         {:error, :unknown_room}
 
       not acl_allowed?(room_id, origin) ->
@@ -1419,21 +1245,68 @@ defmodule AxonWeb.FederationController do
     end
   end
 
-  defp sig_error_message(:bad_signature), do: "Bad event signature"
-  defp sig_error_message(:missing_signature), do: "Event has no signature from its origin server"
-  defp sig_error_message(:key_not_found), do: "Could not fetch the origin server's signing key"
+  # ---------------------------------------------------------------------------
+  # Helpers — responses
+  # ---------------------------------------------------------------------------
 
-  defp compute_event_id(pdu) do
-    EventHash.reference_hash(pdu, EventStore.get_room_version(pdu["room_id"]))
+  defp respond(conn, {:ok, body}), do: json(conn, body)
+  defp respond(conn, {:error, reason}), do: render_error(conn, reason)
+
+  # The deprecated v1 send_join/send_leave/invite wrap a success body as
+  # `[200, body]`.
+  defp respond_v1(conn, {:ok, body}), do: json(conn, [200, body])
+  defp respond_v1(conn, error), do: respond(conn, error)
+
+  defp render_error(conn, {:incompatible_room_version, version}) do
+    conn
+    |> put_status(400)
+    |> json(%{
+      "errcode" => "M_INCOMPATIBLE_ROOM_VERSION",
+      "error" => "Your homeserver does not support the features required to join this room",
+      "room_version" => version
+    })
   end
+
+  defp render_error(conn, reason) do
+    {status, errcode, message} = error_info(reason)
+    conn |> put_status(status) |> json(%{"errcode" => errcode, "error" => message})
+  end
+
+  defp error_info(:acl_denied), do: {403, "M_FORBIDDEN", "Server denied by ACL"}
+  defp error_info(:not_in_room), do: {403, "M_FORBIDDEN", "Server is not in the room"}
+  defp error_info(:room_not_found), do: {404, "M_NOT_FOUND", "Room not found"}
+  defp error_info(:event_not_found), do: {404, "M_NOT_FOUND", "Event not found"}
+  defp error_info(:join_not_allowed), do: {403, "M_FORBIDDEN", "Join not allowed"}
+  defp error_info(:auth_failed), do: {403, "M_FORBIDDEN", "Event failed auth check"}
+
+  defp error_info(:origin_mismatch),
+    do: {403, "M_FORBIDDEN", "User ID domain does not match origin"}
+
+  defp error_info(:knock_not_allowed),
+    do: {403, "M_FORBIDDEN", "This room does not support knocking"}
+
+  defp error_info({:invalid_event, membership}),
+    do: {400, "M_BAD_JSON", "Invalid #{membership} event"}
+
+  defp error_info({:missing_param, name}),
+    do: {400, "M_MISSING_PARAM", "Missing required parameter: #{name}"}
+
+  # Distinct messages per reason: these three fail for completely different
+  # operational causes (bad crypto vs an unsigned event vs not being able to
+  # fetch the origin's keys at all).
+  defp error_info(:bad_signature), do: {403, "M_FORBIDDEN", "Bad event signature"}
+
+  defp error_info(:missing_signature),
+    do: {403, "M_FORBIDDEN", "Event has no signature from its origin server"}
+
+  defp error_info(:key_not_found),
+    do: {403, "M_FORBIDDEN", "Could not fetch the origin server's signing key"}
+
+  defp error_info(_), do: {500, "M_UNKNOWN", "Internal error"}
 
   # ---------------------------------------------------------------------------
   # Helpers — room state
   # ---------------------------------------------------------------------------
-
-  defp room_exists?(room_id) do
-    Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.room_id)) != nil
-  end
 
   # m.room.server_acl (Server-Server API "Server Access Control Lists")
   # gating for every federation endpoint the spec lists as MUST-protect,
@@ -1450,57 +1323,6 @@ defmodule AxonWeb.FederationController do
 
   defp check_acl(room_id, server_name) do
     if acl_allowed?(room_id, server_name), do: :ok, else: {:error, :acl_denied}
-  end
-
-  defp acl_forbidden(conn) do
-    conn
-    |> put_status(403)
-    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Server denied by ACL"})
-  end
-
-  defp get_room_version(room_id) do
-    Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.version)) || "11"
-  end
-
-  defp pick_room_version(room_id, supported_versions) do
-    version = get_room_version(room_id)
-    if version in supported_versions, do: version, else: "11"
-  end
-
-  defp build_join_template(room_id, user_id, member_content) do
-    room_ctx = RoomProcess.get_room_ctx(room_id)
-
-    %{
-      "type" => "m.room.member",
-      "room_id" => room_id,
-      "sender" => user_id,
-      "state_key" => user_id,
-      "content" => member_content,
-      "origin_server_ts" => System.os_time(:millisecond),
-      "origin" => user_id |> AxonCore.MatrixId.server_name(),
-      "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
-      "auth_events" =>
-        select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
-      "depth" => room_ctx.depth + 1
-    }
-  end
-
-  defp build_leave_template(room_id, user_id) do
-    room_ctx = RoomProcess.get_room_ctx(room_id)
-
-    %{
-      "type" => "m.room.member",
-      "room_id" => room_id,
-      "sender" => user_id,
-      "state_key" => user_id,
-      "content" => %{"membership" => "leave"},
-      "origin_server_ts" => System.os_time(:millisecond),
-      "origin" => user_id |> AxonCore.MatrixId.server_name(),
-      "prev_events" => if(room_ctx.last_event_id, do: [room_ctx.last_event_id], else: []),
-      "auth_events" =>
-        select_join_auth_events(user_id, room_ctx.current_state, room_ctx.room_version),
-      "depth" => room_ctx.depth + 1
-    }
   end
 
   defp select_join_auth_events(user_id, current_state, room_version) do
@@ -1523,29 +1345,36 @@ defmodule AxonWeb.FederationController do
     |> Enum.uniq()
   end
 
-  defp build_auth_chain_for_state(state_events) do
-    state_events
-    |> Enum.flat_map(&get_auth_chain_ids/1)
-    |> Enum.uniq()
-    |> Enum.flat_map(fn event_id ->
-      case EventStore.get_event(event_id) do
-        {:ok, e} -> [EventStore.event_to_pdu(e)]
-        _ -> []
-      end
-    end)
+  defp auth_chain_pdus(events) do
+    case auth_chain_ids(events) do
+      [] ->
+        []
+
+      ids ->
+        Repo.all(from(e in Event, where: e.event_id in ^ids))
+        |> Enum.map(&EventStore.event_to_pdu/1)
+    end
   end
 
-  defp get_auth_chain_ids(event) do
-    ids = event.auth_event_ids || []
+  # Union of the transitive auth chains of `events` (the events themselves
+  # excluded unless one is in another's chain): breadth-first, one query per
+  # level, each event visited once.
+  defp auth_chain_ids(events) do
+    events
+    |> Enum.flat_map(&(&1.auth_event_ids || []))
+    |> expand_auth_chain(MapSet.new())
+  end
 
-    (ids ++
-       Enum.flat_map(ids, fn id ->
-         case EventStore.get_event(id) do
-           {:ok, e} -> get_auth_chain_ids(e)
-           _ -> []
-         end
-       end))
-    |> Enum.uniq()
+  defp expand_auth_chain(frontier, seen) do
+    case frontier |> Enum.uniq() |> Enum.reject(&(is_nil(&1) or MapSet.member?(seen, &1))) do
+      [] ->
+        MapSet.to_list(seen)
+
+      new_ids ->
+        Repo.all(from(e in Event, where: e.event_id in ^new_ids, select: e.auth_event_ids))
+        |> Enum.flat_map(&(&1 || []))
+        |> expand_auth_chain(Enum.into(new_ids, seen))
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1568,7 +1397,7 @@ defmodule AxonWeb.FederationController do
   #        isn't visible to this origin server at all (not public/world-
   #        readable, and the origin has no user satisfying a restricted
   #        room's allow-list).
-  #   403 — origin is ACL-denied (mirror the acl_allowed?/acl_forbidden
+  #   403 — origin is ACL-denied (mirror the acl_allowed?/render_error
   #        pattern used by event_auth/backfill/etc. in this same file).
   #
   # Unlike the CS API version, there's no specific requesting *user* — only
@@ -1587,9 +1416,9 @@ defmodule AxonWeb.FederationController do
 
     cond do
       not acl_allowed?(room_id, origin) ->
-        acl_forbidden(conn)
+        render_error(conn, :acl_denied)
 
-      not room_exists?(room_id) ->
+      not EventStore.room_exists?(room_id) ->
         hierarchy_not_found(conn)
 
       not server_may_see?(room_id, origin) ->
@@ -1602,7 +1431,7 @@ defmodule AxonWeb.FederationController do
         child_summaries =
           children
           |> Enum.map(& &1["state_key"])
-          |> Enum.filter(&room_exists?/1)
+          |> Enum.filter(&EventStore.room_exists?/1)
           |> Enum.filter(&server_may_see?(&1, origin))
           |> Enum.map(fn child_id ->
             hierarchy_build_entry(child_id, hierarchy_child_events(child_id, suggested_only))
@@ -1612,7 +1441,7 @@ defmodule AxonWeb.FederationController do
           children
           |> Enum.map(& &1["state_key"])
           |> Enum.reject(fn child_id ->
-            room_exists?(child_id) and server_may_see?(child_id, origin)
+            EventStore.room_exists?(child_id) and server_may_see?(child_id, origin)
           end)
 
         json(conn, %{
@@ -1643,26 +1472,7 @@ defmodule AxonWeb.FederationController do
   end
 
   defp restricted_allow_satisfied_by_server?(state, origin) do
-    allow = get_in(state, ["m.room.join_rules", "allow"]) || []
-
-    allow
-    |> Enum.filter(&(&1["type"] == "m.room_membership"))
-    |> Enum.map(& &1["room_id"])
-    |> Enum.reject(&is_nil/1)
-    |> Enum.any?(&any_local_member_from_server?(&1, origin))
-  end
-
-  defp any_local_member_from_server?(room_id, origin) do
-    Repo.exists?(
-      from(m in "room_memberships",
-        where: m.room_id == ^room_id and m.membership == "join",
-        where: fragment("split_part(?, ':', 2)", m.user_id) == ^origin
-      )
-    )
-  end
-
-  defp room_exists?(room_id) do
-    Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: 1)) != nil
+    state |> allowed_room_ids() |> Enum.any?(&server_joined?(&1, origin))
   end
 
   defp hierarchy_state_map(room_id, types) do
@@ -1736,7 +1546,6 @@ defmodule AxonWeb.FederationController do
         )
       ) || 0
 
-    room_type = get_in(state, ["m.room.create", "type"])
     guest_access = get_in(state, ["m.room.guest_access", "guest_access"]) || "forbidden"
 
     history_visibility =
@@ -1744,48 +1553,36 @@ defmodule AxonWeb.FederationController do
 
     join_rule = get_in(state, ["m.room.join_rules", "join_rule"]) || "invite"
 
-    room_version =
-      Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.version)) || "1"
+    allowed_room_ids =
+      if join_rule in ["restricted", "knock_restricted"] do
+        case allowed_room_ids(state) do
+          [] -> nil
+          ids -> ids
+        end
+      end
 
-    entry = %{
+    %{
       "room_id" => room_id,
       "num_joined_members" => num_joined,
       "world_readable" => history_visibility == "world_readable",
       "guest_can_join" => guest_access == "can_join",
       "join_rule" => join_rule,
-      "room_version" => room_version,
+      "room_version" => EventStore.get_room_version(room_id, "1"),
       "children_state" => children
     }
+    |> maybe_put("name", get_in(state, ["m.room.name", "name"]))
+    |> maybe_put("topic", get_in(state, ["m.room.topic", "topic"]))
+    |> maybe_put("avatar_url", get_in(state, ["m.room.avatar", "url"]))
+    |> maybe_put("canonical_alias", get_in(state, ["m.room.canonical_alias", "alias"]))
+    |> maybe_put("room_type", get_in(state, ["m.room.create", "type"]))
+    |> maybe_put("encryption", get_in(state, ["m.room.encryption", "algorithm"]))
+    |> maybe_put("allowed_room_ids", allowed_room_ids)
+  end
 
-    entry =
-      Enum.reduce(
-        [
-          {get_in(state, ["m.room.name", "name"]), "name"},
-          {get_in(state, ["m.room.topic", "topic"]), "topic"},
-          {get_in(state, ["m.room.avatar", "url"]), "avatar_url"},
-          {get_in(state, ["m.room.canonical_alias", "alias"]), "canonical_alias"},
-          {room_type, "room_type"},
-          {get_in(state, ["m.room.encryption", "algorithm"]), "encryption"}
-        ],
-        entry,
-        fn
-          {nil, _k}, acc -> acc
-          {v, k}, acc -> Map.put(acc, k, v)
-        end
-      )
-
-    if join_rule in ["restricted", "knock_restricted"] do
-      allow = get_in(state, ["m.room.join_rules", "allow"]) || []
-
-      ids =
-        allow
-        |> Enum.filter(&(&1["type"] == "m.room_membership"))
-        |> Enum.map(& &1["room_id"])
-        |> Enum.reject(&is_nil/1)
-
-      if ids == [], do: entry, else: Map.put(entry, "allowed_room_ids", ids)
-    else
-      entry
-    end
+  defp allowed_room_ids(state) do
+    (get_in(state, ["m.room.join_rules", "allow"]) || [])
+    |> Enum.filter(&(&1["type"] == "m.room_membership"))
+    |> Enum.map(& &1["room_id"])
+    |> Enum.reject(&is_nil/1)
   end
 end

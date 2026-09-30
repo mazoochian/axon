@@ -8,7 +8,7 @@ defmodule AxonWeb.EventController do
   import Ecto.Query, only: [from: 2]
   alias AxonCore.{ClientTransactionStore, EventStore, Repo}
   alias AxonRoom.RoomProcess
-  alias AxonWeb.TransactionIdProjection
+  alias AxonWeb.{Params, TransactionIdProjection}
 
   @max_event_size 65_535
 
@@ -151,14 +151,11 @@ defmodule AxonWeb.EventController do
   # for GET /event/{id} and /messages).
   def get_state(conn, %{"room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
+    bounds = visibility_bounds(room_id, user_id)
 
-    if member_or_forgotten?(room_id, user_id) do
-      conn
-      |> put_status(403)
-      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+    if not room_readable?(bounds) do
+      forbidden(conn)
     else
-      bounds = visibility_bounds(room_id, user_id)
-
       result =
         case departed_boundary(bounds) do
           nil ->
@@ -188,14 +185,11 @@ defmodule AxonWeb.EventController do
     user_id = conn.assigns.current_user_id
     state_key = params["state_key"] || ""
     format = params["format"]
+    bounds = visibility_bounds(room_id, user_id)
 
-    if member_or_forgotten?(room_id, user_id) do
-      conn
-      |> put_status(403)
-      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+    if not room_readable?(bounds) do
+      forbidden(conn)
     else
-      bounds = visibility_bounds(room_id, user_id)
-
       fetched =
         case departed_boundary(bounds) do
           nil ->
@@ -223,30 +217,34 @@ defmodule AxonWeb.EventController do
   end
 
   # `visibility_bounds/2`'s leave_ordering, but only when it actually
-  # applies to this request — a current join/invite (or a user who was
-  # never a member, already blocked above by member_or_forgotten?/2)
-  # gets nil, meaning "use the live/current-state path".
+  # applies to this request — a current member (or a world_readable
+  # reader who was never one) gets nil, meaning "use the live/current-state path".
   defp departed_boundary(%{membership: m, leave_ordering: ord}) when m in ["leave", "ban"],
     do: ord
 
   defp departed_boundary(_bounds), do: nil
 
-  # Regression guard (finding): get_state/2, get_state_event/2, and
-  # get_messages/2 used to have no membership check at all (or, for
-  # get_messages, only checked "forgotten" — never "never was a member"),
-  # meaning any authenticated user on the server could read a private
-  # room's full state/timeline just by knowing its room_id. get_relations/2
-  # already had the correct nil-or-forgotten check; this mirrors it.
-  defp member_or_forgotten?(room_id, user_id) do
-    membership =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: %{membership: m.membership, forgotten: m.forgotten}
-        )
-      )
+  @doc """
+  Whether `visibility_bounds/2`'s user may read the room's state and history
+  at all: a current member, a departed (left/banned, not forgotten) one
+  within their membership bounds, or anyone for a world_readable room.
+  Invites and knocks do not qualify.
+  """
+  def room_readable?(bounds),
+    do: bounds.history_visibility == "world_readable" or member_reader?(bounds)
 
-    membership == nil or membership.forgotten
+  defp member_reader?(%{forgotten: true}), do: false
+  defp member_reader?(%{membership: "join"}), do: true
+
+  defp member_reader?(%{membership: m, leave_ordering: ord}) when m in ["leave", "ban"],
+    do: not is_nil(ord)
+
+  defp member_reader?(_bounds), do: false
+
+  defp forbidden(conn) do
+    conn
+    |> put_status(403)
+    |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/event/:event_id
@@ -313,13 +311,13 @@ defmodule AxonWeb.EventController do
         )
       ) || "shared"
 
-    membership =
+    %{membership: membership, forgotten: forgotten} =
       Repo.one(
         from(m in "room_memberships",
           where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: m.membership
+          select: %{membership: m.membership, forgotten: m.forgotten}
         )
-      )
+      ) || %{membership: nil, forgotten: false}
 
     join_ordering =
       if history_visibility in ["joined", "invited"] or membership in ["leave", "ban"],
@@ -336,6 +334,7 @@ defmodule AxonWeb.EventController do
     %{
       history_visibility: history_visibility,
       membership: membership,
+      forgotten: forgotten == true,
       join_ordering: join_ordering,
       invite_ordering: invite_ordering,
       leave_ordering: leave_ordering
@@ -424,20 +423,15 @@ defmodule AxonWeb.EventController do
   # GET /_matrix/client/v3/rooms/:room_id/messages
   def get_messages(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
+    bounds = visibility_bounds(room_id, user_id)
 
-    if member_or_forgotten?(room_id, user_id) do
-      conn
-      |> put_status(403)
-      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
-    else
+    with true <- room_readable?(bounds) || :forbidden,
+         {:ok, dir} <- Params.direction(params["dir"] || "b") do
       from_token = params["from"]
-      dir = params["dir"] || "b"
-      limit = String.to_integer(params["limit"] || "10")
+      limit = Params.int(params["limit"], 10, 1, 1000)
       filter = decode_filter(params["filter"])
 
       from_ordering = parse_token(from_token) || EventStore.room_max_stream_ordering(room_id) + 1
-
-      bounds = visibility_bounds(room_id, user_id)
 
       # EventStore.get_messages/4's dir=b is exclusive of `from_ordering`
       # itself (by design — see event_store_test.exs's `stream_ordering +
@@ -463,21 +457,23 @@ defmodule AxonWeb.EventController do
             from_ordering
         end
 
+      page = EventStore.get_messages(room_id, from_ordering, dir, limit)
+
       events =
-        EventStore.get_messages(room_id, from_ordering, dir, limit)
+        page
         |> Enum.filter(&event_visible?(bounds, &1))
         |> filter_contains_url(filter)
 
       start_token = if from_token, do: from_token, else: Integer.to_string(from_ordering)
 
+      # The page is ordered in the direction of travel, so its last event is
+      # the furthest one reached (the oldest for dir=b) — taken before
+      # visibility filtering so filtered-out events aren't fetched again.
       end_ordering =
-        if events == [],
-          do: from_ordering,
-          else:
-            if(dir == "b",
-              do: hd(events).stream_ordering,
-              else: List.last(events).stream_ordering
-            )
+        case page do
+          [] -> from_ordering
+          _ -> List.last(page).stream_ordering
+        end
 
       chunk =
         events
@@ -495,7 +491,14 @@ defmodule AxonWeb.EventController do
         conn,
         TransactionIdProjection.project(response, user_id, conn.assigns.current_device_id)
       )
+    else
+      :forbidden -> forbidden(conn)
+      {:error, errcode, message} -> bad_param(conn, errcode, message)
     end
+  end
+
+  defp bad_param(conn, errcode, message) do
+    conn |> put_status(400) |> json(%{"errcode" => errcode, "error" => message})
   end
 
   # `contains_url` (a RoomEventFilter field): only events whose content has
@@ -565,13 +568,11 @@ defmodule AxonWeb.EventController do
   def timestamp_to_event(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
 
-    with {:ok, ts} <- parse_timestamp(params["ts"]),
-         {:ok, dir} <- parse_direction(params["dir"]) do
+    with {:ok, ts} <- Params.timestamp(params["ts"]),
+         {:ok, dir} <- Params.direction(params["dir"]) do
       cond do
-        member_or_forgotten?(room_id, user_id) ->
-          conn
-          |> put_status(403)
-          |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+        not member_reader?(visibility_bounds(room_id, user_id)) ->
+          forbidden(conn)
 
         event = timestamp_answer(room_id, ts, dir) ->
           json(conn, %{
@@ -588,8 +589,7 @@ defmodule AxonWeb.EventController do
           })
       end
     else
-      {:error, errcode, message} ->
-        conn |> put_status(400) |> json(%{"errcode" => errcode, "error" => message})
+      {:error, errcode, message} -> bad_param(conn, errcode, message)
     end
   end
 
@@ -625,22 +625,6 @@ defmodule AxonWeb.EventController do
     end
   end
 
-  defp parse_timestamp(nil), do: {:error, "M_MISSING_PARAM", "Missing required parameter: ts"}
-
-  defp parse_timestamp(ts) when is_binary(ts) do
-    case Integer.parse(ts) do
-      {value, ""} when value >= 0 -> {:ok, value}
-      _ -> {:error, "M_INVALID_PARAM", "Query parameter ts must be a non-negative integer"}
-    end
-  end
-
-  # `dir` defaults to "f" per spec.
-  defp parse_direction(nil), do: {:ok, "f"}
-  defp parse_direction(dir) when dir in ["f", "b"], do: {:ok, dir}
-
-  defp parse_direction(_),
-    do: {:error, "M_INVALID_PARAM", "Query parameter dir must be one of \"f\" or \"b\""}
-
   # GET /_matrix/client/v3/rooms/:room_id/context/:event_id
   #
   # Previously unimplemented — no route at all, so it 404'd generically.
@@ -649,87 +633,88 @@ defmodule AxonWeb.EventController do
   # search result in context.
   def get_context(conn, %{"room_id" => room_id, "event_id" => event_id} = params) do
     user_id = conn.assigns.current_user_id
+    bounds = visibility_bounds(room_id, user_id)
 
-    cond do
-      member_or_forgotten?(room_id, user_id) ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+    with true <- room_readable?(bounds) || :forbidden,
+         {:ok, %{room_id: ^room_id} = event} <- EventStore.get_visible_event(event_id),
+         true <- event_visible?(bounds, event) do
+      # Spec: `limit` is the total number of events returned either
+      # side of the target, so split it between the two directions.
+      limit = Params.int(params["limit"], 10, 0, 1000)
+      half = max(div(limit, 2), 1)
 
-      true ->
-        case EventStore.get_event(event_id) do
-          {:ok, %{room_id: ^room_id} = event} ->
-            # Spec: `limit` is the total number of events returned either
-            # side of the target, so split it between the two directions.
-            limit = String.to_integer(params["limit"] || "10")
-            half = max(div(limit, 2), 1)
+      # get_context_neighbors/4, not get_messages/4: `event` is the
+      # pivot here, and it can itself be a federation-backfilled event
+      # whose stream_ordering reflects local insertion time rather
+      # than DAG position (Complement: TestJumpToDateEndpoint "can
+      # paginate backwards" — see get_context_neighbors/4's doc).
+      before_events =
+        room_id
+        |> EventStore.get_context_neighbors(event, "b", half)
+        |> Enum.filter(&event_visible?(bounds, &1))
 
-            # get_context_neighbors/4, not get_messages/4: `event` is the
-            # pivot here, and it can itself be a federation-backfilled event
-            # whose stream_ordering reflects local insertion time rather
-            # than DAG position (Complement: TestJumpToDateEndpoint "can
-            # paginate backwards" — see get_context_neighbors/4's doc).
-            before_events =
-              EventStore.get_context_neighbors(room_id, event, "b", half)
+      after_events =
+        room_id
+        |> EventStore.get_context_neighbors(event, "f", half)
+        |> Enum.filter(&event_visible?(bounds, &1))
 
-            after_events =
-              EventStore.get_context_neighbors(room_id, event, "f", half)
-
-            # get_context_neighbors/4 returns "b" newest-first, which is
-            # already the reverse-chronological order the spec wants for
-            # events_before.
-            #
-            # `start`/`end` still have to be plain stream_ordering values —
-            # they're consumed by /messages's dir=b, whose own WHERE bound
-            # is stream_ordering-only (see get_messages/4's doc) — so they
-            # can't just borrow the boundary event's stream_ordering the way
-            # a non-skewed room would suggest. Any event on the "before" or
-            # "after" side (including `event` itself, on the "after" side)
-            # can carry a stream_ordering *higher* than events nominally
-            # further into the room's history, exactly because it may have
-            # backfilled in later than they did. The only bound guaranteed
-            # not to silently drop one of them is one strictly past the
-            # *highest* stream_ordering among everything that boundary needs
-            # to keep reachable — never just the depth-nearest one's.
-            #
-            # `start` only has to keep `before_events` reachable: `event`
-            # itself is deliberately excluded (it's already returned
-            # separately, and dir=b pagination from `start` isn't expected
-            # to reproduce it).
-            start_ordering =
-              case before_events do
-                [] -> event.stream_ordering
-                events -> 1 + (events |> Enum.map(& &1.stream_ordering) |> Enum.max())
-              end
-
-            # `end` has to keep both `after_events` *and* `event` itself
-            # reachable — a subsequent dir=b page from `end` is exactly how
-            # a client walks back through `event` and beyond (there's no
-            # forward-from-`end` call in play), so `event` can't be left
-            # out here the way it is for `start`.
-            end_ordering =
-              1 + ([event | after_events] |> Enum.map(& &1.stream_ordering) |> Enum.max())
-
-            response = %{
-              "start" => Integer.to_string(start_ordering),
-              "end" => Integer.to_string(end_ordering),
-              "events_before" => Enum.map(before_events, &EventStore.event_to_map/1),
-              "event" => EventStore.event_to_map(event),
-              "events_after" => Enum.map(after_events, &EventStore.event_to_map/1),
-              "state" =>
-                room_id |> EventStore.get_current_state() |> Enum.map(&EventStore.event_to_map/1)
-            }
-
-            json(
-              conn,
-              TransactionIdProjection.project(response, user_id, conn.assigns.current_device_id)
-            )
-
-          _ ->
-            conn
-            |> put_status(404)
-            |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Event not found"})
+      # get_context_neighbors/4 returns "b" newest-first, which is
+      # already the reverse-chronological order the spec wants for
+      # events_before.
+      #
+      # `start`/`end` still have to be plain stream_ordering values —
+      # they're consumed by /messages's dir=b, whose own WHERE bound
+      # is stream_ordering-only (see get_messages/4's doc) — so they
+      # can't just borrow the boundary event's stream_ordering the way
+      # a non-skewed room would suggest. Any event on the "before" or
+      # "after" side (including `event` itself, on the "after" side)
+      # can carry a stream_ordering *higher* than events nominally
+      # further into the room's history, exactly because it may have
+      # backfilled in later than they did. The only bound guaranteed
+      # not to silently drop one of them is one strictly past the
+      # *highest* stream_ordering among everything that boundary needs
+      # to keep reachable — never just the depth-nearest one's.
+      #
+      # `start` only has to keep `before_events` reachable: `event`
+      # itself is deliberately excluded (it's already returned
+      # separately, and dir=b pagination from `start` isn't expected
+      # to reproduce it).
+      start_ordering =
+        case before_events do
+          [] -> event.stream_ordering
+          events -> 1 + (events |> Enum.map(& &1.stream_ordering) |> Enum.max())
         end
+
+      # `end` has to keep both `after_events` *and* `event` itself
+      # reachable — a subsequent dir=b page from `end` is exactly how
+      # a client walks back through `event` and beyond (there's no
+      # forward-from-`end` call in play), so `event` can't be left
+      # out here the way it is for `start`.
+      end_ordering =
+        1 + ([event | after_events] |> Enum.map(& &1.stream_ordering) |> Enum.max())
+
+      response = %{
+        "start" => Integer.to_string(start_ordering),
+        "end" => Integer.to_string(end_ordering),
+        "events_before" => Enum.map(before_events, &EventStore.event_to_map/1),
+        "event" => EventStore.event_to_map(event),
+        "events_after" => Enum.map(after_events, &EventStore.event_to_map/1),
+        "state" =>
+          room_id |> EventStore.get_current_state() |> Enum.map(&EventStore.event_to_map/1)
+      }
+
+      json(
+        conn,
+        TransactionIdProjection.project(response, user_id, conn.assigns.current_device_id)
+      )
+    else
+      :forbidden ->
+        forbidden(conn)
+
+      _ ->
+        conn
+        |> put_status(404)
+        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Event not found"})
     end
   end
 
@@ -738,22 +723,11 @@ defmodule AxonWeb.EventController do
   # GET /_matrix/client/v1/rooms/:room_id/relations/:event_id/:rel_type/:event_type
   def get_relations(conn, %{"room_id" => room_id, "event_id" => event_id} = params) do
     user_id = conn.assigns.current_user_id
+    bounds = visibility_bounds(room_id, user_id)
 
-    membership =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: %{membership: m.membership, forgotten: m.forgotten}
-        )
-      )
-
-    if membership == nil or membership.forgotten do
-      conn
-      |> put_status(403)
-      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
-    else
-      dir = params["dir"] || "b"
-      limit = String.to_integer(params["limit"] || "10")
+    with true <- room_readable?(bounds) || :forbidden,
+         {:ok, dir} <- Params.direction(params["dir"] || "b") do
+      limit = Params.int(params["limit"], 10, 1, 1000)
       from_token = params["from"]
 
       from_ordering =
@@ -773,6 +747,7 @@ defmodule AxonWeb.EventController do
 
       chunk =
         events
+        |> Enum.filter(&event_visible?(bounds, &1))
         |> Enum.map(&EventStore.event_to_map/1)
         |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
 
@@ -785,6 +760,9 @@ defmodule AxonWeb.EventController do
       resp = %{"chunk" => chunk}
       resp = if next_batch, do: Map.put(resp, "next_batch", next_batch), else: resp
       json(conn, TransactionIdProjection.project(resp, user_id, conn.assigns.current_device_id))
+    else
+      :forbidden -> forbidden(conn)
+      {:error, errcode, message} -> bad_param(conn, errcode, message)
     end
   end
 
@@ -795,12 +773,11 @@ defmodule AxonWeb.EventController do
   # root's own position, per `EventStore.get_thread_roots/3`.
   def get_threads(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
+    bounds = visibility_bounds(room_id, user_id)
 
     cond do
-      member_or_forgotten?(room_id, user_id) ->
-        conn
-        |> put_status(403)
-        |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+      not room_readable?(bounds) ->
+        forbidden(conn)
 
       params["include"] not in [nil, "all", "participated"] ->
         conn
@@ -811,7 +788,7 @@ defmodule AxonWeb.EventController do
         })
 
       true ->
-        limit = String.to_integer(params["limit"] || "10")
+        limit = Params.int(params["limit"], 10, 1, 1000)
         from_token = params["from"]
 
         from_ordering =
@@ -826,7 +803,9 @@ defmodule AxonWeb.EventController do
 
         chunk =
           roots_with_activity
-          |> Enum.map(fn {root, _activity} -> EventStore.event_to_map(root) end)
+          |> Enum.map(fn {root, _activity} -> root end)
+          |> Enum.filter(&event_visible?(bounds, &1))
+          |> Enum.map(&EventStore.event_to_map/1)
           |> then(&EventStore.bundle_relations(room_id, &1, user_id: user_id))
 
         next_batch =

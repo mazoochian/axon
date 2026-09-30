@@ -93,6 +93,69 @@ defmodule AxonWeb.AuthControllerTest do
     assert decode(conn)["errcode"] == "M_MISSING_PARAM"
   end
 
+  test "non-string login credentials are a missing-param error, not a crash" do
+    for body <- [
+          %{"type" => "m.login.password", "identifier" => %{"user" => 42}, "password" => "x"},
+          %{"type" => "m.login.password", "user" => "alice", "password" => %{"a" => 1}}
+        ] do
+      conn = build_conn() |> jp("/_matrix/client/v3/login", body)
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_MISSING_PARAM"
+    end
+  end
+
+  test "reserved localparts (system accounts, guest prefix) cannot be registered" do
+    for username <- ["_server", "_bridge_bot", "guest_abc", "Guest_Abc"] do
+      conn =
+        build_conn()
+        |> jp("/_matrix/client/v3/register", %{
+          "username" => username,
+          "password" => "Test1234!",
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INVALID_USERNAME"
+
+      conn = build_conn() |> get("/_matrix/client/v3/register/available?username=#{username}")
+      assert conn.status == 400
+    end
+  end
+
+  test "a non-string registration password is rejected" do
+    conn =
+      build_conn()
+      |> jp("/_matrix/client/v3/register", %{
+        "username" => "badpw_#{System.unique_integer([:positive])}",
+        "password" => 12_345,
+        "auth" => %{"type" => "m.login.dummy"}
+      })
+
+    assert conn.status == 400
+  end
+
+  test "m.login.dummy does not satisfy UIA for password change or deactivation" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/account/password", %{
+        "new_password" => "Other1234!",
+        "auth" => %{"type" => "m.login.dummy"}
+      })
+
+    assert conn.status == 401
+
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/account/deactivate", %{"auth" => %{"type" => "m.login.dummy"}})
+
+    assert conn.status == 401
+
+    assert authed(alice.token) |> get("/_matrix/client/v3/account/whoami") |> Map.get(:status) ==
+             200
+  end
+
   test "register_available reports true for a free username and false when taken" do
     free_conn =
       build_conn()
@@ -146,7 +209,9 @@ defmodule AxonWeb.AuthControllerTest do
 
       conn =
         build_conn()
-        |> get("/_matrix/client/v3/register/available?username=whatever_#{System.unique_integer([:positive])}")
+        |> get(
+          "/_matrix/client/v3/register/available?username=whatever_#{System.unique_integer([:positive])}"
+        )
 
       assert conn.status == 403
       body = decode(conn)
@@ -213,6 +278,40 @@ defmodule AxonWeb.AuthControllerTest do
 
       assert conn.status == 200
       assert decode(conn)["user_id"] =~ username
+    end
+
+    test "a reserved localpart is refused even with a valid HMAC" do
+      nonce = decode(build_conn() |> get("/_synapse/admin/v1/register"))["nonce"]
+
+      mac =
+        :crypto.mac(:hmac, :sha, "complement", "#{nonce}\x00_server\x00Test1234!\x00notadmin")
+        |> Base.encode16(case: :lower)
+
+      conn =
+        build_conn()
+        |> jp("/_synapse/admin/v1/register", %{
+          "nonce" => nonce,
+          "username" => "_server",
+          "password" => "Test1234!",
+          "mac" => mac,
+          "admin" => false
+        })
+
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INVALID_USERNAME"
+    end
+
+    test "non-string password or nonce is rejected rather than crashing" do
+      conn =
+        build_conn()
+        |> jp("/_synapse/admin/v1/register", %{
+          "nonce" => 1,
+          "username" => "x_#{System.unique_integer([:positive])}",
+          "password" => ["x"],
+          "mac" => "00"
+        })
+
+      assert conn.status == 400
     end
 
     test "register with a wrong HMAC is rejected" do

@@ -115,6 +115,20 @@ defmodule AxonWeb.AppServiceAuthTest do
     assert decode(conn)["errcode"] == "M_UNKNOWN_TOKEN"
   end
 
+  test "?user_id= can't masquerade as a remote user, even one matching the namespace" do
+    put_registrations([
+      bridge_registration("bridge7", "as-secret-7",
+        user_namespaces: [%{"regex" => "@ghost7_.*", "exclusive" => true}]
+      )
+    ])
+
+    conn =
+      as_authed("as-secret-7")
+      |> get("/_matrix/client/v3/account/whoami?user_id=@ghost7_1:remote.example")
+
+    assert conn.status == 401
+  end
+
   test "an unrecognized token still 401s as before" do
     put_registrations([bridge_registration("bridge6", "as-secret-6")])
 

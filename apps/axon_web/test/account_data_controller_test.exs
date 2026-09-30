@@ -130,4 +130,38 @@ defmodule AxonWeb.AccountDataControllerTest do
 
     assert conn.status == 404
   end
+
+  test "stored content is exactly the JSON body: no query params, body keys kept" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    path = "/_matrix/client/v3/user/#{alice.user_id}/account_data/m.custom"
+    body = %{"type" => "t", "user_id" => "u", "foo" => "bar"}
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put(path <> "?access_token=#{alice.token}", Jason.encode!(body))
+
+    assert conn.status == 200
+    assert decode(authed(alice.token) |> get(path)) == body
+
+    room_id = decode(authed(alice.token) |> jp("/_matrix/client/v3/createRoom", %{}))["room_id"]
+    room_path = "/_matrix/client/v3/user/#{alice.user_id}/rooms/#{room_id}/account_data/m.tag"
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put(room_path <> "?access_token=#{alice.token}", Jason.encode!(%{"room_id" => "x"}))
+
+    assert conn.status == 200
+    assert decode(authed(alice.token) |> get(room_path)) == %{"room_id" => "x"}
+  end
+
+  test "a non-object JSON body is rejected" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    path = "/_matrix/client/v3/user/#{alice.user_id}/account_data/m.custom"
+
+    conn = authed(alice.token) |> jpu(path, [1, 2])
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_BAD_JSON"
+  end
 end

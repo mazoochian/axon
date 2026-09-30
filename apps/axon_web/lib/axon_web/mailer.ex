@@ -44,18 +44,34 @@ defmodule AxonWeb.Mailer do
   this is the expected, common case) when SMTP isn't configured.
   """
   def deliver_3pid_invite(address, %{inviter_id: _, room_id: _, token: _} = invite) do
-    case smtp_config() do
-      %{relay: nil} ->
+    cond do
+      not valid_address?(address) ->
+        Logger.warning("Refusing 3pid invite email to a malformed address")
+        {:error, :invalid_address}
+
+      is_nil(smtp_config()[:relay]) ->
         Logger.debug("SMTP not configured — skipping 3pid invite email to #{obscure(address)}")
         :ok
 
-      config ->
+      true ->
+        config = smtp_config()
         Task.start(fn -> send_invite_email(address, invite, config) end)
         :ok
     end
   end
 
-  defp send_invite_email(address, %{inviter_id: inviter_id, room_id: room_id, token: token}, config) do
+  # The address is written verbatim into the To: header, so CR/LF would let
+  # it inject arbitrary headers or body content.
+  defp valid_address?(address) when is_binary(address),
+    do: String.contains?(address, "@") and not String.contains?(address, ["\r", "\n"])
+
+  defp valid_address?(_), do: false
+
+  defp send_invite_email(
+         address,
+         %{inviter_id: inviter_id, room_id: room_id, token: token},
+         config
+       ) do
     server_name = AxonCrypto.KeyServer.server_name()
     subject = "#{inviter_id} invited you to chat on #{server_name}"
 
@@ -84,7 +100,9 @@ defmodule AxonWeb.Mailer do
 
     case result do
       {:error, type, message} ->
-        Logger.warning("3pid invite email to #{obscure(address)} failed: #{type} #{inspect(message)}")
+        Logger.warning(
+          "3pid invite email to #{obscure(address)} failed: #{type} #{inspect(message)}"
+        )
 
       {:error, reason} ->
         Logger.warning("3pid invite email to #{obscure(address)} failed: #{inspect(reason)}")

@@ -114,4 +114,32 @@ defmodule AxonWeb.FilterControllerTest do
     conn = authed(alice.token) |> jp("/_matrix/client/v3/user/#{alice.user_id}/filter", %{})
     assert conn.status == 200
   end
+
+  test "the stored filter excludes query params such as access_token" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    filter = %{"room" => %{"timeline" => %{"limit" => 5}}}
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> post(
+        "/_matrix/client/v3/user/#{alice.user_id}/filter?access_token=#{alice.token}",
+        Jason.encode!(filter)
+      )
+
+    assert conn.status == 200
+    filter_id = decode(conn)["filter_id"]
+
+    get_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/user/#{alice.user_id}/filter/#{filter_id}")
+
+    assert decode(get_conn) == filter
+  end
+
+  test "a non-object filter body is rejected" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    conn = authed(alice.token) |> jp("/_matrix/client/v3/user/#{alice.user_id}/filter", [1])
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_BAD_JSON"
+  end
 end

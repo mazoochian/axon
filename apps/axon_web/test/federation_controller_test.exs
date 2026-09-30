@@ -19,6 +19,7 @@ defmodule AxonWeb.FederationControllerTest do
   alias AxonRoom.{CreateRoom, RoomProcess}
 
   @port 18_900
+  @supported_vers "?" <> Enum.map_join(1..12, "&", &"ver=#{&1}")
   @server_name "fake-fedctrl.test"
 
   setup do
@@ -116,7 +117,7 @@ defmodule AxonWeb.FederationControllerTest do
   defp join_via_http(room_id, member_user_id, room_version \\ "11") do
     make_join_conn =
       signed_get(
-        "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(member_user_id)}"
+        "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(member_user_id)}#{@supported_vers}"
       )
 
     assert make_join_conn.status == 200
@@ -147,12 +148,18 @@ defmodule AxonWeb.FederationControllerTest do
   # v7 room's event as if it were v11 produces a signature axon correctly
   # refuses.
   defp signed_remote_event(fields, room_version \\ "11") do
-    FakeRemoteMatrixServer.sign_event(
-      @port,
+    @port
+    |> FakeRemoteMatrixServer.sign_event(
       Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields),
       room_version
     )
+    |> with_reference_id(room_version)
   end
+
+  # From room version 3 on the event_id is the reference hash, which /send
+  # recomputes and checks against any event_id on the wire.
+  defp with_reference_id(event, room_version \\ "11"),
+    do: Map.put(event, "event_id", EventHash.reference_hash(event, room_version))
 
   # ---- port-parameterized variants (multi-server relay tests only, which
   # need arbitrary/dynamic fake servers rather than the shared @port) ----
@@ -176,7 +183,9 @@ defmodule AxonWeb.FederationControllerTest do
   end
 
   defp signed_remote_event_at(port, fields) do
-    FakeRemoteMatrixServer.sign_event(port, Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
+    port
+    |> FakeRemoteMatrixServer.sign_event(Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
+    |> with_reference_id()
   end
 
   defp join_remote_member_at(port, room_id, member_user_id) do
@@ -293,7 +302,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(mismatched_user)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(mismatched_user)}#{@supported_vers}"
         )
 
       assert conn.status == 403
@@ -304,7 +313,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/!nonexistent:localhost/#{URI.encode(joiner)}"
+          "/_matrix/federation/v1/make_join/!nonexistent:localhost/#{URI.encode(joiner)}#{@supported_vers}"
         )
 
       assert conn.status == 404
@@ -317,14 +326,74 @@ defmodule AxonWeb.FederationControllerTest do
 
       conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}#{@supported_vers}"
         )
 
       assert conn.status == 403
     end
+
+    test "400s with M_INCOMPATIBLE_ROOM_VERSION unless the room version is among every ver given" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+
+      path =
+        "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(remote_user("j"))}"
+
+      version = EventStore.get_room_version(room_id)
+
+      for query <- ["", "?ver=1", "?ver=1&ver=2"] do
+        conn = signed_get(path <> query)
+        assert conn.status == 400
+        assert decode(conn)["errcode"] == "M_INCOMPATIBLE_ROOM_VERSION"
+        assert decode(conn)["room_version"] == version
+      end
+
+      conn = signed_get("#{path}?ver=1&ver=#{version}&ver=2")
+      assert conn.status == 200
+      assert decode(conn)["room_version"] == version
+    end
   end
 
   describe "PUT invite/2" do
+    test "the deprecated v1 route takes the bare event and answers [200, body]" do
+      room_id = "!invite_#{System.unique_integer([:positive])}:#{@server_name}"
+      inviter = remote_user("inviter")
+      invitee = new_local_user("invitee")
+      event_id = "$v1invite_#{System.unique_integer([:positive])}"
+
+      event =
+        signed_remote_event(
+          %{
+            "room_id" => room_id,
+            "type" => "m.room.member",
+            "state_key" => invitee,
+            "sender" => inviter,
+            "content" => %{"membership" => "invite"},
+            "depth" => 1,
+            "prev_events" => [],
+            "origin_server_ts" => System.os_time(:millisecond),
+            "unsigned" => %{
+              "invite_room_state" => [
+                %{"type" => "m.room.name", "state_key" => "", "content" => %{"name" => "Old"}}
+              ]
+            }
+          },
+          "1"
+        )
+        |> Map.put("event_id", event_id)
+
+      conn =
+        signed_put(
+          "/_matrix/federation/v1/invite/#{URI.encode(room_id)}/#{URI.encode(event_id)}",
+          event
+        )
+
+      assert conn.status == 200, conn.resp_body
+      assert [200, %{"event" => returned}] = decode(conn)
+      assert returned["event_id"] == event_id
+      assert EventStore.get_membership(room_id, invitee) == {:ok, "invite"}
+    end
+
     # Room versions 3+ never carry "event_id" on the wire (it's derived from
     # the reference hash) — this is the shape a real inviting server (and
     # Complement) actually sends. Regression for a 500 that hit every
@@ -387,6 +456,7 @@ defmodule AxonWeb.FederationControllerTest do
           },
           "6"
         )
+        |> Map.put("event_id", event_id)
 
       conn =
         signed_put(
@@ -408,7 +478,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       make_join_conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}#{@supported_vers}"
         )
 
       template = decode(make_join_conn)["event"]
@@ -429,6 +499,33 @@ defmodule AxonWeb.FederationControllerTest do
       assert conn.status == 200
       body = decode(conn)
       assert is_list(body["state"])
+      assert EventStore.get_membership(room_id, joiner) == {:ok, "join"}
+    end
+
+    test "the deprecated v1 route answers [200, body]" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      joiner = remote_user("joiner")
+
+      template =
+        decode(
+          signed_get(
+            "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}#{@supported_vers}"
+          )
+        )["event"]
+
+      join_event =
+        signed_remote_event(Map.put(template, "origin_server_ts", System.os_time(:millisecond)))
+
+      conn =
+        signed_put(
+          "/_matrix/federation/v1/send_join/#{URI.encode(room_id)}/#{URI.encode(join_event["event_id"])}",
+          join_event
+        )
+
+      assert conn.status == 200
+      assert [200, %{"state" => state, "auth_chain" => _}] = decode(conn)
+      assert is_list(state)
       assert EventStore.get_membership(room_id, joiner) == {:ok, "join"}
     end
 
@@ -553,6 +650,34 @@ defmodule AxonWeb.FederationControllerTest do
       conn = signed_put(path, leave_event)
 
       assert conn.status == 200
+      assert decode(conn) == %{}
+      assert EventStore.get_membership(room_id, member) == {:ok, "leave"}
+    end
+
+    test "the deprecated v1 send_leave route answers [200, {}]" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      member = remote_user("member")
+      join_remote_member(room_id, member)
+
+      template =
+        decode(
+          signed_get(
+            "/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(member)}"
+          )
+        )["event"]
+
+      leave_event =
+        signed_remote_event(Map.put(template, "origin_server_ts", System.os_time(:millisecond)))
+
+      conn =
+        signed_put(
+          "/_matrix/federation/v1/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}",
+          leave_event
+        )
+
+      assert conn.status == 200
+      assert decode(conn) == [200, %{}]
       assert EventStore.get_membership(room_id, member) == {:ok, "leave"}
     end
 
@@ -601,11 +726,19 @@ defmodule AxonWeb.FederationControllerTest do
 
       conn =
         signed_get(
-          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}?ver=10"
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}#{@supported_vers}"
         )
 
       assert conn.status == 200
       assert decode(conn)["event"]["content"]["membership"] == "knock"
+
+      conn =
+        signed_get(
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}?ver=7"
+        )
+
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INCOMPATIBLE_ROOM_VERSION"
     end
 
     test "make_knock 403s when the room doesn't allow knocking" do
@@ -615,7 +748,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       conn =
         signed_get(
-          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}"
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}#{@supported_vers}"
         )
 
       assert conn.status == 403
@@ -637,7 +770,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       make_knock_conn =
         signed_get(
-          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}"
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(knocker)}#{@supported_vers}"
         )
 
       template = decode(make_knock_conn)["event"]
@@ -794,7 +927,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       make_join_conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie2)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie2)}#{@supported_vers}"
         )
 
       assert make_join_conn.status == 200
@@ -835,7 +968,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie)}#{@supported_vers}"
         )
 
       assert conn.status == 403
@@ -874,6 +1007,55 @@ defmodule AxonWeb.FederationControllerTest do
       assert conn.status == 200
       {new_last_event_id, _} = RoomProcess.get_position(room_id)
       assert new_last_event_id == pdu["event_id"]
+    end
+
+    test "a wire event_id that isn't the reference hash is a per-PDU error, not trusted" do
+      owner = new_local_user("owner")
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      remote_member = remote_user("member")
+      join_remote_member(room_id, remote_member)
+      {last_event_id, depth} = RoomProcess.get_position(room_id)
+
+      pdu =
+        signed_remote_event(%{
+          "room_id" => room_id,
+          "type" => "m.room.message",
+          "sender" => remote_member,
+          "content" => %{"msgtype" => "m.text", "body" => "spoofed id"},
+          "depth" => depth + 1,
+          "prev_events" => [last_event_id],
+          "origin_server_ts" => System.os_time(:millisecond)
+        })
+
+      real_id = pdu["event_id"]
+      fake_id = "$spoofed_#{System.unique_integer([:positive])}"
+      txn_id = "txn_#{System.unique_integer([:positive])}"
+
+      conn =
+        signed_put("/_matrix/federation/v1/send/#{txn_id}", %{
+          "pdus" => [Map.put(pdu, "event_id", fake_id)]
+        })
+
+      assert conn.status == 200
+      assert %{"error" => _} = decode(conn)["pdus"][fake_id]
+      assert EventStore.get_event(fake_id) == {:error, :not_found}
+      assert EventStore.get_event(real_id) == {:error, :not_found}
+    end
+
+    test "malformed PDUs and non-list pdus/edus don't fail the whole transaction" do
+      path = fn -> "/_matrix/federation/v1/send/txn_#{System.unique_integer([:positive])}" end
+
+      conn =
+        signed_put(path.(), %{
+          "pdus" => ["junk", 42, %{"event_id" => "$noroom", "type" => "m.room.message"}]
+        })
+
+      assert conn.status == 200
+      assert %{"$noroom" => %{"error" => _}} = decode(conn)["pdus"]
+
+      conn = signed_put(path.(), %{"pdus" => %{"not" => "a list"}, "edus" => "nope"})
+      assert conn.status == 200
+      assert decode(conn)["pdus"] == %{}
     end
 
     # Reproduces Complement's TestNetworkPartitionOrdering shape end-to-end
@@ -1046,6 +1228,7 @@ defmodule AxonWeb.FederationControllerTest do
         |> forgeable_message(victim, "I hereby resign")
         |> Map.put("origin", evil_hs)
         |> then(&FakeRemoteMatrixServer.sign_event(evil_port, &1, "11"))
+        |> with_reference_id()
 
       # Attacker signs the *transaction* with their own key, which is
       # legitimate — X-Matrix auth says who is talking to us, not who wrote
@@ -1089,6 +1272,7 @@ defmodule AxonWeb.FederationControllerTest do
         }
         |> Map.put("origin", evil_hs)
         |> then(&FakeRemoteMatrixServer.sign_event(evil_port, &1, "11"))
+        |> with_reference_id()
 
       txn_id = "txn_#{System.unique_integer([:positive])}"
 
@@ -1110,6 +1294,7 @@ defmodule AxonWeb.FederationControllerTest do
         |> forgeable_message(victim, "I hereby resign")
         |> Map.put("origin", victim_hs)
         |> then(&FakeRemoteMatrixServer.sign_event(victim_port, &1, "11"))
+        |> with_reference_id()
 
       txn_id = "txn_#{System.unique_integer([:positive])}"
 
@@ -1199,6 +1384,7 @@ defmodule AxonWeb.FederationControllerTest do
         room_id
         |> forgeable_message(author, "meet me at noon")
         |> then(&FakeRemoteMatrixServer.sign_event(author_port, &1, "11"))
+        |> with_reference_id()
 
       # The relay rewrites the body. The signature still verifies — it never
       # covered `content` — and only `hashes.sha256` disagrees.
@@ -1228,6 +1414,7 @@ defmodule AxonWeb.FederationControllerTest do
         room_id
         |> forgeable_message(author, "meet me at noon")
         |> then(&FakeRemoteMatrixServer.sign_event(author_port, &1, "11"))
+        |> with_reference_id()
 
       conn = relay_pdu(relay_port, signed)
       assert conn.status == 200
@@ -1255,6 +1442,7 @@ defmodule AxonWeb.FederationControllerTest do
         |> forgeable_message(author, "meet me at noon")
         |> Map.delete("hashes")
         |> then(&FakeRemoteMatrixServer.sign_event_verbatim(author_port, &1, "11"))
+        |> with_reference_id()
 
       refute Map.has_key?(signed, "hashes")
 
@@ -1295,6 +1483,7 @@ defmodule AxonWeb.FederationControllerTest do
           },
           "11"
         )
+        |> with_reference_id()
 
       tampered = put_in(signed, ["content", "displayname"], "Server Administrator")
 
@@ -1425,7 +1614,8 @@ defmodule AxonWeb.FederationControllerTest do
           "origin_server_ts" => System.os_time(:millisecond)
         })
 
-      path = "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}"
+      path =
+        "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(leave_event["event_id"])}"
 
       conn = signed_put_at(evil_port, path, leave_event)
 
@@ -1716,8 +1906,14 @@ defmodule AxonWeb.FederationControllerTest do
           name: "Readable"
         )
 
+      join_remote_member(room_id, remote_user("resident"))
+
       %{owner: owner, room_id: room_id}
     end
+
+    defp state_path(kind, room_id, event_id),
+      do:
+        "/_matrix/federation/v1/#{kind}/#{URI.encode(room_id)}?event_id=#{URI.encode_www_form(event_id)}"
 
     test "get_event returns a known event, 404s for an unknown one", %{room_id: room_id} do
       {:ok, event} = EventStore.get_state_event(room_id, "m.room.name", "")
@@ -1731,21 +1927,108 @@ defmodule AxonWeb.FederationControllerTest do
       assert conn.status == 404
     end
 
-    test "get_state returns the room's current state events", %{room_id: room_id} do
-      conn = signed_get("/_matrix/federation/v1/state/#{URI.encode(room_id)}")
+    test "get_state returns the room's state at the given event", %{
+      room_id: room_id,
+      owner: owner
+    } do
+      {:ok, head} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "hi"})
+
+      conn = signed_get(state_path("state", room_id, head))
       assert conn.status == 200
       types = decode(conn)["pdus"] |> Enum.map(& &1["type"])
       assert "m.room.create" in types
       assert "m.room.name" in types
+      refute decode(conn)["auth_chain"] == []
     end
 
-    test "get_state_ids returns state and auth chain event ids", %{room_id: room_id} do
-      conn = signed_get("/_matrix/federation/v1/state_ids/#{URI.encode(room_id)}")
+    test "get_state_ids returns the state before the given event, not current state", %{
+      room_id: room_id,
+      owner: owner
+    } do
+      {:ok, name_event} = EventStore.get_state_event(room_id, "m.room.name", "")
+
+      {:ok, topic_id} =
+        RoomProcess.send_event(room_id, owner, "m.room.topic", %{"topic" => "t"}, state_key: "")
+
+      conn = signed_get(state_path("state_ids", room_id, name_event.event_id))
       assert conn.status == 200
       body = decode(conn)
-      assert is_list(body["pdu_ids"])
-      assert is_list(body["auth_chain_ids"])
+      refute name_event.event_id in body["pdu_ids"]
+      refute topic_id in body["pdu_ids"]
       refute body["pdu_ids"] == []
+      assert is_list(body["auth_chain_ids"])
+
+      {:ok, head} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "x"})
+      body = decode(signed_get(state_path("state_ids", room_id, head)))
+      assert name_event.event_id in body["pdu_ids"]
+      assert topic_id in body["pdu_ids"]
+    end
+
+    test "get_state/get_state_ids require a known event_id and a known room", %{room_id: room_id} do
+      for kind <- ["state", "state_ids"] do
+        assert signed_get("/_matrix/federation/v1/#{kind}/#{URI.encode(room_id)}").status == 400
+        assert signed_get(state_path(kind, room_id, "$nonexistent")).status == 404
+        assert signed_get(state_path(kind, "!nope:localhost", "$x")).status == 404
+      end
+    end
+
+    test "room reads 403 for an origin with no member in the room", %{owner: owner} do
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+      {:ok, msg} = RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "x"})
+      encoded = URI.encode(room_id)
+
+      assert signed_get("/_matrix/federation/v1/event/#{URI.encode(msg)}").status == 403
+      assert signed_get(state_path("state", room_id, msg)).status == 403
+      assert signed_get(state_path("state_ids", room_id, msg)).status == 403
+
+      assert signed_get(
+               "/_matrix/federation/v1/backfill/#{encoded}?v=#{URI.encode_www_form(msg)}"
+             ).status == 403
+
+      assert signed_get("/_matrix/federation/v1/event_auth/#{encoded}/#{URI.encode(msg)}").status ==
+               403
+
+      conn =
+        signed_post("/_matrix/federation/v1/get_missing_events/#{encoded}", %{
+          "earliest_events" => [],
+          "latest_events" => [msg]
+        })
+
+      assert conn.status == 403
+    end
+
+    test "get_event redacts an event the origin's history visibility doesn't cover", %{
+      owner: owner
+    } do
+      {:ok, room_id} = CreateRoom.execute(owner, server_name: "localhost", preset: "public_chat")
+
+      {:ok, _} =
+        RoomProcess.send_event(
+          room_id,
+          owner,
+          "m.room.history_visibility",
+          %{"history_visibility" => "joined"},
+          state_key: ""
+        )
+
+      {:ok, before_join} =
+        RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "secret"})
+
+      join_remote_member(room_id, remote_user("late"))
+
+      {:ok, after_join} =
+        RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "public"})
+
+      [hidden] =
+        decode(signed_get("/_matrix/federation/v1/event/#{URI.encode(before_join)}"))["pdus"]
+
+      assert hidden["event_id"] == before_join
+      assert hidden["content"] == %{}
+
+      [shown] =
+        decode(signed_get("/_matrix/federation/v1/event/#{URI.encode(after_join)}"))["pdus"]
+
+      assert shown["content"]["body"] == "public"
     end
 
     test "event_auth returns the requested event's transitive auth chain, not the event itself",
@@ -1769,18 +2052,35 @@ defmodule AxonWeb.FederationControllerTest do
       assert conn.status == 404
     end
 
-    test "backfill returns events older than the given ordering, respecting limit", %{
+    test "backfill returns the v events and their ancestors, respecting limit", %{
       room_id: room_id,
       owner: owner
     } do
-      for i <- 1..5 do
-        RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "msg #{i}"})
-      end
+      ids =
+        for i <- 1..5 do
+          {:ok, id} =
+            RoomProcess.send_event(room_id, owner, "m.room.message", %{"body" => "m#{i}"})
 
-      conn = signed_get("/_matrix/federation/v1/backfill/#{URI.encode(room_id)}?limit=2")
+          id
+        end
+
+      [_, _, m3, m4, m5] = ids
+      path = "/_matrix/federation/v1/backfill/#{URI.encode(room_id)}"
+
+      conn = signed_get("#{path}?v=#{URI.encode_www_form(m5)}&limit=2")
       assert conn.status == 200
-      pdus = decode(conn)["pdus"]
-      assert length(pdus) == 2
+
+      assert decode(conn)["pdus"] |> Enum.map(& &1["event_id"]) |> Enum.sort() ==
+               Enum.sort([m4, m5])
+
+      conn =
+        signed_get("#{path}?v=#{URI.encode_www_form(m3)}&v=#{URI.encode_www_form(m5)}&limit=3")
+
+      returned = decode(conn)["pdus"] |> Enum.map(& &1["event_id"])
+      assert length(returned) == 3
+      assert m3 in returned and m5 in returned
+
+      assert signed_get("#{path}?limit=2").status == 400
     end
 
     test "get_missing_events walks the prev_events of latest_events, excluding both boundaries, oldest first",
@@ -2162,7 +2462,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}#{@supported_vers}"
         )
 
       assert conn.status == 403
@@ -2176,7 +2476,7 @@ defmodule AxonWeb.FederationControllerTest do
 
       make_join_conn =
         signed_get(
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(joiner)}#{@supported_vers}"
         )
 
       template = decode(make_join_conn)["event"]
@@ -2341,7 +2641,7 @@ defmodule AxonWeb.FederationControllerTest do
       make_join_conn =
         signed_get_at(
           port_b,
-          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie)}"
+          "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(charlie)}#{@supported_vers}"
         )
 
       template = decode(make_join_conn)["event"]
@@ -2451,7 +2751,7 @@ defmodule AxonWeb.FederationControllerTest do
       make_knock_conn =
         signed_get_at(
           port_b,
-          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(charlie)}"
+          "/_matrix/federation/v1/make_knock/#{URI.encode(room_id)}/#{URI.encode(charlie)}#{@supported_vers}"
         )
 
       template = decode(make_knock_conn)["event"]

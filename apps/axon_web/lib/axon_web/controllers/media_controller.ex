@@ -16,36 +16,24 @@ defmodule AxonWeb.MediaController do
   def upload(conn, params) do
     user_id = conn.assigns[:current_user_id]
     server_name = Application.fetch_env!(:axon_web, :server_name)
-
-    content_type =
-      case Plug.Conn.get_req_header(conn, "content-type") do
-        [ct | _] -> ct
-        [] -> "application/octet-stream"
-      end
-
-    # Strip any charset suffix (e.g. "image/png; charset=utf-8")
-    content_type = content_type |> String.split(";") |> hd() |> String.trim()
+    content_type = request_content_type(conn)
 
     # ?filename= is a query param per spec, not a body field — persisted so
     # a later download can return it via Content-Disposition (spec: "If the
     # upload was made with a filename, this header MUST contain the same
-    # filename"). Previously read into a local and immediately discarded.
+    # filename").
     filename = non_empty(params["filename"])
 
-    # `read_body/2` returns an updated `conn` that must be threaded through
-    # to whatever sends the response — Bandit tracks body-read state on it,
-    # and responding with the stale pre-read `conn` left the connection
-    # thinking this request's body was never drained. Invisible in
-    # Phoenix.ConnTest (no real transport), but over real HTTP the next
-    # request pipelined on the same keep-alive connection would then stall
-    # for `read_body`'s default 15s read_timeout before Bandit gave up
-    # waiting for bytes that were never coming.
-    case Plug.Conn.read_body(conn, length: 100_000_000) do
-      {:ok, body, conn} when byte_size(body) > 0 ->
+    with_upload_body(conn, fn
+      conn, <<>> ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "Empty body"})
+
+      conn, body ->
         case Store.upload(user_id, content_type, body, server_name, filename) do
           {:ok, media_id} ->
-            mxc_uri = "mxc://#{server_name}/#{media_id}"
-            json(conn, %{"content_uri" => mxc_uri})
+            json(conn, %{"content_uri" => "mxc://#{server_name}/#{media_id}"})
 
           {:error, reason} ->
             Logger.error("Media upload failed: #{inspect(reason)}")
@@ -54,24 +42,7 @@ defmodule AxonWeb.MediaController do
             |> put_status(500)
             |> json(%{"errcode" => "M_UNKNOWN", "error" => "Upload failed"})
         end
-
-      {:ok, <<>>, conn} ->
-        conn
-        |> put_status(400)
-        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "Empty body"})
-
-      {:error, :too_large} ->
-        conn
-        |> put_status(413)
-        |> json(%{"errcode" => "M_TOO_LARGE", "error" => "Upload too large"})
-
-      {:error, reason} ->
-        Logger.error("Body read error: #{inspect(reason)}")
-
-        conn
-        |> put_status(500)
-        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to read body"})
-    end
+    end)
   end
 
   # POST /_matrix/media/v1/create (MSC2246 async uploads)
@@ -100,37 +71,19 @@ defmodule AxonWeb.MediaController do
     local_server = Application.fetch_env!(:axon_web, :server_name)
 
     if server_name != local_server do
-      conn
-      |> put_status(404)
-      |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+      media_not_found(conn)
     else
-      content_type =
-        case Plug.Conn.get_req_header(conn, "content-type") do
-          [ct | _] -> ct |> String.split(";") |> hd() |> String.trim()
-          [] -> "application/octet-stream"
-        end
-
+      content_type = request_content_type(conn)
       filename = non_empty(params["filename"])
 
       case Store.complete_upload_precheck(media_id, user_id) do
         :ok ->
-          case Plug.Conn.read_body(conn, length: 100_000_000) do
-            {:ok, body, conn} ->
-              case Store.complete_upload(media_id, user_id, content_type, body, filename) do
-                {:ok, _media_id} ->
-                  json(conn, %{})
-
-                {:error, reason} ->
-                  media_upload_error(conn, reason)
-              end
-
-            {:error, :too_large} ->
-              conn |> put_status(413) |> json(%{"errcode" => "M_TOO_LARGE", "error" => "Upload too large"})
-
-            {:error, reason} ->
-              Logger.error("Body read error: #{inspect(reason)}")
-              conn |> put_status(500) |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to read body"})
-          end
+          with_upload_body(conn, fn conn, body ->
+            case Store.complete_upload(media_id, user_id, content_type, body, filename) do
+              {:ok, _media_id} -> json(conn, %{})
+              {:error, reason} -> media_upload_error(conn, reason)
+            end
+          end)
 
         {:error, reason} ->
           media_upload_error(conn, reason)
@@ -138,9 +91,42 @@ defmodule AxonWeb.MediaController do
     end
   end
 
-  defp media_upload_error(conn, :not_found) do
-    conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+  # `read_body/2` returns an updated `conn` that must be threaded through
+  # to whatever sends the response — Bandit tracks body-read state on it,
+  # and responding with the stale pre-read `conn` leaves a pipelined
+  # keep-alive request stalled until read_timeout. A body over the limit
+  # comes back as `{:more, ...}`.
+  defp with_upload_body(conn, fun) do
+    case Plug.Conn.read_body(conn, length: AxonMedia.max_upload_bytes()) do
+      {:ok, body, conn} ->
+        fun.(conn, body)
+
+      {:more, _partial, conn} ->
+        conn
+        |> put_status(413)
+        |> json(%{"errcode" => "M_TOO_LARGE", "error" => "Upload too large"})
+
+      {:error, reason} ->
+        Logger.error("Body read error: #{inspect(reason)}")
+
+        conn
+        |> put_status(500)
+        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to read body"})
+    end
   end
+
+  # Strips any parameters (e.g. "image/png; charset=utf-8").
+  defp request_content_type(conn) do
+    case Plug.Conn.get_req_header(conn, "content-type") do
+      [ct | _] -> base_content_type(ct)
+      [] -> "application/octet-stream"
+    end
+  end
+
+  defp base_content_type(content_type),
+    do: content_type |> to_string() |> String.split(";") |> hd() |> String.trim()
+
+  defp media_upload_error(conn, :not_found), do: media_not_found(conn)
 
   defp media_upload_error(conn, :forbidden) do
     conn
@@ -151,7 +137,10 @@ defmodule AxonWeb.MediaController do
   defp media_upload_error(conn, :already_uploaded) do
     conn
     |> put_status(409)
-    |> json(%{"errcode" => "M_CANNOT_OVERWRITE_MEDIA", "error" => "Media has already been uploaded"})
+    |> json(%{
+      "errcode" => "M_CANNOT_OVERWRITE_MEDIA",
+      "error" => "Media has already been uploaded"
+    })
   end
 
   # A Matrix media ID is an opaque identifier, and the spec defines exactly
@@ -269,15 +258,8 @@ defmodule AxonWeb.MediaController do
         )
         |> send_resp(200, data)
 
-      {:error, :not_found} ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
-
-      {:error, :not_yet_uploaded} ->
-        conn
-        |> put_status(504)
-        |> json(%{"errcode" => "M_NOT_YET_UPLOADED", "error" => "Media has not been uploaded yet"})
+      {:error, reason} ->
+        media_download_error(conn, reason)
     end
   end
 
@@ -311,9 +293,7 @@ defmodule AxonWeb.MediaController do
         end
 
       _ ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+        media_not_found(conn)
     end
   end
 
@@ -339,9 +319,7 @@ defmodule AxonWeb.MediaController do
         |> send_resp(200, data)
 
       {:error, :not_found} ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Remote media not found"})
+        media_not_found(conn, "Remote media not found")
 
       {:error, reason} ->
         remote_fetch_failed(conn, origin_server, media_id, reason)
@@ -358,9 +336,7 @@ defmodule AxonWeb.MediaController do
         |> send_resp(200, data)
 
       {:error, :not_found} ->
-        conn
-        |> put_status(404)
-        |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Remote media not found"})
+        media_not_found(conn, "Remote media not found")
 
       {:error, reason} ->
         remote_fetch_failed(conn, origin_server, media_id, reason)
@@ -396,8 +372,8 @@ defmodule AxonWeb.MediaController do
       {:ok, %{content_type: content_type, data: data, filename: filename}} ->
         send_multipart_media(conn, content_type, data, filename)
 
-      {:error, :not_found} ->
-        media_not_found(conn)
+      {:error, reason} ->
+        media_download_error(conn, reason)
     end
   end
 
@@ -420,8 +396,8 @@ defmodule AxonWeb.MediaController do
               {:ok, %{content_type: ct, data: data, filename: filename}} ->
                 send_multipart_media(conn, ct, data, filename)
 
-              {:error, :not_found} ->
-                media_not_found(conn)
+              {:error, reason} ->
+                media_download_error(conn, reason)
             end
 
           {:error, reason} ->
@@ -439,11 +415,19 @@ defmodule AxonWeb.MediaController do
     end
   end
 
-  defp media_not_found(conn) do
+  defp media_not_found(conn, message \\ "Media not found") do
     conn
     |> put_status(404)
-    |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Media not found"})
+    |> json(%{"errcode" => "M_NOT_FOUND", "error" => message})
   end
+
+  defp media_download_error(conn, :not_yet_uploaded) do
+    conn
+    |> put_status(504)
+    |> json(%{"errcode" => "M_NOT_YET_UPLOADED", "error" => "Media has not been uploaded yet"})
+  end
+
+  defp media_download_error(conn, _not_found), do: media_not_found(conn)
 
   defp send_multipart_media(conn, content_type, data, filename) do
     boundary = "axonmedia" <> (16 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower))
@@ -504,15 +488,7 @@ defmodule AxonWeb.MediaController do
   end
 
   defp inline_safe?(content_type) do
-    base_type =
-      content_type
-      |> to_string()
-      |> String.split(";")
-      |> hd()
-      |> String.trim()
-      |> String.downcase()
-
-    base_type in @inline_safe_content_types
+    String.downcase(base_content_type(content_type)) in @inline_safe_content_types
   end
 
   # Plain quoted-string for an ASCII-safe name (handles embedded spaces/

@@ -81,7 +81,9 @@ defmodule AxonWeb.SharedSecretRegistrationTest do
       # ...and the account is real and really an admin, not just echoed back.
       assert user_exists?(body["user_id"])
 
-      assert authed(body["access_token"]) |> get("/_synapse/admin/v1/users") |> Map.fetch!(:status) ==
+      assert authed(body["access_token"])
+             |> get("/_synapse/admin/v1/users")
+             |> Map.fetch!(:status) ==
                200
     end
 
@@ -200,7 +202,7 @@ defmodule AxonWeb.SharedSecretRegistrationTest do
       # 3-request limit set above starts from zero rather than partly
       # spent. Same reasoning, and same mechanism, as rate_limit_test.exs's
       # login-bucket clear.
-      :ets.match_delete(:axon_rate_limiter, {{:admin_register, :_}, :_})
+      AxonWeb.RateLimiter.reset(:admin_register)
       :ok
     end
 

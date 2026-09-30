@@ -222,4 +222,25 @@ defmodule AxonWeb.PushRulesControllerTest do
 
     assert bob_conn.status == 404
   end
+
+  test "put_rule_enabled/put_rule_actions reject wrongly-typed bodies and unknown rules" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    base = "/_matrix/client/v3/pushrules/global/override"
+
+    conn = authed(alice.token) |> jpu("#{base}/.m.rule.master/enabled", %{"enabled" => "true"})
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+
+    conn = authed(alice.token) |> jpu("#{base}/.m.rule.master/actions", %{"actions" => "notify"})
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+
+    conn = authed(alice.token) |> jpu("#{base}/nope/enabled", %{"enabled" => false})
+    assert conn.status == 404
+    assert decode(conn)["errcode"] == "M_NOT_FOUND"
+
+    conn = authed(alice.token) |> jpu("#{base}/nope/actions", %{"actions" => []})
+    assert conn.status == 404
+    assert (authed(alice.token) |> get("#{base}/nope")).status == 404
+  end
 end

@@ -62,11 +62,7 @@ defmodule AxonWeb.VersionController do
   end
 
   def media_config(conn, _params) do
-    json(conn, %{"m.upload.size" => 104_857_600})
-  end
-
-  def empty_list_pushers(conn, _params) do
-    json(conn, %{"pushers" => []})
+    json(conn, %{"m.upload.size" => AxonMedia.max_upload_bytes()})
   end
 
   def empty_list_3pid(conn, _params) do

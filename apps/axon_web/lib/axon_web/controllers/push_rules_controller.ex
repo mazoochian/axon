@@ -58,32 +58,34 @@ defmodule AxonWeb.PushRulesController do
         "kind" => kind,
         "rule_id" => rule_id,
         "enabled" => enabled
-      }) do
+      })
+      when is_boolean(enabled) do
     with :ok <- UserRules.put_enabled(conn.assigns.current_user_id, kind, rule_id, enabled) do
       json(conn, %{})
     end
   end
 
-  def put_rule_enabled(conn, _params) do
-    conn
-    |> put_status(400)
-    |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "enabled is required"})
-  end
+  def put_rule_enabled(conn, params), do: bad_param(conn, params, "enabled", "a boolean")
 
   def put_rule_actions(conn, %{
         "scope" => "global",
         "kind" => kind,
         "rule_id" => rule_id,
         "actions" => actions
-      }) do
+      })
+      when is_list(actions) do
     with :ok <- UserRules.put_actions(conn.assigns.current_user_id, kind, rule_id, actions) do
       json(conn, %{})
     end
   end
 
-  def put_rule_actions(conn, _params) do
+  def put_rule_actions(conn, params), do: bad_param(conn, params, "actions", "a list")
+
+  defp bad_param(conn, params, key, expected) do
+    errcode = if Map.has_key?(params, key), do: "M_INVALID_PARAM", else: "M_MISSING_PARAM"
+
     conn
     |> put_status(400)
-    |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "actions is required"})
+    |> json(%{"errcode" => errcode, "error" => "#{key} must be #{expected}"})
   end
 end

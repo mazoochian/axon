@@ -90,10 +90,14 @@ defmodule AxonWeb.FakeIdentityServer do
   end
 
   @doc "Marks the fake's long-term public key as revoked (pubkey/isvalid returns false)."
-  def revoke_key(port), do: update_state(port, fn s -> %{s | revoked_keys: MapSet.put(s.revoked_keys, s.public_key)} end)
+  def revoke_key(port),
+    do:
+      update_state(port, fn s -> %{s | revoked_keys: MapSet.put(s.revoked_keys, s.public_key)} end)
 
   def public_key_b64(port), do: Base.encode64(state(port).public_key, padding: false)
-  def ephemeral_public_key_b64(port), do: Base.encode64(state(port).ephemeral_public_key, padding: false)
+
+  def ephemeral_public_key_b64(port),
+    do: Base.encode64(state(port).ephemeral_public_key, padding: false)
 
   @doc "Escape hatch for edge cases (500s, malformed bodies) — same shape as FakeRemoteMatrixServer.put_response/4."
   def put_response(port, {method, path_matcher}, status, body) do
@@ -127,7 +131,10 @@ defmodule AxonWeb.FakeIdentityServer do
     mappings =
       s.bindings
       |> Enum.reduce(%{}, fn {{medium, address}, mxid}, acc ->
-        hashed = :crypto.hash(:sha256, "#{address} #{medium} #{@pepper}") |> Base.url_encode64(padding: false)
+        hashed =
+          :crypto.hash(:sha256, "#{address} #{medium} #{@pepper}")
+          |> Base.url_encode64(padding: false)
+
         if hashed in addresses, do: Map.put(acc, hashed, mxid), else: acc
       end)
 
@@ -139,7 +146,9 @@ defmodule AxonWeb.FakeIdentityServer do
     %{"medium" => medium, "address" => address, "sender" => sender} = conn.body_params
     token = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
 
-    update_state(conn.port, fn st -> put_in(st.invites[token], %{sender: sender, address: address, medium: medium}) end)
+    update_state(conn.port, fn st ->
+      put_in(st.invites[token], %{sender: sender, address: address, medium: medium})
+    end)
 
     long_term_pk = Base.encode64(s.public_key, padding: false)
     eph_pk = Base.encode64(s.ephemeral_public_key, padding: false)
@@ -149,7 +158,10 @@ defmodule AxonWeb.FakeIdentityServer do
       "token" => token,
       "display_name" => obfuscate(address),
       "public_keys" => [
-        %{"public_key" => long_term_pk, "key_validity_url" => base <> "/_matrix/identity/v2/pubkey/isvalid"},
+        %{
+          "public_key" => long_term_pk,
+          "key_validity_url" => base <> "/_matrix/identity/v2/pubkey/isvalid"
+        },
         %{
           "public_key" => eph_pk,
           "key_validity_url" => base <> "/_matrix/identity/v2/pubkey/ephemeral/isvalid"
@@ -158,11 +170,16 @@ defmodule AxonWeb.FakeIdentityServer do
     })
   end
 
-  defp handle_builtin(%{method: "POST", request_path: "/_matrix/identity/v2/validate/msisdn/requestToken"} = conn) do
+  defp handle_builtin(
+         %{method: "POST", request_path: "/_matrix/identity/v2/validate/msisdn/requestToken"} =
+           conn
+       ) do
     send_json(conn, 200, %{"sid" => "fake-msisdn-sid"})
   end
 
-  defp handle_builtin(%{method: "GET", request_path: "/_matrix/identity/v2/pubkey/isvalid"} = conn) do
+  defp handle_builtin(
+         %{method: "GET", request_path: "/_matrix/identity/v2/pubkey/isvalid"} = conn
+       ) do
     s = state(conn.port)
     public_key_b64 = conn.query_params["public_key"]
 
@@ -172,12 +189,19 @@ defmodule AxonWeb.FakeIdentityServer do
     end
   end
 
-  defp handle_builtin(%{method: "GET", request_path: "/_matrix/identity/v2/pubkey/ephemeral/isvalid"} = conn) do
+  defp handle_builtin(
+         %{method: "GET", request_path: "/_matrix/identity/v2/pubkey/ephemeral/isvalid"} = conn
+       ) do
     send_json(conn, 200, %{"valid" => true})
   end
 
-  defp handle_builtin(%{method: "POST", request_path: "/_matrix/identity/v2/account/register"} = conn) do
-    send_json(conn, 200, %{"access_token" => "fake_id_access_token", "token" => "fake_id_access_token"})
+  defp handle_builtin(
+         %{method: "POST", request_path: "/_matrix/identity/v2/account/register"} = conn
+       ) do
+    send_json(conn, 200, %{
+      "access_token" => "fake_id_access_token",
+      "token" => "fake_id_access_token"
+    })
   end
 
   # Test-only convenience beyond what a real identity server exposes:
@@ -201,13 +225,19 @@ defmodule AxonWeb.FakeIdentityServer do
   end
 
   defp handle_builtin(conn) do
-    send_json(conn, 404, %{"errcode" => "M_NOT_FOUND", "error" => "no route in FakeIdentityServer"})
+    send_json(conn, 404, %{
+      "errcode" => "M_NOT_FOUND",
+      "error" => "no route in FakeIdentityServer"
+    })
   end
 
   defp obfuscate(address) do
     case String.split(address, "@", parts: 2) do
-      [local, domain] -> String.slice(local, 0, 1) <> "..." <> "@" <> String.slice(domain, 0, 3) <> "..."
-      _ -> "***"
+      [local, domain] ->
+        String.slice(local, 0, 1) <> "..." <> "@" <> String.slice(domain, 0, 3) <> "..."
+
+      _ ->
+        "***"
     end
   end
 
@@ -215,14 +245,24 @@ defmodule AxonWeb.FakeIdentityServer do
     port = conn.port
 
     Enum.find_value(state(port).overrides, fn
-      {{method, %Regex{} = re}, resp} -> if conn.method == method and Regex.match?(re, conn.request_path), do: resp
-      {{method, path}, resp} when is_binary(path) -> if conn.method == method and conn.request_path == path, do: resp
+      {{method, %Regex{} = re}, resp} ->
+        if conn.method == method and Regex.match?(re, conn.request_path), do: resp
+
+      {{method, path}, resp} when is_binary(path) ->
+        if conn.method == method and conn.request_path == path, do: resp
     end)
   end
 
   defp log_request(conn) do
     port = conn.port
-    entry = %{method: conn.method, path: conn.request_path, headers: conn.req_headers, body: conn.body_params}
+
+    entry = %{
+      method: conn.method,
+      path: conn.request_path,
+      headers: conn.req_headers,
+      body: conn.body_params
+    }
+
     update_state(port, fn s -> %{s | requests: [entry | s.requests]} end)
   end
 

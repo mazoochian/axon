@@ -127,7 +127,12 @@ defmodule AxonWeb.ThirdPartyController do
   # is forwarded verbatim — minus the path parameter Phoenix merged in, and
   # minus `access_token`, which is axon's own auth credential and has no
   # business being handed to a bridge (Synapse pops it here too).
-  defp search_fields(params), do: Map.drop(params, ["protocol", "access_token"])
+  defp search_fields(params) do
+    for {k, v} <- Map.drop(params, ["protocol", "access_token"]),
+        is_binary(v),
+        into: %{},
+        do: {k, v}
+  end
 
   # A malformed or unreachable AS response degrades to an empty result list
   # rather than a 5xx — see this module's moduledoc.

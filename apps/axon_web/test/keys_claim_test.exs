@@ -34,7 +34,10 @@ defmodule AxonWeb.KeysClaimTest do
 
     conn1 = authed(alice.token) |> jp("/_matrix/client/v3/keys/claim", request)
     body1 = decode(conn1)
-    assert body1["one_time_keys"][alice.user_id][alice.device_id] == %{"curve25519:AAAAAA" => key_json}
+
+    assert body1["one_time_keys"][alice.user_id][alice.device_id] == %{
+             "curve25519:AAAAAA" => key_json
+           }
 
     conn2 = authed(alice.token) |> jp("/_matrix/client/v3/keys/claim", request)
     refute Map.has_key?(decode(conn2)["one_time_keys"], alice.user_id)

@@ -399,6 +399,40 @@ defmodule AxonWeb.CryptoIdentityTest do
       assert decode(conn)["errcode"] == "M_FORBIDDEN"
     end
 
+    test "replacing the master key requires password UIA; m.login.dummy is not enough" do
+      user = register("cs_dummy_#{System.unique_integer([:positive])}")
+
+      key = fn id ->
+        %{"keys" => %{"ed25519:#{id}" => id}, "usage" => ["master"], "user_id" => user.user_id}
+      end
+
+      assert authed(user.token)
+             |> jp("/_matrix/client/v3/keys/device_signing/upload", %{"master_key" => key.("m1")})
+             |> Map.get(:status) == 200
+
+      dummy =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
+          "master_key" => key.("m2"),
+          "auth" => %{"type" => "m.login.dummy"}
+        })
+
+      assert dummy.status == 401
+
+      password =
+        authed(user.token)
+        |> jp("/_matrix/client/v3/keys/device_signing/upload", %{
+          "master_key" => key.("m2"),
+          "auth" => %{
+            "type" => "m.login.password",
+            "identifier" => %{"type" => "m.id.user", "user" => user.user_id},
+            "password" => "Test1234!"
+          }
+        })
+
+      assert password.status == 200
+    end
+
     test "MSC3967: first-time upload of master+self+user signing keys together skips UIA" do
       user = register("msc3967_first_#{System.unique_integer([:positive])}")
 

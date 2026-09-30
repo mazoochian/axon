@@ -52,6 +52,13 @@ defmodule AxonWeb.AppService.ManagerTest do
       assert Manager.verify_hs_token("hs-secret-1") == {:ok, reg}
     end
 
+    test "token verification ignores non-string tokens and registrations without one" do
+      put_registrations([%{"id" => "bridge1"}, %{"id" => "bridge2", "as_token" => "as-2"}])
+      assert Manager.verify_as_token(nil) == :error
+      assert Manager.verify_as_token("as-") == :error
+      assert {:ok, %{"id" => "bridge2"}} = Manager.verify_as_token("as-2")
+    end
+
     test "verify_hs_token returns :error for an unknown token" do
       put_registrations([%{"id" => "bridge1", "hs_token" => "hs-secret-1"}])
       assert Manager.verify_hs_token("nope") == :error
@@ -88,6 +95,27 @@ defmodule AxonWeb.AppService.ManagerTest do
       }
 
       assert Manager.owns_user?(reg, "@bridge_ghost1:test.local")
+    end
+
+    test "never owns a user on another server, even one matching its namespace" do
+      reg = %{
+        "sender_localpart" => "the-bridge-user",
+        "namespaces" => %{"users" => [%{"regex" => "@bridge_.*", "exclusive" => true}]}
+      }
+
+      refute Manager.owns_user?(reg, "@bridge_ghost1:evil.example")
+      refute Manager.owns_user?(reg, "@the-bridge-user:evil.example")
+    end
+
+    test "namespace regexes must match the whole user ID" do
+      reg = %{
+        "sender_localpart" => "the-bridge-user",
+        "namespaces" => %{"users" => [%{"regex" => "@bridge_[a-z]+:test.local"}]}
+      }
+
+      assert Manager.owns_user?(reg, "@bridge_abc:test.local")
+      refute Manager.owns_user?(reg, "@x@bridge_abc:test.local")
+      refute Manager.owns_user?(reg, "@bridge_abc:test.local.evil")
     end
 
     test "does not own a user matching no namespace and not its own sender user" do

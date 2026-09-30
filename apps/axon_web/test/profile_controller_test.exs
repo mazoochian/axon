@@ -53,15 +53,15 @@ defmodule AxonWeb.ProfileControllerTest do
     assert decode(conn)["errcode"] == "M_FORBIDDEN"
   end
 
-  test "PUT displayname with no displayname field in the body is a no-op success" do
+  test "PUT displayname with no displayname field in the body is a missing-param error" do
     alice = register("dnmissing_#{System.unique_integer([:positive])}")
 
     conn =
       authed(alice.token)
       |> jpu("/_matrix/client/v3/profile/#{alice.user_id}/displayname", %{})
 
-    assert conn.status == 200
-    assert decode(conn) == %{}
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_MISSING_PARAM"
   end
 
   test "GET avatar_url reflects what was set via PUT, and propagates" do
@@ -95,14 +95,47 @@ defmodule AxonWeb.ProfileControllerTest do
     assert decode(conn)["errcode"] == "M_FORBIDDEN"
   end
 
-  test "PUT avatar_url with no avatar_url field in the body is a no-op success" do
+  test "PUT avatar_url with no avatar_url field in the body is a missing-param error" do
     alice = register("avmissing_#{System.unique_integer([:positive])}")
 
     conn =
       authed(alice.token)
       |> jpu("/_matrix/client/v3/profile/#{alice.user_id}/avatar_url", %{})
 
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_MISSING_PARAM"
+  end
+
+  test "clearing avatar_url and displayname removes them from the room member event" do
+    alice = register("profclear_#{System.unique_integer([:positive])}")
+    room_id = create_room(alice.token)
+    profile = "/_matrix/client/v3/profile/#{alice.user_id}"
+    member_path = "/_matrix/client/v3/rooms/#{room_id}/state/m.room.member/#{alice.user_id}"
+
+    member_content = fn done? ->
+      Enum.reduce_while(1..40, nil, fn _, _ ->
+        content = decode(authed(alice.token) |> get(member_path))
+
+        if done?.(content) do
+          {:halt, content}
+        else
+          Process.sleep(25)
+          {:cont, content}
+        end
+      end)
+    end
+
+    avatar = %{"avatar_url" => "mxc://localhost/a"}
+    assert authed(alice.token) |> jpu(profile <> "/avatar_url", avatar) |> Map.get(:status) == 200
+    assert member_content.(&(&1["avatar_url"] == "mxc://localhost/a"))["avatar_url"]
+
+    assert authed(alice.token) |> delete(profile <> "/avatar_url") |> Map.get(:status) == 200
+    refute Map.has_key?(member_content.(&(not Map.has_key?(&1, "avatar_url"))), "avatar_url")
+
+    conn = authed(alice.token) |> jpu(profile <> "/displayname", %{"displayname" => nil})
     assert conn.status == 200
-    assert decode(conn) == %{}
+    content = member_content.(&(not Map.has_key?(&1, "displayname")))
+    refute Map.has_key?(content, "displayname")
+    assert content["membership"] == "join"
   end
 end

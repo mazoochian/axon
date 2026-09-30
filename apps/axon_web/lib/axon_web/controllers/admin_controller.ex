@@ -15,10 +15,11 @@ defmodule AxonWeb.AdminController do
 
   @default_limit 100
   @max_limit 1000
+  @max_offset 2_147_483_647
 
   defp paging(params) do
-    from_ = String.to_integer(params["from"] || "0")
-    limit = min(String.to_integer(params["limit"] || "#{@default_limit}"), @max_limit)
+    from_ = AxonWeb.Params.int(params["from"], 0, 0, @max_offset)
+    limit = AxonWeb.Params.int(params["limit"], @default_limit, 1, @max_limit)
     {from_, limit}
   end
 
