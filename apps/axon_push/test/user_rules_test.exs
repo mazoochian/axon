@@ -147,6 +147,20 @@ defmodule AxonPush.UserRulesTest do
     end
   end
 
+  test "put_enabled/put_actions on a rule that doesn't exist is not_found and stores nothing" do
+    assert UserRules.put_enabled(@user, "override", "nope", false) == {:error, :not_found}
+
+    assert UserRules.put_actions(@user, "bogus_kind", ".m.rule.master", []) ==
+             {:error, :not_found}
+
+    assert UserRules.get_rule(@user, "override", "nope") == nil
+  end
+
+  test "is_user_mention is served with the user's own id" do
+    rule = UserRules.get_rule(@user, "override", ".m.rule.is_user_mention")
+    assert [%{"value" => @user}] = rule["conditions"]
+  end
+
   describe "put_custom_rule/4 positioning (before/after)" do
     @pos_user "@rules_pos_user:localhost"
 

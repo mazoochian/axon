@@ -81,7 +81,7 @@ defmodule AxonPush.DispatcherTest do
     :ok
   end
 
-  defp register_pusher(user_id, app_id \\ "com.example.app") do
+  defp register_pusher(user_id, app_id \\ "com.example.app", extra_data \\ %{}) do
     Repo.insert_all(
       "pushers",
       [
@@ -94,7 +94,7 @@ defmodule AxonPush.DispatcherTest do
           device_display_name: "Test Device",
           pushkey: "pushkey_#{System.unique_integer([:positive])}",
           lang: "en",
-          data: %{"url" => "http://127.0.0.1:#{@port}/_matrix/push/v1/notify"},
+          data: Map.put(extra_data, "url", "http://127.0.0.1:#{@port}/_matrix/push/v1/notify"),
           enabled: true
         }
       ],
@@ -130,7 +130,49 @@ defmodule AxonPush.DispatcherTest do
     assert notification["event_id"] == "$abc"
     assert notification["room_id"] == @room
     assert notification["sender"] == @sender
-    assert [%{"app_id" => "com.example.app"}] = notification["devices"]
+    assert notification["content"]["body"] == "hello"
+    assert [%{"app_id" => "com.example.app", "data" => %{}}] = notification["devices"]
+  end
+
+  defp message(event_id) do
+    %{
+      "event_id" => event_id,
+      "type" => "m.room.message",
+      "sender" => @sender,
+      "content" => %{"msgtype" => "m.text", "body" => "secret"}
+    }
+  end
+
+  test "event_id_only pushers get no event details, and device data excludes the url" do
+    register_pusher(@recipient, "com.example.app", %{"format" => "event_id_only"})
+
+    Dispatcher.dispatch_event(message("$eio"), @room)
+
+    [%{"notification" => notification}] = wait_for_delivery()
+
+    assert Map.keys(notification) |> Enum.sort() ==
+             ~w(counts devices event_id prio room_id)
+
+    assert [%{"data" => %{"format" => "event_id_only"} = data}] = notification["devices"]
+    refute Map.has_key?(data, "url")
+  end
+
+  test "a gateway on a private address is refused unless explicitly allowed" do
+    Application.put_env(:axon_push, :allow_private_addresses, false)
+    on_exit(fn -> Application.put_env(:axon_push, :allow_private_addresses, true) end)
+    register_pusher(@recipient)
+
+    Dispatcher.dispatch_event(message("$ssrf"), @room)
+
+    Process.sleep(100)
+    assert FakePusherGateway.received(@port) == []
+  end
+
+  test "valid_push_url?/1 requires http(s) and the spec notify path" do
+    assert Dispatcher.valid_push_url?("https://push.example.com/_matrix/push/v1/notify")
+    refute Dispatcher.valid_push_url?("https://push.example.com/notify")
+    refute Dispatcher.valid_push_url?("file:///_matrix/push/v1/notify")
+    refute Dispatcher.valid_push_url?(nil)
   end
 
   test "never pushes to the sender of the event" do

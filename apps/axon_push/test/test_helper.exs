@@ -9,5 +9,7 @@ case Finch.start_link(name: Axon.Finch) do
   {:error, {:already_started, _}} -> :ok
 end
 
+# The fake push gateway listens on loopback.
+
 ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(AxonCore.Repo, :manual)

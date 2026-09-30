@@ -7,8 +7,10 @@ defmodule AxonPush.DefaultRulesTest do
 
   @expected_kinds ~w(override content room sender underride)
   @expected_override_ids ~w(.m.rule.master .m.rule.suppress_notices .m.rule.invite_for_me
-                             .m.rule.member_event .m.rule.contains_display_name
-                             .m.rule.tombstone .m.rule.roomnotif)
+                             .m.rule.member_event .m.rule.is_user_mention
+                             .m.rule.contains_display_name .m.rule.is_room_mention
+                             .m.rule.roomnotif .m.rule.tombstone .m.rule.reaction
+                             .m.rule.room.server_acl .m.rule.suppress_edits)
   @expected_content_ids ~w(.m.rule.contains_user_name)
   @expected_underride_ids ~w(.m.rule.call .m.rule.encrypted_room_one_to_one
                               .m.rule.room_one_to_one .m.rule.message .m.rule.encrypted)
@@ -17,9 +19,8 @@ defmodule AxonPush.DefaultRulesTest do
     assert Map.keys(DefaultRules.rules()) |> Enum.sort() == Enum.sort(@expected_kinds)
   end
 
-  test "override rules include every spec-required default override rule" do
-    ids = DefaultRules.rules()["override"] |> Enum.map(& &1["rule_id"])
-    for id <- @expected_override_ids, do: assert(id in ids)
+  test "override rules are exactly the spec's default override rules, in spec order" do
+    assert Enum.map(DefaultRules.rules()["override"], & &1["rule_id"]) == @expected_override_ids
   end
 
   test "content rules include the display-username rule" do

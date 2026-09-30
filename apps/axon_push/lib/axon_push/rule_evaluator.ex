@@ -7,9 +7,11 @@ defmodule AxonPush.RuleEvaluator do
   """
 
   import Ecto.Query
-  alias AxonCore.Repo
+  alias AxonCore.{EventStore, Repo}
+  alias AxonPush.DefaultRules
 
-  @rule_kinds ~w(override content room sender underride)
+  @legacy_mention_rules ~w(.m.rule.contains_display_name .m.rule.contains_user_name .m.rule.roomnotif)
+  @count_expr ~r/\A\s*(==|<=|>=|<|>)?\s*(\d+)\s*\z/
 
   @doc """
   Evaluate push rules for `user_id` against `event` in `room_id`.
@@ -19,254 +21,174 @@ defmodule AxonPush.RuleEvaluator do
   Returns {:notify, actions} | :dont_notify.
   """
   def should_notify?(event, room_id, user_id, rules) do
-    member_count = get_member_count(room_id)
-    display_name = get_display_name(user_id)
+    ctx = %{
+      event: event,
+      room_id: room_id,
+      user_id: user_id,
+      has_mentions: is_map(event["content"]) and Map.has_key?(event["content"], "m.mentions")
+    }
 
-    Enum.reduce_while(@rule_kinds, :dont_notify, fn kind, _acc ->
-      kind_rules = rules[kind] || []
-
-      case eval_kind(kind, kind_rules, event, room_id, user_id, display_name, member_count) do
-        {:match, actions} ->
-          if "notify" in actions do
-            {:halt, {:notify, actions}}
-          else
-            {:halt, :dont_notify}
-          end
-
-        :no_match ->
-          {:cont, :dont_notify}
+    DefaultRules.kinds()
+    |> Enum.reduce_while(ctx, fn kind, ctx ->
+      case first_match(rules[kind] || [], ctx, matcher(kind)) do
+        {:match, actions, _ctx} -> {:halt, {:match, actions}}
+        {:no_match, ctx} -> {:cont, ctx}
       end
     end)
+    |> case do
+      {:match, actions} -> if "notify" in actions, do: {:notify, actions}, else: :dont_notify
+      _ctx -> :dont_notify
+    end
   end
 
   # ---------------------------------------------------------------------------
   # Kind-level evaluation
   # ---------------------------------------------------------------------------
 
-  # Content rules: single pattern matching against content.body
-  defp eval_kind("content", rules, event, _room_id, user_id, _dn, _count) do
-    content = event["content"] || %{}
-    body = content["body"] || ""
-    localpart = localpart(user_id)
-
-    Enum.reduce_while(rules, :no_match, fn rule, _ ->
-      if rule["enabled"] != false do
-        pattern = rule["pattern"] || ""
-        pattern = String.replace(pattern, "${user_localpart}", localpart)
-
-        if glob_match?(pattern, body) do
-          {:halt, {:match, rule["actions"] || []}}
-        else
-          {:cont, :no_match}
+  defp first_match(rules, ctx, matcher) do
+    Enum.reduce_while(rules, {:no_match, ctx}, fn rule, {:no_match, ctx} ->
+      if active?(rule, ctx) do
+        case matcher.(rule, ctx) do
+          {true, ctx} -> {:halt, {:match, List.wrap(rule["actions"]), ctx}}
+          {false, ctx} -> {:cont, {:no_match, ctx}}
         end
       else
-        {:cont, :no_match}
+        {:cont, {:no_match, ctx}}
       end
     end)
   end
 
-  # Room/sender rules match implicitly by rule_id == room_id / sender,
-  # never by an explicit "conditions" array (there isn't one in the PUT
-  # body for these kinds) — falling through to the generic conditions-based
-  # clause below would vacuously match *every* room/sender rule against
-  # *every* event, since `all_conditions_match?([], ...)` is trivially true
-  # on an empty conditions list.
-  defp eval_kind("room", rules, _event, room_id, _user_id, _dn, _count) do
-    match_by_rule_id(rules, room_id)
+  defp active?(%{"enabled" => false}, _ctx), do: false
+
+  defp active?(rule, ctx),
+    do: not (ctx.has_mentions and rule["rule_id"] in @legacy_mention_rules)
+
+  defp matcher("content") do
+    fn rule, ctx ->
+      pattern = rule["pattern"]
+      body = body(ctx.event)
+
+      matched =
+        is_binary(pattern) and body != nil and
+          glob_match?(
+            String.replace(pattern, "${user_localpart}", localpart(ctx.user_id)),
+            body,
+            true
+          )
+
+      {matched, ctx}
+    end
   end
 
-  defp eval_kind("sender", rules, event, _room_id, _user_id, _dn, _count) do
-    match_by_rule_id(rules, event["sender"])
-  end
+  # Room/sender rules match implicitly by rule_id == room_id / sender, never by
+  # a "conditions" array (an empty one would vacuously match every event).
+  defp matcher("room"), do: fn rule, ctx -> {rule["rule_id"] == ctx.room_id, ctx} end
+  defp matcher("sender"), do: fn rule, ctx -> {rule["rule_id"] == ctx.event["sender"], ctx} end
 
-  defp eval_kind(_kind, rules, event, room_id, user_id, display_name, member_count) do
-    Enum.reduce_while(rules, :no_match, fn rule, _ ->
-      if rule["enabled"] != false do
-        conditions = rule["conditions"] || []
-
-        if all_conditions_match?(conditions, event, room_id, user_id, display_name, member_count) do
-          {:halt, {:match, rule["actions"] || []}}
-        else
-          {:cont, :no_match}
+  defp matcher(_kind) do
+    fn rule, ctx ->
+      rule
+      |> Map.get("conditions")
+      |> List.wrap()
+      |> Enum.reduce_while({true, ctx}, fn cond, {true, ctx} ->
+        case eval_condition(cond, ctx) do
+          {true, ctx} -> {:cont, {true, ctx}}
+          {false, ctx} -> {:halt, {false, ctx}}
         end
-      else
-        {:cont, :no_match}
-      end
-    end)
-  end
-
-  defp match_by_rule_id(rules, target_id) do
-    Enum.reduce_while(rules, :no_match, fn rule, _ ->
-      if rule["enabled"] != false and rule["rule_id"] == target_id do
-        {:halt, {:match, rule["actions"] || []}}
-      else
-        {:cont, :no_match}
-      end
-    end)
+      end)
+    end
   end
 
   # ---------------------------------------------------------------------------
   # Condition evaluation
   # ---------------------------------------------------------------------------
 
-  defp all_conditions_match?(conditions, event, room_id, user_id, display_name, member_count) do
-    Enum.all?(conditions, fn cond ->
-      eval_condition(cond, event, room_id, user_id, display_name, member_count)
-    end)
-  end
-
-  defp eval_condition(
-         %{"kind" => "event_match", "key" => key, "pattern" => pattern},
-         event,
-         _room_id,
-         user_id,
-         _dn,
-         _count
-       ) do
-    localpart = localpart(user_id)
-
+  defp eval_condition(%{"kind" => "event_match", "key" => key, "pattern" => pattern}, ctx)
+       when is_binary(key) and is_binary(pattern) do
     pattern =
       pattern
-      |> String.replace("${user_id}", user_id)
-      |> String.replace("${user_localpart}", localpart)
+      |> String.replace("${user_id}", ctx.user_id)
+      |> String.replace("${user_localpart}", localpart(ctx.user_id))
 
-    value = get_event_field(event, key)
-    glob_match?(pattern, to_string(value || ""))
+    matched =
+      case get_event_field(ctx.event, key) do
+        {:ok, value} when is_binary(value) -> glob_match?(pattern, value, key == "content.body")
+        _ -> false
+      end
+
+    {matched, ctx}
   end
 
-  defp eval_condition(
-         %{"kind" => "contains_display_name"},
-         event,
-         _room_id,
-         _user_id,
-         display_name,
-         _count
-       ) do
-    body = get_in(event, ["content", "body"]) || ""
+  defp eval_condition(%{"kind" => "contains_display_name"}, ctx) do
+    {display_name, ctx} = fetch(ctx, :display_name)
+    body = body(ctx.event)
 
-    display_name != nil and display_name != "" and
-      String.contains?(String.downcase(body), String.downcase(display_name))
+    matched =
+      body != nil and is_binary(display_name) and display_name != "" and
+        Regex.match?(word_regex(Regex.escape(display_name)), body)
+
+    {matched, ctx}
   end
 
-  defp eval_condition(
-         %{"kind" => "room_member_count", "is" => expr},
-         _event,
-         _room_id,
-         _user_id,
-         _dn,
-         member_count
-       ) do
-    eval_count_expr(expr, member_count)
-  end
+  defp eval_condition(%{"kind" => "room_member_count", "is" => expr}, ctx) when is_binary(expr) do
+    case Regex.run(@count_expr, expr) do
+      [_, op, n] ->
+        {count, ctx} = fetch(ctx, :member_count)
+        {compare(op, count, String.to_integer(n)), ctx}
 
-  defp eval_condition(
-         %{"kind" => "event_property_is", "key" => key, "value" => value},
-         event,
-         _,
-         _,
-         _,
-         _
-       ) do
-    get_event_field(event, key) == value
-  end
-
-  defp eval_condition(
-         %{"kind" => "event_property_contains", "key" => key, "value" => value},
-         event,
-         _,
-         _,
-         _,
-         _
-       ) do
-    case get_event_field(event, key) do
-      list when is_list(list) -> value in list
-      _ -> false
+      nil ->
+        {false, ctx}
     end
   end
 
-  # sender_notification_permission and unknown conditions default to false (safe)
-  defp eval_condition(_cond, _event, _room_id, _user_id, _dn, _count), do: false
+  defp eval_condition(%{"kind" => "event_property_is", "key" => key, "value" => value}, ctx)
+       when is_binary(key) do
+    {get_event_field(ctx.event, key) == {:ok, value}, ctx}
+  end
+
+  defp eval_condition(%{"kind" => "event_property_contains", "key" => key, "value" => value}, ctx)
+       when is_binary(key) do
+    matched =
+      case get_event_field(ctx.event, key) do
+        {:ok, list} when is_list(list) -> value in list
+        _ -> false
+      end
+
+    {matched, ctx}
+  end
+
+  defp eval_condition(%{"kind" => "sender_notification_permission", "key" => key}, ctx)
+       when is_binary(key) do
+    {power_levels, ctx} = fetch(ctx, :power_levels)
+
+    {sender_level(power_levels, ctx.event["sender"]) >= notification_level(power_levels, key),
+     ctx}
+  end
+
+  defp eval_condition(_cond, ctx), do: {false, ctx}
+
+  defp compare(op, count, n) when op in ["", "=="], do: count == n
+  defp compare(">=", count, n), do: count >= n
+  defp compare("<=", count, n), do: count <= n
+  defp compare(">", count, n), do: count > n
+  defp compare("<", count, n), do: count < n
 
   # ---------------------------------------------------------------------------
-  # Helpers
+  # Lazily-loaded, per-call room/user data
   # ---------------------------------------------------------------------------
 
-  defp get_event_field(event, key) do
-    # Support dot-separated paths: "content.msgtype", "content.body", "type", "state_key"
-    key
-    |> String.split(".")
-    |> Enum.reduce(event, fn part, acc ->
-      if is_map(acc), do: Map.get(acc, part), else: nil
-    end)
-  end
+  defp fetch(ctx, key) do
+    case ctx do
+      %{^key => value} ->
+        {value, ctx}
 
-  # Glob pattern matching: * → any sequence, ? → any single char
-  defp glob_match?(pattern, string) do
-    regex_str =
-      pattern
-      |> Regex.escape()
-      |> String.replace("\\*", ".*")
-      |> String.replace("\\?", ".")
-
-    case Regex.compile("^#{regex_str}$", "i") do
-      {:ok, re} -> Regex.match?(re, string)
-      _ -> false
+      _ ->
+        value = load(key, ctx)
+        {value, Map.put(ctx, key, value)}
     end
   end
 
-  defp eval_count_expr(expr, count) do
-    cond do
-      String.starts_with?(expr, "==") ->
-        String.slice(expr, 2..-1//1)
-        |> String.trim()
-        |> Integer.parse()
-        |> case do
-          {n, _} -> count == n
-          _ -> false
-        end
-
-      String.starts_with?(expr, ">=") ->
-        String.slice(expr, 2..-1//1)
-        |> String.trim()
-        |> Integer.parse()
-        |> case do
-          {n, _} -> count >= n
-          _ -> false
-        end
-
-      String.starts_with?(expr, "<=") ->
-        String.slice(expr, 2..-1//1)
-        |> String.trim()
-        |> Integer.parse()
-        |> case do
-          {n, _} -> count <= n
-          _ -> false
-        end
-
-      String.starts_with?(expr, ">") ->
-        String.slice(expr, 1..-1//1)
-        |> String.trim()
-        |> Integer.parse()
-        |> case do
-          {n, _} -> count > n
-          _ -> false
-        end
-
-      String.starts_with?(expr, "<") ->
-        String.slice(expr, 1..-1//1)
-        |> String.trim()
-        |> Integer.parse()
-        |> case do
-          {n, _} -> count < n
-          _ -> false
-        end
-
-      true ->
-        false
-    end
-  end
-
-  defp get_member_count(room_id) do
+  defp load(:member_count, %{room_id: room_id}) do
     Repo.one(
       from(m in "room_memberships",
         where: m.room_id == ^room_id and m.membership == "join",
@@ -275,14 +197,125 @@ defmodule AxonPush.RuleEvaluator do
     ) || 0
   end
 
-  defp get_display_name(user_id) do
-    Repo.one(
-      from(p in "user_profiles",
-        where: p.user_id == ^user_id,
-        select: p.displayname
-      )
-    )
+  defp load(:display_name, %{user_id: user_id}) do
+    Repo.one(from(p in "user_profiles", where: p.user_id == ^user_id, select: p.displayname))
   end
+
+  # Without an m.room.power_levels event the room creator has 100 and everyone
+  # else 0; in room v12 the creators outrank any power level.
+  defp load(:power_levels, %{room_id: room_id}) do
+    create = state_content(room_id, "m.room.create")
+
+    creators =
+      case create do
+        {sender, %{"room_version" => "12"} = content} ->
+          [sender | List.wrap(content["additional_creators"])]
+
+        _ ->
+          []
+      end
+
+    case {state_content(room_id, "m.room.power_levels"), create} do
+      {{_, content}, _} when is_map(content) ->
+        %{content: content, creators: creators}
+
+      {_, {sender, content}} ->
+        %{content: %{"users" => %{(content["creator"] || sender) => 100}}, creators: creators}
+
+      _ ->
+        %{content: %{}, creators: creators}
+    end
+  end
+
+  defp state_content(room_id, type) do
+    case EventStore.get_state_event(room_id, type, "") do
+      {:ok, event} ->
+        map = EventStore.event_to_map(event)
+        {map["sender"], map["content"] || %{}}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp sender_level(%{creators: creators, content: content}, sender) do
+    if sender in creators do
+      :infinity
+    else
+      users = if is_map(content["users"]), do: content["users"], else: %{}
+      to_level(Map.get(users, sender, content["users_default"]), 0)
+    end
+  end
+
+  defp notification_level(%{content: content}, key) do
+    notifications = if is_map(content["notifications"]), do: content["notifications"], else: %{}
+    to_level(notifications[key], 50)
+  end
+
+  defp to_level(n, _default) when is_integer(n), do: n
+
+  defp to_level(s, default) when is_binary(s) do
+    case Integer.parse(String.trim(s)) do
+      {n, ""} -> n
+      _ -> default
+    end
+  end
+
+  defp to_level(_, default), do: default
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  # Dot-separated path; `\.` is a literal dot and `\\` a literal backslash.
+  defp get_event_field(event, key) do
+    key
+    |> split_key("", [])
+    |> Enum.reduce_while({:ok, event}, fn part, {:ok, acc} ->
+      case acc do
+        %{^part => value} -> {:cont, {:ok, value}}
+        _ -> {:halt, :error}
+      end
+    end)
+  end
+
+  defp split_key(<<?\\, c, rest::binary>>, cur, acc) when c in [?., ?\\],
+    do: split_key(rest, <<cur::binary, c>>, acc)
+
+  defp split_key(<<?., rest::binary>>, cur, acc), do: split_key(rest, "", [cur | acc])
+  defp split_key(<<c, rest::binary>>, cur, acc), do: split_key(rest, <<cur::binary, c>>, acc)
+  defp split_key(<<>>, cur, acc), do: Enum.reverse([cur | acc])
+
+  # `*` matches any sequence and `?` any single character, case-insensitively.
+  # content.body matches anywhere on word boundaries; every other key must
+  # match the whole value.
+  defp glob_match?(pattern, value, word_boundary?) do
+    cond do
+      word_boundary? ->
+        Regex.match?(word_regex(glob_to_regex(pattern, ".*?")), value)
+
+      String.contains?(pattern, ["*", "?"]) ->
+        Regex.match?(Regex.compile!("\\A" <> glob_to_regex(pattern, ".*") <> "\\z", "ius"), value)
+
+      true ->
+        String.downcase(pattern) == String.downcase(value)
+    end
+  end
+
+  defp glob_to_regex(glob, star) do
+    for <<c::utf8 <- glob>>, into: "" do
+      case c do
+        ?* -> star
+        ?? -> "."
+        c -> Regex.escape(<<c::utf8>>)
+      end
+    end
+  end
+
+  defp word_regex(inner), do: Regex.compile!("(?:\\A|\\W)" <> inner <> "(?:\\W|\\z)", "ius")
+
+  defp body(%{"content" => %{"body" => body}}) when is_binary(body), do: body
+  defp body(_event), do: nil
 
   defp localpart(user_id) do
     user_id

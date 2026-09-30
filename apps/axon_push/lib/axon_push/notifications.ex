@@ -138,6 +138,15 @@ defmodule AxonPush.Notifications do
     {page, next_token}
   end
 
+  @doc "Whether push rule `actions` set the highlight tweak."
+  def highlight?(actions) do
+    Enum.any?(actions, fn
+      %{"set_tweak" => "highlight", "value" => value} -> value != false
+      %{"set_tweak" => "highlight"} -> true
+      _ -> false
+    end)
+  end
+
   # ---------------------------------------------------------------------------
   # Private
   # ---------------------------------------------------------------------------
@@ -154,13 +163,5 @@ defmodule AxonPush.Notifications do
         select: %{stream_ordering: e.stream_ordering, origin_server_ts: e.origin_server_ts}
       )
     )
-  end
-
-  defp highlight?(actions) do
-    Enum.any?(actions, fn
-      %{"set_tweak" => "highlight", "value" => value} -> value != false
-      %{"set_tweak" => "highlight"} -> true
-      _ -> false
-    end)
   end
 end
