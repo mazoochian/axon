@@ -7,6 +7,7 @@ defmodule AxonWeb.Plug.FederationAuth do
   """
 
   import Plug.Conn
+  import AxonCore.MapUtil, only: [maybe_put: 3]
   alias AxonCrypto.{CanonicalJSON, KeyServer}
   alias AxonFederation.KeyCache
   require Logger
@@ -83,14 +84,7 @@ defmodule AxonWeb.Plug.FederationAuth do
   # ---------------------------------------------------------------------------
 
   defp verify_signature(conn, origin, destination, key_id, sig_b64) do
-    # Re-read body for signing (must have been read by Plug.Parsers already)
-    body = read_raw_body(conn)
-
-    content =
-      case body do
-        "" -> nil
-        json -> Jason.decode!(json)
-      end
+    content = request_content(conn)
 
     signable =
       %{
@@ -99,7 +93,7 @@ defmodule AxonWeb.Plug.FederationAuth do
         "origin" => origin,
         "destination" => destination
       }
-      |> then(fn m -> if content, do: Map.put(m, "content", content), else: m end)
+      |> maybe_put("content", content)
       |> CanonicalJSON.encode_to_binary()
 
     case Base.decode64(sig_b64, padding: false) do
@@ -128,32 +122,20 @@ defmodule AxonWeb.Plug.FederationAuth do
     end
   end
 
-  defp read_raw_body(conn) do
-    # Attempt to read the cached raw body (set by Plug.Parsers with cache_body)
-    case conn.assigns[:raw_body] do
-      nil ->
-        # Fall back to reading from body params if already parsed. Plug.Parsers
-        # resolves body_params to `%{}` for EVERY request that passes through
-        # it — including bodyless GETs — never leaving it genuinely Unfetched
-        # by the time this plug runs. So `body_params == %{}` is ambiguous:
-        # it means either "no body was sent at all" (a GET) or "a body was
-        # sent and it happened to be the empty JSON object `{}`" (a POST/PUT
-        # with an intentionally empty payload) — and per spec those sign
-        # differently: "content" is omitted from the signable entirely when
-        # there's no body, but included (as {}) when there genuinely is one.
-        # A request that actually carried a body always sent a content-type
-        # header for it; one that didn't, never does — use that as the
-        # disambiguator rather than trusting body_params' emptiness alone.
-        has_content_type? = get_req_header(conn, "content-type") != []
+  # The parsed JSON body, or nil when the request carried none. Plug.Parsers
+  # resolves body_params to `%{}` for EVERY request that passes through it —
+  # including bodyless GETs — so `%{}` is ambiguous: "no body at all" (a GET)
+  # or "a body that is the empty JSON object `{}`". Per spec those sign
+  # differently: "content" is omitted from the signable entirely when there's
+  # no body, but included (as {}) when there genuinely is one. A request that
+  # actually carried a body always sent a content-type header for it.
+  defp request_content(conn) do
+    has_content_type? = get_req_header(conn, "content-type") != []
 
-        case conn.body_params do
-          %Plug.Conn.Unfetched{} -> ""
-          params when map_size(params) == 0 and not has_content_type? -> ""
-          params -> Jason.encode!(params)
-        end
-
-      raw ->
-        raw
+    case conn.body_params do
+      %Plug.Conn.Unfetched{} -> nil
+      params when map_size(params) == 0 and not has_content_type? -> nil
+      params -> params
     end
   end
 

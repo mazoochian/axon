@@ -266,7 +266,12 @@ defmodule AxonFederation.RoomJoinTest do
     room_id = remote_room_id()
 
     FakeRemoteMatrixServer.make_join_response(@port, room_id, user_id, "11")
-    FakeRemoteMatrixServer.send_join_response(@port, remote_state_events_without_event_id(room_id), [])
+
+    FakeRemoteMatrixServer.send_join_response(
+      @port,
+      remote_state_events_without_event_id(room_id),
+      []
+    )
 
     assert RoomJoin.join_via_federation(room_id, user_id, [@server_name]) == {:ok, room_id}
 
@@ -284,38 +289,66 @@ defmodule AxonFederation.RoomJoinTest do
     assert join_rules["content"]["join_rule"] == "public"
   end
 
-  test "a join event that itself fails to insert (missing room_id in the make_join template) is logged, not a crash",
-       %{user_id: user_id} do
-    room_id = remote_room_id()
+  describe "make_join template validation" do
+    defp serve_template(room_id, user_id, overrides, room_version \\ "10") do
+      template =
+        Map.merge(
+          %{
+            "type" => "m.room.member",
+            "room_id" => room_id,
+            "sender" => user_id,
+            "state_key" => user_id,
+            "content" => %{"membership" => "join"},
+            "depth" => 1,
+            "prev_events" => [],
+            "auth_events" => [],
+            "origin" => @server_name
+          },
+          overrides
+        )
 
-    # Deliberately omit "room_id" from the template — build_and_sign_join
-    # carries it forward as-is, so the final signed join event will lack it
-    # too, failing changeset validation at insert time.
-    template = %{
-      "type" => "m.room.member",
-      "sender" => user_id,
-      "state_key" => user_id,
-      "content" => %{"membership" => "join"},
-      "depth" => 1,
-      "prev_events" => [],
-      "auth_events" => [],
-      "origin" => @server_name
-    }
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/make_join/}},
+        200,
+        %{"event" => template, "room_version" => room_version}
+      )
 
-    FakeRemoteMatrixServer.put_response(
-      @port,
-      {"GET", ~r{^/_matrix/federation/v1/make_join/}},
-      200,
-      %{"event" => template, "room_version" => "10"}
-    )
+      FakeRemoteMatrixServer.send_join_response(@port, remote_state_events(room_id), [])
+    end
 
-    FakeRemoteMatrixServer.send_join_response(@port, remote_state_events(room_id), [])
+    defp send_join_requests do
+      FakeRemoteMatrixServer.requests(@port)
+      |> Enum.filter(&String.contains?(&1.path, "send_join"))
+    end
 
-    log =
-      capture_log(fn ->
-        assert RoomJoin.join_via_federation(room_id, user_id, [@server_name]) == {:ok, room_id}
-      end)
+    test "a template for a different room, user or event type is never signed or sent",
+         %{user_id: user_id} do
+      room_id = remote_room_id()
 
-    assert log =~ "Failed to insert join event"
+      for overrides <- [
+            %{"room_id" => remote_room_id()},
+            %{"state_key" => "@someone_else:localhost"},
+            %{"type" => "m.room.message"},
+            %{"content" => "not an object"}
+          ] do
+        serve_template(room_id, user_id, overrides)
+
+        assert RoomJoin.join_via_federation(room_id, user_id, [@server_name]) ==
+                 {:error, :all_servers_failed}
+      end
+
+      assert send_join_requests() == []
+    end
+
+    test "a template for an unsupported room version is refused", %{user_id: user_id} do
+      room_id = remote_room_id()
+      serve_template(room_id, user_id, %{}, "999")
+
+      assert RoomJoin.join_via_federation(room_id, user_id, [@server_name]) ==
+               {:error, :all_servers_failed}
+
+      assert send_join_requests() == []
+    end
   end
 end

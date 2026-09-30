@@ -77,6 +77,41 @@ defmodule AxonWeb.MediaControllerTest do
     assert decode(conn)["errcode"] == "M_MISSING_PARAM"
   end
 
+  test "an application/json upload is stored verbatim rather than parsed as a request body" do
+    alice = register("mediaupload_json_#{System.unique_integer([:positive])}")
+    body = ~s({"not": "a request"})
+
+    conn =
+      authed(alice.token)
+      |> put_req_header("content-type", "application/json")
+      |> post("/_matrix/media/v3/upload?filename=data.json", body)
+
+    assert conn.status == 200
+    media_id = decode(conn)["content_uri"] |> String.split("/") |> List.last()
+
+    dl = build_conn() |> get("/_matrix/media/v3/download/localhost/#{media_id}")
+    assert dl.resp_body == body
+    assert hd(get_resp_header(dl, "content-disposition")) =~ ~s(filename="data.json")
+  end
+
+  test "an upload over the configured size limit is rejected with 413 M_TOO_LARGE" do
+    alice = register("mediaupload_big_#{System.unique_integer([:positive])}")
+    Application.put_env(:axon_media, :max_upload_bytes, 10)
+    on_exit(fn -> Application.delete_env(:axon_media, :max_upload_bytes) end)
+
+    assert decode(authed(alice.token) |> get("/_matrix/client/v3/media/config"))[
+             "m.upload.size"
+           ] == 10
+
+    conn =
+      authed(alice.token)
+      |> put_req_header("content-type", "application/octet-stream")
+      |> post("/_matrix/client/v3/media/upload", String.duplicate("x", 11))
+
+    assert conn.status == 413
+    assert decode(conn)["errcode"] == "M_TOO_LARGE"
+  end
+
   test "a thumbnail generation failure (not merely unsupported type) is reported as 500" do
     alice = register("mediathumb_fail_#{System.unique_integer([:positive])}")
 
@@ -523,6 +558,21 @@ defmodule AxonWeb.MediaControllerTest do
 
       assert conn.status == 404
       assert decode(conn)["errcode"] == "M_NOT_FOUND"
+    end
+
+    test "GET federation/v1/media/download of a not-yet-uploaded media ID is 504, not a crash",
+         %{port: port} do
+      alice = register("fedmedia_pending_#{System.unique_integer([:positive])}")
+      {:ok, media_id} = AxonMedia.Store.create_pending(alice.user_id, "localhost")
+      path = "/_matrix/federation/v1/media/download/#{media_id}"
+
+      conn =
+        build_conn()
+        |> put_req_header("authorization", FakeRemoteMatrixServer.sign_request(port, "GET", path))
+        |> get(path)
+
+      assert conn.status == 504
+      assert decode(conn)["errcode"] == "M_NOT_YET_UPLOADED"
     end
 
     test "outbound: downloading non-local media fetches it via the authenticated federation endpoint" do

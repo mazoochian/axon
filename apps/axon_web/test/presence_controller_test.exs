@@ -71,7 +71,9 @@ defmodule AxonWeb.PresenceControllerTest do
 
   defp jp(conn, path, body),
     do:
-      conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(path, Jason.encode!(body))
 
   # Alice creates a room and invites Bob, who joins — the "shares a joined
   # room" relationship presence visibility is gated on.

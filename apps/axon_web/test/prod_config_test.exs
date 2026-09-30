@@ -66,6 +66,7 @@ defmodule AxonWeb.ProdConfigTest do
                @required["SECRET_KEY_BASE"]
 
       assert get_in(config, [:axon_core, AxonCore.Repo, :password]) == @required["DB_PASS"]
+
       assert get_in(config, [:axon_core, AxonCore.AdvisoryLockRepo, :password]) ==
                @required["DB_PASS"]
     end

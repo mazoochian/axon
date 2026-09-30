@@ -3,7 +3,7 @@ defmodule AxonWeb.FallbackController do
 
   require Logger
 
-  def call(conn, {:error, :not_found}) do
+  def call(conn, {:error, reason}) when reason in [:not_found, :room_not_found] do
     conn
     |> put_status(404)
     |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Not found"})

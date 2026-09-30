@@ -14,68 +14,32 @@ defmodule AxonFederation.RoomLeave do
   against the room's actual resident server instead, exactly like a join.
   """
 
-  require Logger
-
-  alias AxonCore.EventStore
-  alias AxonCrypto.{EventHash, KeyServer}
-  alias AxonFederation.HttpClient
+  alias AxonFederation.MembershipHandshake
 
   @doc """
   Leaves (rejects) a room via federation, trying each server in
   `via_servers` in turn. Returns `:ok` or `{:error, reason}`.
   """
   def leave_via_federation(room_id, user_id, via_servers) do
-    Enum.find_value(via_servers, {:error, :all_servers_failed}, fn server ->
-      case try_leave(room_id, user_id, server) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          Logger.warning("Federation leave via #{server} failed: #{inspect(reason)}")
-          false
-      end
-    end)
+    MembershipHandshake.via_servers(via_servers, "leave", &try_leave(room_id, user_id, &1))
   end
 
   defp try_leave(room_id, user_id, server) do
-    path = "/_matrix/federation/v1/make_leave/#{URI.encode(room_id)}/#{URI.encode(user_id)}"
-
-    with {:ok, %{"event" => template} = resp} <- HttpClient.get(server, path) do
-      room_version = resp["room_version"] || "11"
-      signed_event = build_and_sign_leave(template, user_id, room_version)
-
-      with {:ok, _} <- send_leave(server, room_id, signed_event) do
-        # Direct insert, not RoomProcess — mirrors RoomJoin.import_room_state/4:
-        # we're still not resident, just recording our own rejection so it
-        # shows up in our own /sync.
-        case EventStore.insert_event(signed_event, room_version) do
-          {:ok, _} -> :ok
-          {:error, :already_exists} -> :ok
-          {:error, reason} -> {:error, reason}
-        end
-      end
+    with {:ok, template, room_version} <-
+           MembershipHandshake.make(server, "leave", room_id, user_id),
+         leave_event =
+           MembershipHandshake.sign(template, user_id, %{"membership" => "leave"}, room_version),
+         {:ok, _} <-
+           MembershipHandshake.send(
+             server,
+             "/_matrix/federation/v2/send_leave",
+             room_id,
+             leave_event
+           ) do
+      # Direct insert, not RoomProcess — mirrors RoomJoin.import_room_state/4:
+      # we're still not resident, just recording our own rejection so it
+      # shows up in our own /sync.
+      MembershipHandshake.insert_event(leave_event, room_version)
     end
-  end
-
-  defp build_and_sign_leave(template, user_id, room_version) do
-    leave_event =
-      template
-      |> Map.put("sender", user_id)
-      |> Map.put("state_key", user_id)
-      |> Map.update("content", %{"membership" => "leave"}, &Map.put(&1, "membership", "leave"))
-      |> Map.put("origin", KeyServer.server_name())
-      |> Map.put("origin_server_ts", System.os_time(:millisecond))
-
-    content_hash = EventHash.content_hash(leave_event)
-    leave_event = Map.put(leave_event, "hashes", %{"sha256" => content_hash})
-    signed = KeyServer.sign_event(leave_event, room_version)
-    event_id = EventHash.reference_hash(signed, room_version)
-    Map.put(signed, "event_id", event_id)
-  end
-
-  defp send_leave(server, room_id, leave_event) do
-    event_id = leave_event["event_id"]
-    path = "/_matrix/federation/v2/send_leave/#{URI.encode(room_id)}/#{URI.encode(event_id)}"
-    HttpClient.put(server, path, leave_event)
   end
 end

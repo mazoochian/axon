@@ -38,7 +38,7 @@ defmodule AxonCrypto.Redaction do
   | 6–7      | membership                 | creator         | join_rule         | —                    | —                      |
   | 8        | membership                 | creator         | join_rule, allow  | —                    | —                      |
   | 9–10     | + join_authorised_via_...  | creator         | join_rule, allow  | —                    | —                      |
-  | 11+      | + join_authorised_via_...  | *all fields*    | join_rule, allow  | invite               | `m.room.redaction`     |
+  | 11+      | + third_party_invite.signed | *all fields*   | join_rule, allow  | invite               | `m.room.redaction`     |
   """
 
   @v1_top_level ~w(
@@ -79,7 +79,16 @@ defmodule AxonCrypto.Redaction do
         do: ["membership"],
         else: ["membership", "join_authorised_via_users_server"]
 
-    Map.take(content, keep)
+    redacted = Map.take(content, keep)
+
+    # v11+ also keeps `third_party_invite.signed` (MSC3821).
+    case content["third_party_invite"] do
+      %{"signed" => signed} when v not in ~w(1 2 3 4 5 6 7 8 9 10) ->
+        Map.put(redacted, "third_party_invite", %{"signed" => signed})
+
+      _ ->
+        redacted
+    end
   end
 
   # From v11 the create event keeps its entire content (MSC2176).
@@ -94,7 +103,11 @@ defmodule AxonCrypto.Redaction do
   end
 
   defp redact_content("m.room.power_levels", content, v) do
-    keep = if v in ~w(1 2 3 4 5 6 7 8 9 10), do: @base_power_levels, else: @base_power_levels ++ ["invite"]
+    keep =
+      if v in ~w(1 2 3 4 5 6 7 8 9 10),
+        do: @base_power_levels,
+        else: @base_power_levels ++ ["invite"]
+
     Map.take(content, keep)
   end
 

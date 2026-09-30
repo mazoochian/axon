@@ -36,7 +36,9 @@ defmodule AxonCrypto.RedactionTest do
   end
 
   test "an ordinary message loses its whole content" do
-    redacted = Redaction.redact(event("m.room.message", %{"body" => "hi", "msgtype" => "m.text"}), "11")
+    redacted =
+      Redaction.redact(event("m.room.message", %{"body" => "hi", "msgtype" => "m.text"}), "11")
+
     assert redacted["content"] == %{}
   end
 
@@ -54,21 +56,18 @@ defmodule AxonCrypto.RedactionTest do
            }
   end
 
-  test "m.room.member does NOT keep third_party_invite" do
-    # The spec text for recent room versions mentions preserving
-    # `third_party_invite.signed`, but gomatrixserverlib — the de-facto
-    # interop target, and what Complement signs with — does not implement it
-    # in any of its five content keep-lists. Matching the reference here is
-    # what makes signatures agree with real peers; diverging would reintroduce
-    # exactly the class of self-consistent-but-incompatible bug this module
-    # exists to fix. Deliberate divergence from the spec text, recorded here
-    # rather than silently.
+  test "m.room.member keeps third_party_invite.signed from v11 only (MSC3821)" do
     content = %{
       "membership" => "invite",
       "third_party_invite" => %{"display_name" => "bob", "signed" => %{"token" => "t"}}
     }
 
     assert Redaction.redact(event("m.room.member", content), "11")["content"] == %{
+             "membership" => "invite",
+             "third_party_invite" => %{"signed" => %{"token" => "t"}}
+           }
+
+    assert Redaction.redact(event("m.room.member", content), "10")["content"] == %{
              "membership" => "invite"
            }
   end
@@ -77,6 +76,7 @@ defmodule AxonCrypto.RedactionTest do
     content = %{"membership" => "join", "join_authorised_via_users_server" => "@auth:other"}
 
     assert Redaction.redact(event("m.room.member", content), "9")["content"] == content
+
     assert Redaction.redact(event("m.room.member", content), "8")["content"] == %{
              "membership" => "join"
            }
@@ -86,6 +86,7 @@ defmodule AxonCrypto.RedactionTest do
     content = %{"join_rule" => "restricted", "allow" => [%{"type" => "m.room_membership"}]}
 
     assert Redaction.redact(event("m.room.join_rules", content), "8")["content"] == content
+
     assert Redaction.redact(event("m.room.join_rules", content), "7")["content"] == %{
              "join_rule" => "restricted"
            }
@@ -95,6 +96,7 @@ defmodule AxonCrypto.RedactionTest do
     content = %{"invite" => 50, "kick" => 50}
 
     assert Redaction.redact(event("m.room.power_levels", content), "11")["content"] == content
+
     assert Redaction.redact(event("m.room.power_levels", content), "10")["content"] == %{
              "kick" => 50
            }
@@ -129,7 +131,11 @@ defmodule AxonCrypto.RedactionTest do
   end
 
   test "m.room.join_rules keeps join_rule and the restricted allow list" do
-    content = %{"join_rule" => "restricted", "allow" => [%{"type" => "m.room_membership"}], "x" => 1}
+    content = %{
+      "join_rule" => "restricted",
+      "allow" => [%{"type" => "m.room_membership"}],
+      "x" => 1
+    }
 
     assert Redaction.redact(event("m.room.join_rules", content), "11")["content"] == %{
              "join_rule" => "restricted",
@@ -142,10 +148,11 @@ defmodule AxonCrypto.RedactionTest do
       content = %{"creator" => "@a:x", "room_version" => "11", "extra" => true}
 
       assert Redaction.redact(event("m.room.create", content), "11")["content"] == content
-      assert Redaction.redact(event("m.room.create", content), "10")["content"] == %{"creator" => "@a:x"}
+
+      assert Redaction.redact(event("m.room.create", content), "10")["content"] == %{
+               "creator" => "@a:x"
+             }
     end
-
-
 
     test "m.room.redaction keeps content.redacts from v11 only" do
       content = %{"redacts" => "$target", "reason" => "spam"}

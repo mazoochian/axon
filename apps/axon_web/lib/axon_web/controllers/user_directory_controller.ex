@@ -2,18 +2,19 @@ defmodule AxonWeb.UserDirectoryController do
   use Phoenix.Controller, formats: [:json]
 
   import Ecto.Query
+  import AxonCore.MapUtil, only: [maybe_put: 3]
   alias AxonCore.Repo
 
   def search(conn, params) do
-    term = params["search_term"] || ""
-    limit = min(params["limit"] || 10, 50)
+    term = if is_binary(params["search_term"]), do: params["search_term"], else: ""
+    limit = AxonWeb.Params.int(params["limit"], 10, 0, 50)
     requester = conn.assigns.current_user_id
 
     {results, limited?} =
       if String.length(term) < 1 do
         {[], false}
       else
-        pattern = "%#{String.downcase(term)}%"
+        pattern = "%#{term |> String.downcase() |> escape_like()}%"
 
         candidates =
           from(candidate in "room_memberships",
@@ -66,6 +67,5 @@ defmodule AxonWeb.UserDirectoryController do
     json(conn, %{"results" => results, "limited" => limited?})
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, val), do: Map.put(map, key, val)
+  defp escape_like(term), do: String.replace(term, ["\\", "%", "_"], &("\\" <> &1))
 end

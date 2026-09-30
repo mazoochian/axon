@@ -34,7 +34,7 @@ defmodule AxonWeb.NotificationsController do
     {rows, next_token} =
       Notifications.list(user_id,
         from: params["from"],
-        limit: parse_limit(params["limit"]),
+        limit: AxonWeb.Params.int(params["limit"], 20, 1, 100),
         only: params["only"]
       )
 
@@ -58,15 +58,6 @@ defmodule AxonWeb.NotificationsController do
     resp = if next_token, do: Map.put(resp, "next_token", next_token), else: resp
 
     json(conn, resp)
-  end
-
-  defp parse_limit(nil), do: nil
-
-  defp parse_limit(limit_param) do
-    case Integer.parse(limit_param) do
-      {n, _} -> n
-      :error -> nil
-    end
   end
 
   defp build_receipt_cache(rows, user_id) do

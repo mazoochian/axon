@@ -76,6 +76,11 @@ defmodule AxonWeb.TimestampToEventTest do
     FakeRemoteMatrixServer.sign_event(port, Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
   end
 
+  defp signed_remote_pdu(port, room_id, fields) do
+    pdu = signed_remote_event(port, Map.put(fields, "room_id", room_id))
+    {AxonCrypto.EventHash.reference_hash(pdu, EventStore.get_room_version(room_id)), pdu}
+  end
+
   defp remote_user(port, prefix),
     do:
       "@#{prefix}_#{System.unique_integer([:positive])}:#{FakeRemoteMatrixServer.server_name(port)}"
@@ -204,6 +209,7 @@ defmodule AxonWeb.TimestampToEventTest do
       # or imported history looks like. Direction then has to be resolved by
       # stream_ordering alone.
       shared_ts = 1_500_000_000_000
+
       AxonCore.Repo.update_all(
         from(e in "events", where: e.room_id == ^room_id),
         set: [origin_server_ts: shared_ts]
@@ -300,12 +306,9 @@ defmodule AxonWeb.TimestampToEventTest do
     test "finds an event via federation that the local server never held, and backfills it so /context works afterwards",
          %{alice: alice, room_id: room_id, bob: bob} do
       old_ts = 1_000
-      imported_event_id = "$imported_#{unique()}"
 
-      pdu =
-        signed_remote_event(@port, %{
-          "event_id" => imported_event_id,
-          "room_id" => room_id,
+      {imported_event_id, pdu} =
+        signed_remote_pdu(@port, room_id, %{
           "type" => "m.room.message",
           # sender must be an already-joined member (bob) — AuthRules
           # rejects a message from anyone else, same as a live PDU would.
@@ -501,13 +504,10 @@ defmodule AxonWeb.TimestampToEventTest do
       # root-caused bug at the EventStore.find_event_by_timestamp/3 level;
       # only the earliest-known-event heuristic added to timestamp_answer/3
       # keeps it from being handed back unconditionally the way it used to.
-      federation_event_id = "$federation_answer_#{unique()}"
       federation_ts = 1
 
-      pdu =
-        signed_remote_event(@port, %{
-          "event_id" => federation_event_id,
-          "room_id" => room_id,
+      {federation_event_id, pdu} =
+        signed_remote_pdu(@port, room_id, %{
           "type" => "m.room.message",
           "sender" => bob,
           "content" => %{"msgtype" => "m.text", "body" => "genuinely the earliest"},

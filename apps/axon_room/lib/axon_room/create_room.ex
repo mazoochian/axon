@@ -2,7 +2,7 @@ defmodule AxonRoom.CreateRoom do
   @moduledoc "Executes the room creation sequence."
 
   alias AxonCore.EventStore
-  alias AxonRoom.{EventBuilder, RoomProcess}
+  alias AxonRoom.{AuthRules, EventBuilder, RoomProcess, RoomVersions}
 
   @default_version "11"
 
@@ -343,8 +343,9 @@ defmodule AxonRoom.CreateRoom do
   end
 
   @doc "Whether `v` is a supported room version string."
-  def check_version_supported(v) when v in ~w(2 3 4 5 6 7 8 9 10 11 12), do: :ok
-  def check_version_supported(_), do: {:error, :unsupported_room_version}
+  def check_version_supported(v) do
+    if RoomVersions.supported?(v), do: :ok, else: {:error, :unsupported_room_version}
+  end
 
   # ---------------------------------------------------------------------------
   # Room v12 bootstrap: room IDs are the create event's own event ID (with
@@ -407,32 +408,10 @@ defmodule AxonRoom.CreateRoom do
 
   @doc "Whether `list` is a non-empty array of well-formed user ID strings (room v12 additional_creators)."
   def valid_additional_creators?(list) when is_list(list) and list != [] do
-    Enum.all?(list, &valid_user_id?/1)
+    Enum.all?(list, &AuthRules.valid_user_id?/1)
   end
 
   def valid_additional_creators?(_), do: false
-
-  # Server-name grammar is intentionally conservative here (registered
-  # hostname / IPv4 literal + optional ":port"; no IPv6-bracket support) —
-  # good enough to catch garbage like "dom$ain$.com" without trying to be a
-  # full RFC 1035/3986 validator. Kept in sync by hand with the equivalent
-  # check in AxonRoom.AuthRules.valid_user_id?/1 (which re-validates every
-  # additional_creators entry independently when the create event is
-  # auth-checked, so this copy diverging would not be exploitable
-  # end-to-end — but should still be fixed/deduplicated together).
-  @server_name_regex ~r/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*(?::[0-9]{1,5})?$/
-
-  defp valid_user_id?(id) when is_binary(id) do
-    case String.split(id, ":", parts: 2) do
-      ["@" <> localpart, domain] ->
-        localpart != "" and domain != "" and Regex.match?(@server_name_regex, domain)
-
-      _ ->
-        false
-    end
-  end
-
-  defp valid_user_id?(_), do: false
 
   # v12, no explicit room_id override: build+hash the create event standalone
   # to derive the room_id. Explicit room_id (v12 room upgrades — see

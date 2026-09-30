@@ -38,14 +38,11 @@ defmodule AxonWeb.AccountDataController do
   @doc """
   Updates user's account data (user ID and type)
   """
-  def put(conn, %{"user_id" => user_id, "type" => type} = params) do
+  def put(conn, %{"user_id" => user_id, "type" => type}) do
     requester = conn.assigns.current_user_id
 
-    if user_id != requester do
-      {:error, :forbidden}
-    else
-      content = Map.drop(params, ~w(user_id type))
-
+    with :ok <- if(user_id == requester, do: :ok, else: {:error, :forbidden}),
+         {:ok, content} <- body_object(conn) do
       Repo.insert_all(
         "account_data",
         [
@@ -98,14 +95,11 @@ defmodule AxonWeb.AccountDataController do
   @doc """
   Update user's local room account data
   """
-  def put_room(conn, %{"user_id" => user_id, "room_id" => room_id, "type" => type} = params) do
+  def put_room(conn, %{"user_id" => user_id, "room_id" => room_id, "type" => type}) do
     requester = conn.assigns.current_user_id
 
-    if user_id != requester do
-      {:error, :forbidden}
-    else
-      content = Map.drop(params, ~w(user_id room_id type))
-
+    with :ok <- if(user_id == requester, do: :ok, else: {:error, :forbidden}),
+         {:ok, content} <- body_object(conn) do
       Repo.insert_all(
         "room_account_data",
         [
@@ -121,6 +115,13 @@ defmodule AxonWeb.AccountDataController do
       )
 
       json(conn, %{})
+    end
+  end
+
+  defp body_object(conn) do
+    case AxonWeb.JsonBody.object(conn) do
+      {:ok, content} -> {:ok, content}
+      :error -> AxonWeb.JsonBody.not_object(conn)
     end
   end
 end

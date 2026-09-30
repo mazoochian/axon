@@ -22,6 +22,7 @@ defmodule AxonFederation.BackfillTest do
   use AxonFederation.DataCase, async: false
 
   alias AxonCore.UserStore
+  alias AxonCrypto.EventHash
   alias AxonFederation.{Backfill, FakeRemoteMatrixServer}
   alias AxonRoom.{CreateRoom, RoomProcess}
 
@@ -106,11 +107,8 @@ defmodule AxonFederation.BackfillTest do
   test "a gap fully closed by get_missing_events does not also hit /backfill", %{
     room_id: room_id
   } do
-    missing_prev_id = "$never-sent-#{System.unique_integer([:positive])}"
-
     gap_filler =
       FakeRemoteMatrixServer.sign_event(@port, %{
-        "event_id" => missing_prev_id,
         "room_id" => room_id,
         "type" => "m.room.message",
         "sender" => "@ghost:#{@server_name}",
@@ -122,6 +120,8 @@ defmodule AxonFederation.BackfillTest do
         "prev_events" => [],
         "hashes" => %{"sha256" => "x"}
       })
+
+    missing_prev_id = EventHash.reference_hash(gap_filler, "11")
 
     FakeRemoteMatrixServer.put_response(
       @port,
@@ -147,5 +147,84 @@ defmodule AxonFederation.BackfillTest do
     # And the fetched event actually landed (stored, even if rejected —
     # the point here is just that catch_up didn't bail out early).
     assert {:ok, _} = AxonCore.EventStore.get_event(missing_prev_id)
+  end
+
+  describe "fetch_and_apply_event/3" do
+    defp signed_message(room_id) do
+      FakeRemoteMatrixServer.sign_event(@port, %{
+        "room_id" => room_id,
+        "type" => "m.room.message",
+        "sender" => "@ghost:#{@server_name}",
+        "content" => %{"body" => "fetched"},
+        "depth" => 1,
+        "origin_server_ts" => System.os_time(:millisecond),
+        "auth_events" => [],
+        "prev_events" => [],
+        "hashes" => %{"sha256" => "x"}
+      })
+    end
+
+    defp other_room do
+      {:ok, %{user_id: user}} =
+        UserStore.register("other_#{System.unique_integer([:positive])}", "Test1234!",
+          server_name: "localhost"
+        )
+
+      {:ok, room_id} = CreateRoom.execute(user, server_name: "localhost")
+      room_id
+    end
+
+    defp serve_event(pdu) do
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"GET", ~r{^/_matrix/federation/v1/event/}},
+        200,
+        %{"pdus" => [pdu]}
+      )
+    end
+
+    test "an event from another room is refused", %{room_id: room_id} do
+      other_room = other_room()
+
+      pdu = signed_message(other_room)
+      serve_event(pdu)
+      event_id = EventHash.reference_hash(pdu, "11")
+
+      assert Backfill.fetch_and_apply_event(room_id, @server_name, event_id) ==
+               {:error, :wrong_room}
+
+      assert {:error, :not_found} = AxonCore.EventStore.get_event(event_id)
+    end
+
+    test "an event whose content doesn't hash to the requested id is refused", %{
+      room_id: room_id
+    } do
+      serve_event(signed_message(room_id))
+
+      assert Backfill.fetch_and_apply_event(room_id, @server_name, "$some-other-event") ==
+               {:error, :event_id_mismatch}
+    end
+
+    test "backfilled events for another room are dropped, not applied", %{room_id: room_id} do
+      other_room = other_room()
+
+      foreign = signed_message(other_room)
+
+      FakeRemoteMatrixServer.put_response(
+        @port,
+        {"POST", ~r{^/_matrix/federation/v1/get_missing_events/}},
+        200,
+        %{"events" => [foreign]}
+      )
+
+      Backfill.catch_up(room_id, @server_name, %{
+        "event_id" => "$incoming_#{System.unique_integer([:positive])}",
+        "room_id" => room_id,
+        "prev_events" => ["$never-sent-#{System.unique_integer([:positive])}"]
+      })
+
+      assert {:error, :not_found} =
+               AxonCore.EventStore.get_event(EventHash.reference_hash(foreign, "11"))
+    end
   end
 end

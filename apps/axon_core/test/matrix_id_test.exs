@@ -21,6 +21,7 @@ defmodule AxonCore.MatrixIdTest do
 
     test "server name with an explicit port keeps the port" do
       assert MatrixId.server_name("@alice:example.com:8448") == "example.com:8448"
+
       assert MatrixId.server_name("@charlie:host.docker.internal:41491") ==
                "host.docker.internal:41491"
     end
@@ -57,6 +58,27 @@ defmodule AxonCore.MatrixIdTest do
 
     test "an ID with no server part belongs to nobody" do
       refute MatrixId.from_server?("!hashonly", "example.com")
+    end
+  end
+
+  describe "trailing newlines" do
+    test "are rejected by the localpart and server-name validators" do
+      refute MatrixId.valid_localpart?("alice\n")
+      refute MatrixId.valid_server_name?("example.com\n")
+      refute MatrixId.valid_server_name?("example.com:8448\n")
+    end
+  end
+
+  describe "valid_room_id?/1" do
+    test "accepts server-scoped and v12 hash-only room IDs" do
+      assert MatrixId.valid_room_id?("!abc:example.com:8448")
+      assert MatrixId.valid_room_id?("!aBcD1234hashonly")
+    end
+
+    test "rejects malformed room IDs" do
+      for id <- ["!", "!:example.com", "!abc:", "!abc:bad:port", "@abc:example.com", nil] do
+        refute MatrixId.valid_room_id?(id), "expected #{inspect(id)} to be invalid"
+      end
     end
   end
 end

@@ -54,13 +54,21 @@ defmodule AxonRoom.StateResV2 do
   Resolves a list of state sets into a single resolved state.
 
   `get_event_fn` fetches an event map by event_id (returns nil if not found).
+  `get_events_fn`, when given, fetches many at once (`[id] -> %{id => event}`)
+  and is preferred for loading the auth closure; each event is fetched at
+  most once per call either way.
   """
-  @spec resolve([state_set()], (String.t() -> event_map() | nil), String.t()) :: state_set()
-  def resolve(state_sets, get_event_fn, room_version \\ "11")
-  def resolve([], _, _), do: %{}
-  def resolve([single], _, _), do: single
+  @spec resolve(
+          [state_set()],
+          (String.t() -> event_map() | nil),
+          String.t(),
+          ([String.t()] -> %{String.t() => event_map()}) | nil
+        ) :: state_set()
+  def resolve(state_sets, get_event_fn, room_version \\ "11", get_events_fn \\ nil)
+  def resolve([], _, _, _), do: %{}
+  def resolve([single], _, _, _), do: single
 
-  def resolve(state_sets, get_event_fn, room_version) do
+  def resolve(state_sets, get_event_fn, room_version, get_events_fn) do
     all_keys =
       state_sets
       |> Enum.flat_map(&Map.keys/1)
@@ -100,19 +108,26 @@ defmodule AxonRoom.StateResV2 do
       conflicted_list = MapSet.to_list(conflicted_events)
       conflicted_ids = MapSet.new(conflicted_list, & &1["event_id"])
 
+      events =
+        load_auth_closure(
+          conflicted_list ++ Map.values(unconflicted),
+          get_events_fn || fetch_each(get_event_fn)
+        )
+
+      get_event_fn = &Map.get(events, &1)
+
       # Auth chains of conflicted events (excluding the conflicted events themselves)
       conflicted_chain =
         conflicted_list
-        |> Enum.flat_map(&auth_chain(&1, get_event_fn))
-        |> Enum.uniq_by(& &1["event_id"])
+        |> auth_chain(get_event_fn)
         |> Enum.reject(&MapSet.member?(conflicted_ids, &1["event_id"]))
 
       # Auth chain IDs of unconflicted state (to subtract from auth_diff)
       unconflicted_chain_ids =
         unconflicted
         |> Map.values()
-        |> Enum.flat_map(&auth_chain_ids(&1, get_event_fn))
-        |> MapSet.new()
+        |> auth_chain(get_event_fn)
+        |> MapSet.new(& &1["event_id"])
 
       auth_diff =
         Enum.reject(conflicted_chain, &MapSet.member?(unconflicted_chain_ids, &1["event_id"]))
@@ -183,25 +198,57 @@ defmodule AxonRoom.StateResV2 do
   # Auth chain traversal
   # ---------------------------------------------------------------------------
 
-  defp auth_chain(event, get_event_fn, visited \\ MapSet.new()) do
-    auth_ids = event["auth_events"] || []
-
-    Enum.flat_map(auth_ids, fn auth_id ->
-      if MapSet.member?(visited, auth_id) do
-        []
-      else
-        case get_event_fn.(auth_id) do
-          nil -> []
-          ae -> [ae | auth_chain(ae, get_event_fn, MapSet.put(visited, auth_id))]
-        end
-      end
-    end)
+  # Breadth-first load of every event reachable through auth_events from
+  # `roots`, each id fetched at most once (one batch per BFS level).
+  defp load_auth_closure(roots, get_events_fn) do
+    load_auth_level(auth_ids_of(roots), MapSet.new(), %{}, get_events_fn)
   end
 
-  defp auth_chain_ids(event, get_event_fn) do
-    event
-    |> auth_chain(get_event_fn)
-    |> Enum.map(& &1["event_id"])
+  defp load_auth_level([], _seen, acc, _get_events_fn), do: acc
+
+  defp load_auth_level(ids, seen, acc, get_events_fn) do
+    frontier = ids |> Enum.uniq() |> Enum.reject(&MapSet.member?(seen, &1))
+    seen = Enum.reduce(frontier, seen, &MapSet.put(&2, &1))
+    fetched = if frontier == [], do: %{}, else: get_events_fn.(frontier)
+
+    load_auth_level(
+      auth_ids_of(Map.values(fetched)),
+      seen,
+      Map.merge(acc, fetched),
+      get_events_fn
+    )
+  end
+
+  defp auth_ids_of(events), do: Enum.flat_map(events, &(&1["auth_events"] || []))
+
+  defp fetch_each(get_event_fn) do
+    fn ids ->
+      for id <- ids, event <- [get_event_fn.(id)], event != nil, into: %{}, do: {id, event}
+    end
+  end
+
+  # Every distinct auth ancestor of `roots`, in depth-first pre-order of
+  # first discovery, each visited once.
+  defp auth_chain(roots, get_event_fn) do
+    roots
+    |> auth_ids_of()
+    |> walk_auth_chain(get_event_fn, MapSet.new(), [])
+  end
+
+  defp walk_auth_chain([], _get_event_fn, _visited, acc), do: Enum.reverse(acc)
+
+  defp walk_auth_chain([id | rest], get_event_fn, visited, acc) do
+    with false <- MapSet.member?(visited, id),
+         %{} = event <- get_event_fn.(id) do
+      walk_auth_chain(
+        (event["auth_events"] || []) ++ rest,
+        get_event_fn,
+        MapSet.put(visited, id),
+        [event | acc]
+      )
+    else
+      _ -> walk_auth_chain(rest, get_event_fn, visited, acc)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -288,20 +335,14 @@ defmodule AxonRoom.StateResV2 do
       |> Enum.with_index()
       |> Map.new(fn {ev, i} -> {ev["event_id"], i} end)
 
-    # Pre-compute mainline position for each event.
     # Mainline position = smallest index in mainline_index that appears in the
     # event's auth chain (including the event itself if it's a PL event).
-    get_ml_pos = fn event ->
-      chain = [event | auth_chain(event, get_event_fn)]
+    {positions, _memo} =
+      Enum.map_reduce(events, %{}, fn event, memo ->
+        mainline_position(event, mainline_index, length(mainline), get_event_fn, memo)
+      end)
 
-      chain
-      |> Enum.filter(&(&1["type"] == "m.room.power_levels"))
-      |> Enum.map(&Map.get(mainline_index, &1["event_id"], length(mainline)))
-      |> case do
-        [] -> length(mainline)
-        positions -> Enum.min(positions)
-      end
-    end
+    ml_pos = events |> Enum.zip(positions) |> Map.new(fn {ev, pos} -> {ev["event_id"], pos} end)
 
     # Sort key: power level events come last (is_pl=1 > 0), then by mainline
     # position ascending (lower = closer to current PL = process later but rank
@@ -324,10 +365,47 @@ defmodule AxonRoom.StateResV2 do
     # of a one-hop peek — hit it immediately.
     Enum.sort_by(events, fn event ->
       is_pl = if event["type"] == "m.room.power_levels", do: 1, else: 0
-      ml_pos = get_ml_pos.(event)
       depth = event["depth"] || 0
-      {is_pl, ml_pos, depth, event["event_id"] || ""}
+      {is_pl, Map.fetch!(ml_pos, event["event_id"]), depth, event["event_id"] || ""}
     end)
+  end
+
+  # Memoized over auth_events so each ancestor is visited once per resolve.
+  # An auth_events cycle (only possible with adversarial room v1/v2 ids)
+  # contributes nothing for the edge that closes it.
+  defp mainline_position(event, mainline_index, none, get_event_fn, memo) do
+    id = event["event_id"]
+
+    case Map.fetch(memo, id) do
+      {:ok, :pending} ->
+        {none, memo}
+
+      {:ok, pos} ->
+        {pos, memo}
+
+      :error ->
+        own =
+          if event["type"] == "m.room.power_levels",
+            do: Map.get(mainline_index, id, none),
+            else: none
+
+        {pos, memo} =
+          (event["auth_events"] || [])
+          |> Enum.reduce({own, Map.put(memo, id, :pending)}, fn auth_id, {best, memo} ->
+            case get_event_fn.(auth_id) do
+              nil ->
+                {best, memo}
+
+              parent ->
+                {pos, memo} =
+                  mainline_position(parent, mainline_index, none, get_event_fn, memo)
+
+                {min(best, pos), memo}
+            end
+          end)
+
+        {pos, Map.put(memo, id, pos)}
+    end
   end
 
   defp build_mainline(pl_events, get_event_fn) do

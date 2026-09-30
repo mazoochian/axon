@@ -12,13 +12,30 @@ defmodule AxonPush.Dispatcher do
   require Logger
 
   import Ecto.Query
-  alias AxonCore.Repo
+  alias AxonCore.{NetworkAddress, Repo}
   alias AxonPush.{Notifications, RuleEvaluator, UserRules}
 
   @doc "Called after an event is persisted. Runs in a Task so it never blocks RoomProcess."
   def dispatch_event(event, room_id) do
     Task.Supervisor.start_child(AxonPush.TaskSupervisor, fn -> do_dispatch(event, room_id) end)
   end
+
+  @doc """
+  Whether `url` is an acceptable HTTP pusher URL: http(s) with the spec's
+  `/_matrix/push/v1/notify` path.
+  """
+  def valid_push_url?(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host, path: "/_matrix/push/v1/notify"}
+      when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  def valid_push_url?(_url), do: false
 
   # ---------------------------------------------------------------------------
   # Private
@@ -81,44 +98,82 @@ defmodule AxonPush.Dispatcher do
   end
 
   defp send_http_push(pusher, event, room_id, tweaks) do
-    push_url = get_in(pusher.data, ["url"]) || get_in(pusher.data, [:url])
+    data = pusher.data || %{}
+    push_url = data["url"]
 
-    if is_nil(push_url) do
-      Logger.warning("Pusher #{pusher.app_id}/#{pusher.pushkey} has no url in data")
+    case check_push_url(push_url) do
+      :ok ->
+        payload =
+          Jason.encode!(%{"notification" => notification(pusher, data, event, room_id, tweaks)})
+
+        req = Finch.build(:post, push_url, [{"content-type", "application/json"}], payload)
+
+        case Finch.request(req, Axon.Finch, receive_timeout: 10_000) do
+          {:ok, %Finch.Response{status: status}} when status in 200..299 ->
+            :ok
+
+          {:ok, %Finch.Response{status: status}} ->
+            Logger.warning("Push gateway #{push_url} returned #{status}")
+
+          {:error, reason} ->
+            Logger.warning("Push to #{push_url} failed: #{inspect(reason)}")
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "Not pushing to #{pusher.app_id}/#{pusher.pushkey} url #{inspect(push_url)}: #{reason}"
+        )
+    end
+  end
+
+  defp notification(pusher, data, event, room_id, tweaks) do
+    prio =
+      if (event["type"] == "m.room.encrypted" or tweaks["highlight"]) || tweaks["sound"],
+        do: "high",
+        else: "low"
+
+    base = %{
+      "event_id" => event["event_id"],
+      "room_id" => room_id,
+      "counts" => %{"unread" => 1},
+      "prio" => prio,
+      "devices" => [
+        %{
+          "app_id" => pusher.app_id,
+          "pushkey" => pusher.pushkey,
+          "pushkey_ts" => 0,
+          "data" => Map.delete(data, "url"),
+          "tweaks" => tweaks
+        }
+      ]
+    }
+
+    if data["format"] == "event_id_only" do
+      base
     else
-      payload =
-        Jason.encode!(%{
-          "notification" => %{
-            "event_id" => event["event_id"],
-            "room_id" => room_id,
-            "type" => event["type"],
-            "sender" => event["sender"],
-            "content" => event["content"] || %{},
-            "counts" => %{"unread" => 1},
-            "devices" => [
-              %{
-                "app_id" => pusher.app_id,
-                "pushkey" => pusher.pushkey,
-                "pushkey_ts" => 0,
-                "data" => %{},
-                "tweaks" => tweaks
-              }
-            ]
-          }
-        })
+      Map.merge(base, %{
+        "type" => event["type"],
+        "sender" => event["sender"],
+        "content" => event["content"] || %{}
+      })
+    end
+  end
 
-      req = Finch.build(:post, push_url, [{"content-type", "application/json"}], payload)
+  # `:axon_push, :allow_private_addresses` lifts the private-address block
+  # (test suites whose fake gateway listens on loopback).
+  defp check_push_url(url) do
+    cond do
+      not valid_push_url?(url) ->
+        {:error, "invalid push url"}
 
-      case Finch.request(req, Axon.Finch, receive_timeout: 10_000) do
-        {:ok, %Finch.Response{status: status}} when status in 200..299 ->
-          :ok
+      Application.get_env(:axon_push, :allow_private_addresses, false) ->
+        :ok
 
-        {:ok, %Finch.Response{status: status}} ->
-          Logger.warning("Push gateway #{push_url} returned #{status}")
-
-        {:error, reason} ->
-          Logger.warning("Push to #{push_url} failed: #{inspect(reason)}")
-      end
+      true ->
+        case NetworkAddress.check(URI.parse(url).host) do
+          {:ok, _addresses} -> :ok
+          {:error, _} -> {:error, "blocked address"}
+        end
     end
   end
 end

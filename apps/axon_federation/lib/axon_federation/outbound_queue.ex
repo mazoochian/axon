@@ -129,10 +129,15 @@ defmodule AxonFederation.OutboundQueue do
   def handle_info(_msg, state), do: {:noreply, state}
 
   defp sweep(state) do
+    # Destinations behind an open circuit are left out of the query itself
+    # so their rows can't fill the batch and starve everyone else.
     due_rows =
       Repo.all(
         from(t in "federation_outbound_transactions",
-          where: t.next_attempt_at <= ^DateTime.utc_now(),
+          where:
+            t.next_attempt_at <= ^DateTime.utc_now() and
+              t.destination not in ^open_circuit_destinations(),
+          order_by: [asc: t.next_attempt_at, asc: t.id],
           select: %{id: t.id, destination: t.destination},
           limit: ^@sweep_batch_size
         )
@@ -286,6 +291,14 @@ defmodule AxonFederation.OutboundQueue do
     end
   end
 
+  defp open_circuit_destinations do
+    now = System.monotonic_time(:millisecond)
+
+    :ets.select(@concurrency_table, [
+      {{{:circuit_open_until, :"$1"}, :"$2"}, [{:>, :"$2", now}], [:"$1"]}
+    ])
+  end
+
   defp record_failure(destination) do
     count =
       :ets.update_counter(
@@ -302,7 +315,8 @@ defmodule AxonFederation.OutboundQueue do
     end
   end
 
-  defp reset_circuit(destination) do
+  @doc false
+  def reset_circuit(destination) do
     :ets.insert(@concurrency_table, {{:failures, destination}, 0})
     :ets.delete(@concurrency_table, {:circuit_open_until, destination})
   end

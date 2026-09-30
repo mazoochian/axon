@@ -53,6 +53,16 @@ defmodule AxonWeb.AdminControllerTest do
       assert Enum.any?(body["users"], &(&1["name"] == admin.user_id))
     end
 
+    test "malformed or out-of-range paging params don't crash", %{admin: admin} do
+      for query <- ["from=abc", "limit=xyz", "from=-4&limit=-1", "limit=0"] do
+        conn = authed(admin.token) |> get("/_synapse/admin/v1/users?#{query}")
+        assert conn.status == 200
+      end
+
+      assert authed(admin.token) |> get("/_synapse/admin/v1/rooms?limit=-1") |> Map.get(:status) ==
+               200
+    end
+
     test "get_user returns a single user's details", %{admin: admin} do
       alice = register("admin_getuser_#{System.unique_integer([:positive])}")
       conn = authed(admin.token) |> get("/_synapse/admin/v1/users/#{alice.user_id}")

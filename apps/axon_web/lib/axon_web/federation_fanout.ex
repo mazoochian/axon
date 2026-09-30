@@ -12,6 +12,8 @@ defmodule AxonWeb.FederationFanout do
 
   use GenServer
 
+  import AxonCore.MapUtil, only: [maybe_put: 3]
+
   alias AxonCore.EventStore
   alias AxonCrypto.KeyServer
   alias AxonFederation.OutboundQueue
@@ -30,67 +32,48 @@ defmodule AxonWeb.FederationFanout do
 
   @impl true
   def handle_info({:federate_event, event_map, remote_servers}, state) do
-    guarded(fn ->
-      origin = KeyServer.server_name()
-
-      Enum.each(remote_servers, fn server ->
-        OutboundQueue.enqueue(server, %{
-          "origin" => origin,
-          "origin_server_ts" => System.os_time(:millisecond),
-          "pdus" => [event_map]
-        })
-      end)
-    end)
-
+    guarded(fn -> Enum.each(remote_servers, &enqueue(&1, [event_map], nil)) end)
     {:noreply, state}
   end
 
   @impl true
   def handle_info({:federate_edu, edu, destination_server}, state) do
-    guarded(fn ->
-      origin = KeyServer.server_name()
-
-      OutboundQueue.enqueue(destination_server, %{
-        "origin" => origin,
-        "origin_server_ts" => System.os_time(:millisecond),
-        "pdus" => [],
-        "edus" => [edu]
-      })
-    end)
-
+    guarded(fn -> enqueue(destination_server, [], [edu]) end)
     {:noreply, state}
   end
 
   @impl true
   def handle_info({:presence_changed, user_id, presence_map}, state) do
     guarded(fn ->
-      origin = KeyServer.server_name()
+      edu = %{
+        "edu_type" => "m.presence",
+        "content" => %{"push" => [Map.put(presence_map, "user_id", user_id)]}
+      }
 
-      case EventStore.remote_servers_for_user(user_id) do
-        [] ->
-          :ok
-
-        remote_servers ->
-          edu = %{
-            "edu_type" => "m.presence",
-            "content" => %{"push" => [Map.put(presence_map, "user_id", user_id)]}
-          }
-
-          Enum.each(remote_servers, fn server ->
-            OutboundQueue.enqueue(server, %{
-              "origin" => origin,
-              "origin_server_ts" => System.os_time(:millisecond),
-              "pdus" => [],
-              "edus" => [edu]
-            })
-          end)
-      end
+      user_id
+      |> EventStore.remote_servers_for_user()
+      |> Enum.each(&enqueue(&1, [], [edu]))
     end)
 
     {:noreply, state}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp enqueue(server, pdus, edus) do
+    OutboundQueue.enqueue(
+      server,
+      maybe_put(
+        %{
+          "origin" => KeyServer.server_name(),
+          "origin_server_ts" => System.os_time(:millisecond),
+          "pdus" => pdus
+        },
+        "edus",
+        edus
+      )
+    )
+  end
 
   # This GenServer subscribes to PubSub topics that other long-lived,
   # timer-driven processes (AxonSync.Presence, AxonRoom.RoomProcess) publish

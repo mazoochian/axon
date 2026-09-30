@@ -181,18 +181,23 @@ defmodule AxonRoom.RoomProcess do
     end
   end
 
-  defp send_untracked_event(sender, type, content, opts, state) do
-    room_ctx = %{
+  defp room_ctx(state) do
+    %{
       room_id: state.room_id,
       room_version: state.room_version,
       current_state: state.current_state,
       last_event_id: state.last_event_id,
       depth: state.depth
     }
+  end
 
-    event =
-      EventBuilder.build(sender, type, content, room_ctx, opts)
-      |> with_prev_content(Keyword.get(opts, :state_key), state.current_state)
+  defp build_event(sender, type, content, opts, state) do
+    EventBuilder.build(sender, type, content, room_ctx(state), opts)
+    |> with_prev_content(Keyword.get(opts, :state_key), state.current_state)
+  end
+
+  defp send_untracked_event(sender, type, content, opts, state) do
+    event = build_event(sender, type, content, opts, state)
 
     case duplicate_state_event(sender, event, state.current_state) do
       {:ok, existing_event_id} ->
@@ -240,17 +245,7 @@ defmodule AxonRoom.RoomProcess do
   end
 
   defp build_and_persist(sender, type, content, opts, state) do
-    room_ctx = %{
-      room_id: state.room_id,
-      room_version: state.room_version,
-      current_state: state.current_state,
-      last_event_id: state.last_event_id,
-      depth: state.depth
-    }
-
-    event =
-      EventBuilder.build(sender, type, content, room_ctx, opts)
-      |> with_prev_content(Keyword.get(opts, :state_key), state.current_state)
+    event = build_event(sender, type, content, opts, state)
 
     case duplicate_state_event(sender, event, state.current_state) do
       {:ok, event_id} ->
@@ -343,15 +338,7 @@ defmodule AxonRoom.RoomProcess do
       )
     end
 
-    # Push notifications (fire-and-forget)
-    AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
-    # AppService fanout via PubSub (avoids circular dep on axon_web)
-    Phoenix.PubSub.broadcast(
-      @pubsub,
-      "all_events",
-      {:new_event, state.room_id, event_map}
-    )
-
+    notify_push_and_appservices(state.room_id, event_map)
     {:reply, {:ok, persisted.event_id}, new_state}
   end
 
@@ -361,6 +348,12 @@ defmodule AxonRoom.RoomProcess do
     auth_event_ids = pdu["auth_events"] || []
 
     cond do
+      pdu["room_id"] != state.room_id ->
+        {:reply, {:error, :wrong_room}, state}
+
+      not is_binary(pdu["event_id"]) ->
+        {:reply, {:error, :missing_event_id}, state}
+
       # Soft-failure is a permanent, one-time determination (see
       # EventStore.insert_soft_failed_event/2) — if this exact event_id was
       # already soft-failed (a retried /send transaction, or the same event
@@ -505,14 +498,7 @@ defmodule AxonRoom.RoomProcess do
             )
         end
 
-        AxonPush.Dispatcher.dispatch_event(event_map, state.room_id)
-
-        Phoenix.PubSub.broadcast(
-          @pubsub,
-          "all_events",
-          {:new_event, state.room_id, event_map}
-        )
-
+        notify_push_and_appservices(state.room_id, event_map)
         {:reply, {:ok, event_map["event_id"]}, new_state}
 
       {:error, reason} ->
@@ -534,17 +520,7 @@ defmodule AxonRoom.RoomProcess do
     {:reply, {state.last_event_id, state.depth}, state}
   end
 
-  def handle_call(:get_room_ctx, _from, state) do
-    ctx = %{
-      room_id: state.room_id,
-      room_version: state.room_version,
-      last_event_id: state.last_event_id,
-      depth: state.depth,
-      current_state: state.current_state
-    }
-
-    {:reply, ctx, state}
-  end
+  def handle_call(:get_room_ctx, _from, state), do: {:reply, room_ctx(state), state}
 
   def handle_call(:get_state_map, _from, state) do
     {:reply, state.current_state, state}
@@ -597,12 +573,6 @@ defmodule AxonRoom.RoomProcess do
 
     {:reply, {:error, :soft_failed}, state}
   end
-
-  # See the soft-failure guard at the top of handle_call({:apply_remote_event,
-  # ...}) — nil event_id (shouldn't happen for a real wire PDU, but some
-  # test/internal callers build one without) can never already be stored,
-  # so short-circuits to false rather than querying.
-  defp already_soft_failed?(nil), do: false
 
   defp already_soft_failed?(event_id) do
     match?({:ok, %{soft_failed: true}}, EventStore.get_event(event_id))
@@ -777,6 +747,13 @@ defmodule AxonRoom.RoomProcess do
 
   defp broadcast(room_id, event_map) do
     Phoenix.PubSub.broadcast(@pubsub, "room:#{room_id}", {:new_event, room_id, event_map})
+  end
+
+  # Push notifications (fire-and-forget) and AppService fan-out via PubSub
+  # (avoids a circular dependency on axon_web).
+  defp notify_push_and_appservices(room_id, event_map) do
+    AxonPush.Dispatcher.dispatch_event(event_map, room_id)
+    Phoenix.PubSub.broadcast(@pubsub, "all_events", {:new_event, room_id, event_map})
   end
 
   # Shadow-banned users (admin API) get a normal 200 for every send — they

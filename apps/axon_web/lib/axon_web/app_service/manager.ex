@@ -25,6 +25,7 @@ defmodule AxonWeb.AppService.Manager do
 
   use GenServer
   require Logger
+  import AxonCore.MapUtil, only: [maybe_put: 3]
 
   @table :axon_appservices
 
@@ -37,32 +38,36 @@ defmodule AxonWeb.AppService.Manager do
   end
 
   @doc "Verify an as_token. Returns {:ok, registration} or :error."
-  def verify_as_token(token) do
-    result = list_registrations() |> Enum.find(fn r -> r["as_token"] == token end)
-    if result, do: {:ok, result}, else: :error
-  end
+  def verify_as_token(token), do: find_by_token("as_token", token)
 
   @doc "Verify an hs_token. Returns {:ok, registration} or :error."
-  def verify_hs_token(token) do
-    result = list_registrations() |> Enum.find(fn r -> r["hs_token"] == token end)
-    if result, do: {:ok, result}, else: :error
+  def verify_hs_token(token), do: find_by_token("hs_token", token)
+
+  defp find_by_token(field, token) when is_binary(token) do
+    list_registrations()
+    |> Enum.find(fn r -> is_binary(r[field]) and Plug.Crypto.secure_compare(r[field], token) end)
+    |> case do
+      nil -> :error
+      registration -> {:ok, registration}
+    end
   end
+
+  defp find_by_token(_field, _token), do: :error
 
   @doc """
   Whether `registration` is allowed to act as `user_id` — either its own
   `sender_localpart` user (always implicitly owned, regardless of
   namespace, per the AS spec) or a user matching one of its registered
-  `namespaces.users` regexes (impersonation via `?user_id=`).
+  `namespaces.users` regexes (impersonation via `?user_id=`). Only ever a
+  user on this server.
   """
   def owns_user?(registration, user_id) do
-    sender_user_id = "@#{registration["sender_localpart"]}:#{server_name()}"
-
-    user_id == sender_user_id or
-      (get_in(registration, ["namespaces", "users"]) || [])
-      |> Enum.any?(fn ns -> regex_match?(ns["regex"], user_id) end)
+    AxonWeb.ServerName.local?(user_id) and
+      (user_id == sender_user_id(registration) or namespace_match?(registration, "users", user_id))
   end
 
-  defp server_name, do: Application.get_env(:axon_web, :server_name, "localhost")
+  def sender_user_id(registration),
+    do: "@#{registration["sender_localpart"]}:#{AxonWeb.ServerName.get()}"
 
   # ---------------------------------------------------------------------------
   # Third-party network lookups (AS spec "Third party networks")
@@ -181,9 +186,6 @@ defmodule AxonWeb.AppService.Manager do
         :ok
     end
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp receive_ephemeral?(reg) do
     reg["receive_ephemeral"] == true or reg["push_ephemeral"] == true or
@@ -338,11 +340,17 @@ defmodule AxonWeb.AppService.Manager do
         |> Enum.flat_map(fn path ->
           with {:ok, contents} <- File.read(path),
                {:ok, registration} <- AxonWeb.AppService.RegistrationYaml.parse(contents) do
-            Logger.info("Loaded app service registration #{inspect(registration["id"])} from #{path}")
+            Logger.info(
+              "Loaded app service registration #{inspect(registration["id"])} from #{path}"
+            )
+
             [registration]
           else
             {:error, reason} ->
-              Logger.warning("Failed to load app service registration from #{path}: #{inspect(reason)}")
+              Logger.warning(
+                "Failed to load app service registration from #{path}: #{inspect(reason)}"
+              )
+
               []
           end
         end)
@@ -368,20 +376,26 @@ defmodule AxonWeb.AppService.Manager do
   # `kind` is a namespace key as it appears in the registration file:
   # "users", "rooms" or "aliases".
   defp namespace_match?(reg, kind, value) when is_binary(value) do
-    (get_in(reg, ["namespaces", kind]) || [])
-    |> Enum.any?(fn ns -> regex_match?(ns["regex"], value) end)
+    case get_in(reg, ["namespaces", kind]) do
+      namespaces when is_list(namespaces) ->
+        Enum.any?(namespaces, fn ns -> is_map(ns) and regex_match?(ns["regex"], value) end)
+
+      _ ->
+        false
+    end
   end
 
   defp namespace_match?(_reg, _kind, _value), do: false
 
-  defp regex_match?(nil, _), do: false
-
-  defp regex_match?(pattern, string) do
-    case Regex.compile(pattern) do
+  # Namespace regexes must match the whole value, not just a substring of it.
+  defp regex_match?(pattern, string) when is_binary(pattern) do
+    case Regex.compile("\\A(?:#{pattern})\\z") do
       {:ok, re} -> Regex.match?(re, string)
       _ -> false
     end
   end
+
+  defp regex_match?(_pattern, _string), do: false
 
   defp deliver(reg, event, room_id) do
     push_transaction(reg, %{

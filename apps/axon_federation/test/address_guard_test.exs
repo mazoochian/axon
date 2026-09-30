@@ -98,7 +98,9 @@ defmodule AxonFederation.AddressGuardTest do
 
     test "resolve_checked/1 refuses a private server_name and resolves a public one" do
       assert {:error, :blocked_address} = ServerResolver.resolve_checked("127.0.0.1:9098")
-      assert {:ok, "https://93.184.216.34:8448"} = ServerResolver.resolve_checked("93.184.216.34:8448")
+
+      assert {:ok, "https://93.184.216.34:8448"} =
+               ServerResolver.resolve_checked("93.184.216.34:8448")
     end
   end
 

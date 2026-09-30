@@ -44,7 +44,13 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
   defp remote_user(prefix), do: "@#{prefix}_#{System.unique_integer([:positive])}:#{@server_name}"
 
   defp signed_remote_event(fields) do
-    FakeRemoteMatrixServer.sign_event(@port, Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields))
+    event =
+      FakeRemoteMatrixServer.sign_event(
+        @port,
+        Map.merge(%{"hashes" => %{"sha256" => "x"}}, fields)
+      )
+
+    Map.put(event, "event_id", AxonCrypto.EventHash.reference_hash(event, "11"))
   end
 
   defp signed_get(path) do
@@ -93,7 +99,7 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
     # --- Remote joins via make_join/send_join ---
     make_join_conn =
       signed_get(
-        "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(remote_member)}"
+        "/_matrix/federation/v1/make_join/#{URI.encode(room_id)}/#{URI.encode(remote_member)}?ver=11"
       )
 
     assert make_join_conn.status == 200
@@ -138,7 +144,9 @@ defmodule AxonWeb.E2E.FederationRoomLifecycleTest do
     [{key_id, %{"key" => key_b64}}] = Map.to_list(axon_key_doc["verify_keys"])
     pub_key = Base.decode64!(key_b64, padding: false)
     [sent_pdu] = fanned_out.body["pdus"]
-    assert AxonCrypto.EventHash.verify_signature(sent_pdu, "localhost", key_id, pub_key, "11") == :ok
+
+    assert AxonCrypto.EventHash.verify_signature(sent_pdu, "localhost", key_id, pub_key, "11") ==
+             :ok
 
     # --- An inbound message from the remote member arrives via send_transaction ---
     {last_event_id, depth} = RoomProcess.get_position(room_id)

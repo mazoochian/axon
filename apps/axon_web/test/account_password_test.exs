@@ -13,7 +13,8 @@ defmodule AxonWeb.AccountPasswordTest do
   import AxonWeb.TestHelpers
 
   defp login(username, password, opts \\ %{}) do
-    body = Map.merge(%{"type" => "m.login.password", "user" => username, "password" => password}, opts)
+    body =
+      Map.merge(%{"type" => "m.login.password", "user" => username, "password" => password}, opts)
 
     conn =
       build_conn()

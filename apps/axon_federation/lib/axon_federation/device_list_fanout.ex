@@ -207,24 +207,17 @@ defmodule AxonFederation.DeviceListFanout do
     )
   end
 
-  defp maybe_fan_out(user_id, local_server) do
-    if local_user?(user_id, local_server) do
-      case EventStore.remote_servers_for_user(user_id) do
-        [] -> :ok
-        remote_servers -> fan_out(user_id, remote_servers)
-      end
-    end
-  end
-
   # device_list_updates also gets rows for *remote* users, recorded when
   # this server processes an inbound m.device_list_update for them (so
   # local clients sharing a room with that remote user see
   # device_lists.changed) -- never re-broadcast those, only a user's own
   # home server speaks for their device list.
-  defp local_user?(user_id, local_server) do
-    case String.split(user_id, ":", parts: 2) do
-      [_localpart, ^local_server] -> true
-      _ -> false
+  defp maybe_fan_out(user_id, local_server) do
+    if AxonCore.MatrixId.from_server?(user_id, local_server) do
+      case EventStore.remote_servers_for_user(user_id) do
+        [] -> :ok
+        remote_servers -> fan_out(user_id, remote_servers)
+      end
     end
   end
 

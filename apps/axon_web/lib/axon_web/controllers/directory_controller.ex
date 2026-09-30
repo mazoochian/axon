@@ -4,15 +4,23 @@ defmodule AxonWeb.DirectoryController do
   action_fallback(AxonWeb.FallbackController)
 
   import Ecto.Query
-  alias AxonCore.Repo
+  alias AxonCore.{EventStore, Repo}
+  alias AxonWeb.RoomSummary
 
   # GET/POST /_matrix/client/v3/publicRooms
   def public_rooms(conn, params) do
-    limit = String.to_integer(params["limit"] || "20")
-    since = params["since"]
-    search = get_in(params, ["filter", "generic_search_term"])
+    limit = AxonWeb.Params.int(params["limit"], 20, 1, 500)
+    since = if is_binary(params["since"]), do: params["since"]
 
-    # Base query for public rooms
+    search =
+      case params["filter"] do
+        %{"generic_search_term" => term} when is_binary(term) and term != "" ->
+          String.downcase(term)
+
+        _ ->
+          nil
+      end
+
     q =
       from(r in "rooms",
         where: r.is_public == true,
@@ -25,153 +33,57 @@ defmodule AxonWeb.DirectoryController do
 
     room_ids = Repo.all(q)
 
-    # Build rich chunks with name, topic, alias, member count from state
+    # PublicRoomsChunk.join_rule: "When not present, the room is assumed to
+    # be public".
     chunks =
-      Enum.map(room_ids, fn room_id ->
-        build_public_room_entry(room_id, search)
-      end)
-      |> Enum.reject(&is_nil/1)
+      room_ids
+      |> Enum.map(&RoomSummary.build(&1, "public"))
+      |> Enum.filter(&matches_search?(&1, search))
 
-    next_batch = if length(room_ids) == limit, do: List.last(room_ids), else: nil
+    resp = %{"chunk" => chunks, "total_room_count_estimate" => length(chunks)}
 
-    resp = %{
-      "chunk" => chunks,
-      "total_room_count_estimate" => length(chunks)
-    }
-
-    resp = if next_batch, do: Map.put(resp, "next_batch", next_batch), else: resp
+    resp =
+      if length(room_ids) == limit,
+        do: Map.put(resp, "next_batch", List.last(room_ids)),
+        else: resp
 
     json(conn, resp)
   end
 
-  defp build_public_room_entry(room_id, search) do
-    # Get current state for name, topic, canonical_alias from current_room_state
-    state_rows =
-      Repo.all(
-        from(s in "current_room_state",
-          join: e in "events",
-          on: e.event_id == s.event_id,
-          where:
-            s.room_id == ^room_id and
-              s.type in [
-                "m.room.name",
-                "m.room.topic",
-                "m.room.canonical_alias",
-                "m.room.history_visibility",
-                "m.room.guest_access",
-                "m.room.join_rules",
-                "m.room.create"
-              ],
-          select: %{type: s.type, content: e.content}
-        )
-      )
+  defp matches_search?(_entry, nil), do: true
 
-    state_map = Enum.into(state_rows, %{}, fn r -> {r.type, r.content} end)
-
-    name = get_in(state_map, ["m.room.name", "name"])
-    topic = get_in(state_map, ["m.room.topic", "topic"])
-    canonical_alias = get_in(state_map, ["m.room.canonical_alias", "alias"])
-
-    history_visibility =
-      get_in(state_map, ["m.room.history_visibility", "history_visibility"]) || "shared"
-
-    guest_access = get_in(state_map, ["m.room.guest_access", "guest_access"]) || "forbidden"
-
-    # PublicRoomsChunk.join_rule: "When not present, the room is assumed to
-    # be public" — but Complement's directory test asserts the key is
-    # actually present, so default explicitly rather than omitting it.
-    join_rule = get_in(state_map, ["m.room.join_rules", "join_rule"]) || "public"
-
-    # PublicRoomsChunk.room_type: "The `type` of room (from m.room.create),
-    # if any" — omitted entirely for ordinary (non-space) rooms.
-    room_type = get_in(state_map, ["m.room.create", "type"])
-
-    # Apply search filter on name and topic
-    if search do
-      search_lower = String.downcase(search)
-      name_match = name && String.contains?(String.downcase(name), search_lower)
-      topic_match = topic && String.contains?(String.downcase(topic), search_lower)
-
-      alias_match =
-        canonical_alias && String.contains?(String.downcase(canonical_alias), search_lower)
-
-      id_match = String.contains?(String.downcase(room_id), search_lower)
-
-      if not (name_match || topic_match || alias_match || id_match),
-        do: nil,
-        else:
-          build_entry(
-            room_id,
-            name,
-            topic,
-            canonical_alias,
-            history_visibility,
-            guest_access,
-            join_rule,
-            room_type
-          )
-    else
-      build_entry(
-        room_id,
-        name,
-        topic,
-        canonical_alias,
-        history_visibility,
-        guest_access,
-        join_rule,
-        room_type
-      )
-    end
-  end
-
-  defp build_entry(
-         room_id,
-         name,
-         topic,
-         canonical_alias,
-         history_visibility,
-         guest_access,
-         join_rule,
-         room_type
-       ) do
-    num_joined =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.membership == "join",
-          select: count(m.user_id)
-        )
-      ) || 0
-
-    entry = %{
-      "room_id" => room_id,
-      "world_readable" => history_visibility == "world_readable",
-      "guest_can_join" => guest_access == "can_join",
-      "num_joined_members" => num_joined,
-      "join_rule" => join_rule
-    }
-
-    entry = if name, do: Map.put(entry, "name", name), else: entry
-    entry = if topic, do: Map.put(entry, "topic", topic), else: entry
-
-    entry =
-      if canonical_alias, do: Map.put(entry, "canonical_alias", canonical_alias), else: entry
-
-    entry = if room_type, do: Map.put(entry, "room_type", room_type), else: entry
-
-    entry
+  defp matches_search?(entry, search) do
+    Enum.any?(["name", "topic", "canonical_alias", "room_id"], fn key ->
+      is_binary(entry[key]) and String.contains?(String.downcase(entry[key]), search)
+    end)
   end
 
   # PUT /_matrix/client/v3/directory/list/room/:room_id
+  # Same permission as Synapse's room-list check: a server admin, or a joined
+  # member allowed to send m.room.canonical_alias.
   def set_room_visibility(conn, %{"room_id" => room_id} = params) do
-    visibility = params["visibility"]
-    is_public = visibility == "public"
+    user_id = conn.assigns.current_user_id
 
-    Repo.update_all(
-      from(r in "rooms", where: r.room_id == ^room_id),
-      set: [is_public: is_public]
-    )
+    cond do
+      params["visibility"] not in [nil, "public", "private"] ->
+        invalid_param(conn, "visibility must be \"public\" or \"private\"")
 
-    json(conn, %{})
+      not room_exists?(room_id) ->
+        {:error, :not_found}
+
+      not (AxonWeb.Plug.RequireAdmin.admin?(user_id) or
+               (EventStore.joined?(room_id, user_id) and
+                  can_send_state?(user_id, room_id, "m.room.canonical_alias"))) ->
+        {:error, :insufficient_power}
+
+      true ->
+        Repo.update_all(
+          from(r in "rooms", where: r.room_id == ^room_id),
+          set: [is_public: params["visibility"] != "private"]
+        )
+
+        json(conn, %{})
+    end
   end
 
   # GET /_matrix/client/v3/directory/room/:room_alias
@@ -221,25 +133,52 @@ defmodule AxonWeb.DirectoryController do
   end
 
   # PUT /_matrix/client/v3/directory/room/:room_alias
-  def put_alias(conn, %{"room_alias" => room_alias, "room_id" => room_id}) do
+  def put_alias(conn, %{"room_alias" => room_alias, "room_id" => room_id})
+      when is_binary(room_id) do
     user_id = conn.assigns.current_user_id
 
-    Repo.insert_all(
-      "room_aliases",
-      [
-        %{
-          alias: room_alias,
-          room_id: room_id,
-          creator: user_id,
-          inserted_at: DateTime.utc_now(:microsecond),
-          updated_at: DateTime.utc_now(:microsecond)
-        }
-      ],
-      on_conflict: :nothing
-    )
+    cond do
+      not valid_local_alias?(room_alias) ->
+        invalid_param(conn, "Room alias must be of the form #localpart:#{server_name()}")
 
-    json(conn, %{})
+      not room_exists?(room_id) ->
+        {:error, :not_found}
+
+      not (EventStore.joined?(room_id, user_id) or AxonWeb.Plug.RequireAdmin.admin?(user_id)) ->
+        {:error, :not_joined}
+
+      true ->
+        now = DateTime.utc_now(:microsecond)
+
+        {inserted, _} =
+          Repo.insert_all(
+            "room_aliases",
+            [
+              %{
+                alias: room_alias,
+                room_id: room_id,
+                creator: user_id,
+                inserted_at: now,
+                updated_at: now
+              }
+            ],
+            on_conflict: :nothing
+          )
+
+        if inserted == 1 do
+          json(conn, %{})
+        else
+          conn
+          |> put_status(409)
+          |> json(%{
+            "errcode" => "M_UNKNOWN",
+            "error" => "Room alias #{room_alias} already exists"
+          })
+        end
+    end
   end
+
+  def put_alias(conn, %{"room_id" => _}), do: invalid_param(conn, "room_id must be a string")
 
   def put_alias(conn, _params) do
     conn
@@ -247,20 +186,26 @@ defmodule AxonWeb.DirectoryController do
     |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "room_id required"})
   end
 
+  defp valid_local_alias?("#" <> rest) do
+    case String.split(rest, ":", parts: 2) do
+      [localpart, server] -> localpart != "" and server == server_name()
+      _ -> false
+    end
+  end
+
+  defp valid_local_alias?(_), do: false
+
+  defp invalid_param(conn, error) do
+    conn |> put_status(400) |> json(%{"errcode" => "M_INVALID_PARAM", "error" => error})
+  end
+
+  defp room_exists?(room_id) do
+    Repo.exists?(from(r in "rooms", where: r.room_id == ^room_id))
+  end
+
   # GET /_matrix/client/v3/rooms/:room_id/aliases
   def list_room_aliases(conn, %{"room_id" => room_id}) do
-    user_id = conn.assigns.current_user_id
-
-    # Check membership: only joined members can list aliases
-    membership =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: m.membership
-        )
-      )
-
-    if membership != "join" do
+    if not EventStore.joined?(room_id, conn.assigns.current_user_id) do
       conn
       |> put_status(403)
       |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
@@ -308,7 +253,6 @@ defmodule AxonWeb.DirectoryController do
   end
 
   defp maybe_clear_canonical_alias(user_id, room_id, deleted_alias) do
-    alias AxonCore.EventStore
     alias AxonRoom.RoomProcess
 
     case EventStore.get_state_event(room_id, "m.room.canonical_alias", "") do
@@ -344,14 +288,12 @@ defmodule AxonWeb.DirectoryController do
   # in power_levels.users; a hand-rolled `users_default` fallback would
   # wrongly refuse a v12 creator who manages an alias without ever having
   # been granted an explicit power_levels entry.
-  defp can_manage_aliases?(user_id, room_id) do
-    alias AxonCore.EventStore
-    alias AxonRoom.AuthRules
+  defp can_manage_aliases?(user_id, room_id),
+    do: can_send_state?(user_id, room_id, "m.room.aliases")
 
-    state_map = EventStore.get_current_state_map(room_id)
-    version = room_version(state_map)
-
-    AuthRules.can_send_state?(user_id, "m.room.aliases", state_map, version)
+  defp can_send_state?(user_id, room_id, event_type) do
+    state_map = AxonCore.EventStore.get_current_state_map(room_id)
+    AxonRoom.AuthRules.can_send_state?(user_id, event_type, state_map, room_version(state_map))
   end
 
   defp room_version(state_map) do
@@ -361,5 +303,5 @@ defmodule AxonWeb.DirectoryController do
     end
   end
 
-  defp server_name, do: Application.fetch_env!(:axon_web, :server_name)
+  defp server_name, do: AxonWeb.ServerName.get()
 end

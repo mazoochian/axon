@@ -6,19 +6,20 @@ defmodule AxonWeb.FilterController do
   import Ecto.Query
   alias AxonCore.Repo
 
-  def create(conn, %{"user_id" => user_id} = params) do
+  def create(conn, %{"user_id" => user_id}) do
     requester = conn.assigns.current_user_id
 
     if requester != user_id do
       conn |> put_status(403) |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Forbidden"})
     else
-      filter = Map.drop(params, ["user_id"])
+      case AxonWeb.JsonBody.object(conn) |> validate_filter() do
+        :error ->
+          AxonWeb.JsonBody.not_object(conn)
 
-      case validate_filter(filter) do
         {:error, msg} ->
           conn |> put_status(400) |> json(%{"errcode" => "M_BAD_JSON", "error" => msg})
 
-        :ok ->
+        {:ok, filter} ->
           filter_json = Jason.encode!(filter)
           filter_id = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
 
@@ -41,7 +42,13 @@ defmodule AxonWeb.FilterController do
     end
   end
 
-  defp validate_filter(filter) do
+  defp validate_filter(:error), do: :error
+
+  defp validate_filter({:ok, filter}) do
+    with :ok <- validate_filter_sections(filter), do: {:ok, filter}
+  end
+
+  defp validate_filter_sections(filter) do
     with :ok <- require_map_or_nil(filter["presence"], "presence"),
          :ok <- require_map_or_nil(filter["account_data"], "account_data"),
          :ok <- require_map_or_nil(filter["room"], "room") do

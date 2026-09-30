@@ -52,7 +52,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob@example.com")
+      )
 
     assert conn.status == 400
     assert decode(conn)["errcode"] == "M_MISSING_PARAM"
@@ -89,7 +92,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob@example.com")
+      )
 
     assert conn.status == 200
   end
@@ -106,7 +112,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob@example.com")
+      )
 
     assert conn.status == 200
 
@@ -116,7 +125,9 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     assert invite_event
     assert invite_event["content"]["public_key"] == FakeIdentityServer.public_key_b64(@port)
-    refute invite_event["content"]["public_key"] == AxonCrypto.KeyServer.server_key_info().public_key_b64
+
+    refute invite_event["content"]["public_key"] ==
+             AxonCrypto.KeyServer.server_key_info().public_key_b64
 
     assert [_long_term, _ephemeral] = invite_event["content"]["public_keys"]
 
@@ -136,16 +147,23 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob-bound@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob-bound@example.com")
+      )
 
     assert conn.status == 200
 
-    members_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/joined_members")
+    members_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/joined_members")
+
     refute Map.has_key?(decode(members_conn)["joined"], bob.user_id)
 
     sync_conn = authed(alice.token) |> get("/_matrix/client/v3/sync")
     room_state = get_in(decode(sync_conn), ["rooms", "join", room_id, "state", "events"])
-    member_event = Enum.find(room_state, &(&1["type"] == "m.room.member" and &1["state_key"] == bob.user_id))
+
+    member_event =
+      Enum.find(room_state, &(&1["type"] == "m.room.member" and &1["state_key"] == bob.user_id))
 
     assert member_event["content"]["membership"] == "invite"
     refute Enum.any?(room_state, &(&1["type"] == "m.room.third_party_invite"))
@@ -158,11 +176,16 @@ defmodule AxonWeb.ThirdPartyInviteTest do
     bob = register("3pid_power_bob_#{System.unique_integer([:positive])}")
     room_id = create_room(alice.token, %{"preset" => "public_chat"})
 
-    assert authed(bob.token) |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{}) |> Map.get(:status) == 200
+    assert authed(bob.token)
+           |> jp("/_matrix/client/v3/rooms/#{room_id}/join", %{})
+           |> Map.get(:status) == 200
 
     conn =
       authed(bob.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "carol@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "carol@example.com")
+      )
 
     assert conn.status == 403
   end
@@ -181,20 +204,25 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("msisdn", "+15550000000"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("msisdn", "+15550000000")
+      )
 
     assert conn.status == 200
 
     assert Enum.any?(
              FakeIdentityServer.requests(@port),
-             &(&1.method == "POST" and &1.path == "/_matrix/identity/v2/validate/msisdn/requestToken")
+             &(&1.method == "POST" and
+                 &1.path == "/_matrix/identity/v2/validate/msisdn/requestToken")
            )
 
     sync_conn = authed(alice.token) |> get("/_matrix/client/v3/sync")
     room_state = get_in(decode(sync_conn), ["rooms", "join", room_id, "state", "events"])
     invite_event = Enum.find(room_state, &(&1["type"] == "m.room.third_party_invite"))
 
-    assert invite_event["content"]["public_key"] == AxonCrypto.KeyServer.server_key_info().public_key_b64
+    assert invite_event["content"]["public_key"] ==
+             AxonCrypto.KeyServer.server_key_info().public_key_b64
   end
 
   test "an unsupported 3pid medium is rejected" do
@@ -205,7 +233,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("carrier_pigeon", "loft-42"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("carrier_pigeon", "loft-42")
+      )
 
     assert conn.status == 400
     assert decode(conn)["errcode"] == "M_UNKNOWN"
@@ -224,7 +255,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     invite_conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob@example.com")
+      )
 
     assert invite_conn.status == 200
 
@@ -244,7 +278,9 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     assert join_conn.status == 200
 
-    members_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/joined_members")
+    members_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/joined_members")
+
     assert Map.has_key?(decode(members_conn)["joined"], bob.user_id)
   end
 
@@ -257,7 +293,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     invite_conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob@example.com")
+      )
 
     assert invite_conn.status == 200
 
@@ -291,7 +330,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     invite_conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob@example.com")
+      )
 
     assert invite_conn.status == 200
 
@@ -317,7 +359,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
 
     invite_conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "bob@example.com"))
+      |> jp(
+        "/_matrix/client/v3/rooms/#{room_id}/invite",
+        invite_3pid_params("email", "bob@example.com")
+      )
 
     assert invite_conn.status == 200
 
@@ -337,7 +382,10 @@ defmodule AxonWeb.ThirdPartyInviteTest do
     room_id = create_room(alice.token, %{"preset" => "public_chat"})
 
     authed(alice.token)
-    |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", invite_3pid_params("email", "dan@example.com"))
+    |> jp(
+      "/_matrix/client/v3/rooms/#{room_id}/invite",
+      invite_3pid_params("email", "dan@example.com")
+    )
 
     sync_conn = authed(alice.token) |> get("/_matrix/client/v3/sync")
     room_state = get_in(decode(sync_conn), ["rooms", "join", room_id, "state", "events"])

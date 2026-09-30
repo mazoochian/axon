@@ -81,7 +81,11 @@ defmodule AxonWeb.RoomPreviewStateTest do
         "preset" => "public_chat",
         "room_version" => "7",
         "initial_state" => [
-          %{"type" => "m.room.join_rules", "state_key" => "", "content" => %{"join_rule" => "knock"}}
+          %{
+            "type" => "m.room.join_rules",
+            "state_key" => "",
+            "content" => %{"join_rule" => "knock"}
+          }
         ]
       })
 

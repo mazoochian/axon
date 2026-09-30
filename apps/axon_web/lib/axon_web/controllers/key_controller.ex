@@ -6,6 +6,7 @@ defmodule AxonWeb.KeyController do
   alias AxonCrypto.{EventHash, KeyServer}
   alias AxonCore.{KeyStore, Repo, UserStore}
   alias AxonFederation.HttpClient
+  alias AxonWeb.{SyncHelpers, UIA}
   import Ecto.Query
   require Logger
 
@@ -61,7 +62,7 @@ defmodule AxonWeb.KeyController do
     store_fallback_keys(user_id, device_id, fallback_keys)
 
     # Count remaining OTKs per algorithm
-    counts = count_otks(user_id, device_id)
+    counts = SyncHelpers.get_otk_counts(user_id, device_id)
     json(conn, %{"one_time_key_counts" => counts})
   end
 
@@ -190,25 +191,25 @@ defmodule AxonWeb.KeyController do
              "device_keys" => device_keys_map
            }) do
         {:ok, resp} ->
+          requested = Map.keys(device_keys_map)
+
           remote_dks =
-            (resp["device_keys"] || %{})
+            resp
+            |> requested_entries("device_keys", requested)
             |> Map.new(fn {user_id, devices} ->
               merged =
-                Map.new(devices, fn {device_id, key_json} ->
+                for {device_id, key_json} <- devices, valid_key_json?(key_json), into: %{} do
                   {device_id,
                    KeyStore.merge_signatures(key_json, user_id, device_id, sigs_by_target)}
-                end)
+                end
 
               {user_id, merged}
             end)
 
-          remote_mks =
-            (resp["master_keys"] || %{})
-            |> KeyStore.merge_cross_signing_key_signatures(sigs_by_target)
+          remote_mks = remote_cross_signing_keys(resp, "master_keys", requested, sigs_by_target)
 
           remote_sks =
-            (resp["self_signing_keys"] || %{})
-            |> KeyStore.merge_cross_signing_key_signatures(sigs_by_target)
+            remote_cross_signing_keys(resp, "self_signing_keys", requested, sigs_by_target)
 
           {Map.merge(dks, remote_dks), Map.merge(mks, remote_mks), Map.merge(sks, remote_sks),
            fails}
@@ -219,6 +220,36 @@ defmodule AxonWeb.KeyController do
       end
     end)
   end
+
+  defp remote_cross_signing_keys(resp, field, requested, sigs_by_target) do
+    resp
+    |> requested_entries(field, requested)
+    |> Map.filter(fn {_user_id, key_json} -> valid_key_json?(key_json) end)
+    |> KeyStore.merge_cross_signing_key_signatures(sigs_by_target)
+  end
+
+  # A remote server's reply may only speak for the users we asked it about
+  # (all of which belong to it), and only with object values.
+  defp requested_entries(%{} = resp, field, requested) do
+    case resp[field] do
+      %{} = by_user ->
+        for {user_id, value} <- Map.take(by_user, requested),
+            is_map(value),
+            into: %{},
+            do: {user_id, value}
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp requested_entries(_resp, _field, _requested), do: %{}
+
+  defp valid_key_json?(%{} = key_json) do
+    is_map(Map.get(key_json, "keys", %{})) and is_map(Map.get(key_json, "signatures", %{}))
+  end
+
+  defp valid_key_json?(_key_json), do: false
 
   # POST /_matrix/client/v3/keys/claim
   def claim(conn, params) do
@@ -261,7 +292,8 @@ defmodule AxonWeb.KeyController do
              "one_time_keys" => one_time_keys_map
            }) do
         {:ok, resp} ->
-          {Map.merge(acc, resp["one_time_keys"] || %{}), fails}
+          claimed = requested_entries(resp, "one_time_keys", Map.keys(one_time_keys_map))
+          {Map.merge(acc, claimed), fails}
 
         {:error, reason} ->
           Logger.warning("Federation /user/keys/claim to #{server} failed: #{inspect(reason)}")
@@ -272,19 +304,16 @@ defmodule AxonWeb.KeyController do
 
   # GET /_matrix/client/v3/keys/changes
   # Returns users whose device keys changed, or who joined/left a shared room,
-  # between `from` and `to` sync tokens. Uses the dl_cursor (2nd token part) to
-  # query device_list_updates by id, and the left_cursor (5th part) to query
-  # device_list_partings by id.
+  # between `from` and `to` sync tokens, using their dl_cursor (device list
+  # updates) and left_cursor (device list partings) parts.
   def changes(conn, params) do
     user_id = conn.assigns.current_user_id
-    dl_from = parse_dl_cursor(params["from"])
-    dl_to = parse_dl_cursor(params["to"])
-    left_from = parse_left_cursor(params["from"])
-    left_to = parse_left_cursor(params["to"])
+    {_, dl_from, _, _, left_from, _} = SyncHelpers.parse_token(params["from"])
+    {_, dl_to, _, _, left_to, _} = SyncHelpers.parse_token(params["to"])
 
     # Include the user themselves: their own device-list changes (new logins,
     # cross-signing uploads) must be visible to their other devices.
-    candidate_users = [user_id | shared_room_user_ids(user_id)]
+    candidate_users = [user_id | SyncHelpers.shared_room_user_ids(user_id)]
 
     changed =
       Repo.all(
@@ -313,43 +342,8 @@ defmodule AxonWeb.KeyController do
     json(conn, %{"changed" => changed, "left" => left})
   end
 
-  # Extracts the dl_cursor (device-list position, 2nd token part) from a sync
-  # token. Token format: "${room_ordering}_${dl_cursor}_${ad_cursor}_${pr_cursor}_${left_cursor}"
-  # or plain integer (legacy → dl_cursor = 0). Integer.parse stops at the
-  # trailing "_", so this works regardless of how many parts follow.
-  defp parse_dl_cursor(nil), do: 0
-
-  defp parse_dl_cursor(token) do
-    case String.split(token, "_", parts: 2) do
-      [_, dl_s] ->
-        case Integer.parse(dl_s) do
-          {n, _} -> n
-          _ -> 0
-        end
-
-      [_room_s] ->
-        0
-    end
-  end
-
-  # Extracts the left_cursor (device_list_partings position, 5th token part).
-  defp parse_left_cursor(nil), do: 0
-
-  defp parse_left_cursor(token) do
-    case String.split(token, "_") do
-      parts when length(parts) >= 5 ->
-        case Integer.parse(Enum.at(parts, 4)) do
-          {n, _} -> n
-          _ -> 0
-        end
-
-      _ ->
-        0
-    end
-  end
-
   # POST /_matrix/client/v3/keys/device_signing/upload
-  # Requires UIA (m.login.dummy or m.login.password) — except when delegated
+  # Requires password UIA — except when delegated
   # OIDC auth (MSC3861) is enabled, where a valid, currently-active
   # Authorization-Server-issued token is proof enough; re-auth freshness is
   # the AS's responsibility (prompt=login), not this endpoint's.
@@ -382,38 +376,11 @@ defmodule AxonWeb.KeyController do
         store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key)
         json(conn, %{})
 
-      is_nil(auth) ->
-        conn
-        |> put_status(401)
-        |> json(%{
-          "error" => "Additional authentication required",
-          "completed" => [],
-          "session" => gen_session(),
-          "flows" => [
-            %{"stages" => ["m.login.password"]},
-            %{"stages" => ["m.login.dummy"]}
-          ],
-          "params" => %{}
-        })
-
-      validate_ui_auth(user_id, auth) == :ok ->
-        store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key)
-        json(conn, %{})
-
       true ->
-        conn
-        |> put_status(401)
-        |> json(%{
-          "errcode" => "M_FORBIDDEN",
-          "error" => "Invalid credentials",
-          "completed" => [],
-          "session" => gen_session(),
-          "flows" => [
-            %{"stages" => ["m.login.password"]},
-            %{"stages" => ["m.login.dummy"]}
-          ],
-          "params" => %{}
-        })
+        UIA.authorize(conn, user_id, auth, fn ->
+          store_cross_signing_keys(user_id, master_key, self_signing_key, user_signing_key)
+          json(conn, %{})
+        end)
     end
   end
 
@@ -494,36 +461,6 @@ defmodule AxonWeb.KeyController do
 
     record_device_list_update(user_id)
   end
-
-  defp validate_ui_auth(_user_id, %{"type" => "m.login.dummy"}), do: :ok
-
-  defp validate_ui_auth(current_user_id, %{"type" => "m.login.password"} = auth) do
-    identifier = auth["identifier"] || %{}
-    auth_user = identifier["user"] || auth["user"]
-    password = auth["password"]
-    server_name = Application.fetch_env!(:axon_web, :server_name)
-
-    auth_user_id =
-      if auth_user && String.starts_with?(auth_user, "@"),
-        do: auth_user,
-        else: "@#{auth_user}:#{server_name}"
-
-    if auth_user_id != current_user_id do
-      :error
-    else
-      case UserStore.get_user(current_user_id) do
-        {:ok, user} ->
-          if user.password_hash && Argon2.verify_pass(password, user.password_hash),
-            do: :ok,
-            else: :error
-
-        _ ->
-          :error
-      end
-    end
-  end
-
-  defp validate_ui_auth(_user_id, _auth), do: :error
 
   # POST /_matrix/client/v3/keys/signatures/upload
   def upload_signatures(conn, params) do
@@ -750,7 +687,11 @@ defmodule AxonWeb.KeyController do
     })
   end
 
-  defp normalize_backup_entries(user_id, version, %{"session_id" => session_id, "room_id" => room_id} = params) do
+  defp normalize_backup_entries(
+         user_id,
+         version,
+         %{"session_id" => session_id, "room_id" => room_id} = params
+       ) do
     [build_backup_entry(user_id, version, room_id, session_id, params)]
   end
 
@@ -812,9 +753,14 @@ defmodule AxonWeb.KeyController do
 
       old ->
         cond do
-          entry.is_verified != old.is_verified -> entry.is_verified and not old.is_verified
-          entry.first_message_index != old.first_message_index -> entry.first_message_index < old.first_message_index
-          true -> entry.forwarded_count < old.forwarded_count
+          entry.is_verified != old.is_verified ->
+            entry.is_verified and not old.is_verified
+
+          entry.first_message_index != old.first_message_index ->
+            entry.first_message_index < old.first_message_index
+
+          true ->
+            entry.forwarded_count < old.forwarded_count
         end
     end
   end
@@ -1068,8 +1014,6 @@ defmodule AxonWeb.KeyController do
     )
   end
 
-  defp gen_session, do: :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
-
   defp format_backup_row(row) do
     %{
       "first_message_index" => row.first_message_index,
@@ -1079,30 +1023,7 @@ defmodule AxonWeb.KeyController do
     }
   end
 
-  defp count_otks(user_id, device_id) do
-    Repo.all(
-      from(k in "one_time_keys",
-        where: k.user_id == ^user_id and k.device_id == ^device_id and k.claimed == false,
-        group_by: k.algorithm,
-        select: {k.algorithm, count(k.id)}
-      )
-    )
-    |> Enum.into(%{})
-  end
-
   defp record_device_list_update(user_id), do: KeyStore.record_device_list_update(user_id)
-
-  defp shared_room_user_ids(user_id) do
-    Repo.all(
-      from(m2 in "room_memberships",
-        join: m1 in "room_memberships",
-        on: m1.room_id == m2.room_id and m1.user_id == ^user_id and m1.membership == "join",
-        where: m2.membership == "join" and m2.user_id != ^user_id,
-        select: m2.user_id,
-        distinct: true
-      )
-    )
-  end
 
   defp store_one_time_keys(user_id, device_id, one_time_keys) do
     Enum.each(one_time_keys, fn {key_id, key_json} ->
@@ -1185,7 +1106,7 @@ defmodule AxonWeb.KeyController do
       %{device_id: ^device_id} ->
         case parse_since(since_token) do
           {:ok, since_id} ->
-            limit = parse_limit(limit_param)
+            limit = AxonWeb.Params.int(limit_param, 100, 1, 1000)
 
             {events, last_id, to_token} =
               fetch_dehydrated_events(user_id, device_id, since_id, limit)
@@ -1258,15 +1179,4 @@ defmodule AxonWeb.KeyController do
       _ -> :error
     end
   end
-
-  defp parse_limit(limit) when is_integer(limit) and limit > 0, do: limit
-
-  defp parse_limit(limit) when is_binary(limit) do
-    case Integer.parse(limit) do
-      {n, ""} when n > 0 -> n
-      _ -> 100
-    end
-  end
-
-  defp parse_limit(_), do: 100
 end

@@ -371,4 +371,87 @@ defmodule AxonWeb.DirectoryControllerTest do
       assert get_conn.status == 404
     end
   end
+
+  describe "validation and authorization" do
+    test "publicRooms accepts a JSON integer limit and ignores a non-object filter" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+
+      for body <- [%{"limit" => 5}, %{"limit" => -3, "filter" => "x"}, %{"filter" => [1]}] do
+        conn = authed(alice.token) |> jp("/_matrix/client/v3/publicRooms", body)
+        assert conn.status == 200
+      end
+
+      assert authed(alice.token)
+             |> get("/_matrix/client/v3/publicRooms?limit=abc")
+             |> Map.get(:status) ==
+               200
+    end
+
+    test "set_room_visibility validates the room, the value and the caller's power" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      bob = register("bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{"preset" => "public_chat"})
+      path = "/_matrix/client/v3/directory/list/room/#{room_id}"
+
+      assert authed(alice.token)
+             |> jpu("/_matrix/client/v3/directory/list/room/!nope:localhost", %{
+               "visibility" => "public"
+             })
+             |> Map.get(:status) == 404
+
+      conn = authed(alice.token) |> jpu(path, %{"visibility" => "hidden"})
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+
+      assert authed(bob.token) |> jpu(path, %{"visibility" => "public"}) |> Map.get(:status) ==
+               403
+
+      authed(bob.token) |> jp("/_matrix/client/v3/join/#{room_id}", %{})
+
+      assert authed(bob.token) |> jpu(path, %{"visibility" => "public"}) |> Map.get(:status) ==
+               403
+
+      assert authed(alice.token) |> jpu(path, %{"visibility" => "private"}) |> Map.get(:status) ==
+               200
+    end
+
+    test "put_alias requires a local alias, a known room and membership" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      bob = register("bob_#{System.unique_integer([:positive])}")
+      room_id = create_room(alice.token, %{})
+      n = System.unique_integer([:positive])
+
+      put = fn token, room_alias, body ->
+        authed(token)
+        |> jpu("/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}", body)
+      end
+
+      conn = put.(alice.token, "#remote#{n}:elsewhere.example", %{"room_id" => room_id})
+      assert conn.status == 400
+      assert decode(conn)["errcode"] == "M_INVALID_PARAM"
+
+      assert put.(alice.token, "#badroom#{n}:localhost", %{"room_id" => 123}).status == 400
+
+      assert put.(alice.token, "#noroom#{n}:localhost", %{"room_id" => "!nope:localhost"}).status ==
+               404
+
+      assert put.(bob.token, "#notjoined#{n}:localhost", %{"room_id" => room_id}).status == 403
+    end
+
+    test "put_alias on a taken alias is a 409 and keeps the original mapping" do
+      alice = register("alice_#{System.unique_integer([:positive])}")
+      room_a = create_room(alice.token, %{})
+      room_b = create_room(alice.token, %{})
+      room_alias = "#taken#{System.unique_integer([:positive])}:localhost"
+      path = "/_matrix/client/v3/directory/room/#{encode_alias(room_alias)}"
+
+      assert authed(alice.token) |> jpu(path, %{"room_id" => room_a}) |> Map.get(:status) == 200
+
+      conn = authed(alice.token) |> jpu(path, %{"room_id" => room_b})
+      assert conn.status == 409
+      assert decode(conn)["errcode"] == "M_UNKNOWN"
+
+      assert decode(build_conn() |> get(path))["room_id"] == room_a
+    end
+  end
 end

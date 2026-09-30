@@ -328,7 +328,11 @@ defmodule AxonRoom.CreateRoomTest do
       bob = new_user("bob")
 
       assert {:ok, room_id} =
-               CreateRoom.execute(creator, server_name: "localhost", is_direct: true, invite: [bob])
+               CreateRoom.execute(creator,
+                 server_name: "localhost",
+                 is_direct: true,
+                 invite: [bob]
+               )
 
       assert content_of(room_id, "m.room.member", bob) == %{
                "membership" => "invite",

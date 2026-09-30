@@ -35,6 +35,7 @@ defmodule AxonWeb.Phase9EphemeralTest do
   setup do
     start_supervised!({FakeRemoteMatrixServer, port: @port, server_name: @server_name})
     KeyCache.clear()
+    AxonFederation.OutboundQueue.reset_circuit(@server_name)
 
     Application.put_env(:axon_federation, :server_overrides, %{
       @server_name => "http://127.0.0.1:#{@port}"

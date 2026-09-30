@@ -321,6 +321,9 @@ defmodule AxonWeb.AppService.EphemeralPushTest do
   # "unavailable" one under test — always match on the state, not on "the
   # first m.presence that shows up".
   defp unavailable_presence(port) do
-    Enum.filter(ephemeral_of_type(port, "m.presence"), &(&1["content"]["presence"] == "unavailable"))
+    Enum.filter(
+      ephemeral_of_type(port, "m.presence"),
+      &(&1["content"]["presence"] == "unavailable")
+    )
   end
 end

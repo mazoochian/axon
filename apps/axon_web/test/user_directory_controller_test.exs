@@ -237,4 +237,30 @@ defmodule AxonWeb.UserDirectoryControllerTest do
 
     assert body["limited"] == true
   end
+
+  test "a negative or non-integer limit doesn't crash" do
+    searcher = register("searcher6_#{System.unique_integer([:positive])}")
+
+    for limit <- [-5, "abc", 0] do
+      conn =
+        authed(searcher.token)
+        |> jp("/_matrix/client/v3/user_directory/search", %{
+          "search_term" => "a",
+          "limit" => limit
+        })
+
+      assert conn.status == 200
+    end
+  end
+
+  test "LIKE wildcards in the search term match literally" do
+    target = register("wildcard#{System.unique_integer([:positive])}")
+    make_publicly_visible(target)
+    searcher = register("searcher7_#{System.unique_integer([:positive])}")
+
+    for term <- ["%", "_"] do
+      results = decode(search(searcher.token, term))["results"]
+      refute Enum.any?(results, &(&1["user_id"] == target.user_id))
+    end
+  end
 end

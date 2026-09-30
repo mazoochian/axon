@@ -3,6 +3,7 @@ defmodule AxonWeb.ProfileController do
 
   action_fallback(AxonWeb.FallbackController)
 
+  import AxonCore.MapUtil, only: [maybe_put: 3]
   alias AxonCore.{EventStore, ProfileFields, UserStore}
   alias AxonFederation.HttpClient
   require Logger
@@ -86,9 +87,7 @@ defmodule AxonWeb.ProfileController do
           set_avatar_url(conn, %{"user_id" => user_id, "avatar_url" => value})
 
         :error ->
-          conn
-          |> put_status(400)
-          |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "Missing #{key_name} in body"})
+          missing_param(conn, key_name)
       end
     end
   end
@@ -103,9 +102,7 @@ defmodule AxonWeb.ProfileController do
           json(conn, %{})
 
         :error ->
-          conn
-          |> put_status(400)
-          |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "Missing #{key_name} in body"})
+          missing_param(conn, key_name)
       end
     end
   end
@@ -138,6 +135,12 @@ defmodule AxonWeb.ProfileController do
     end
   end
 
+  defp missing_param(conn, key_name) do
+    conn
+    |> put_status(400)
+    |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "Missing #{key_name} in body"})
+  end
+
   defp forbidden(conn) do
     conn
     |> put_status(403)
@@ -168,7 +171,7 @@ defmodule AxonWeb.ProfileController do
     end
   end
 
-  def set_displayname(conn, _params), do: json(conn, %{})
+  def set_displayname(conn, _params), do: missing_param(conn, "displayname")
 
   # GET /_matrix/client/v3/profile/:user_id/avatar_url
   def get_avatar_url(conn, %{"user_id" => user_id}) do
@@ -194,7 +197,7 @@ defmodule AxonWeb.ProfileController do
     end
   end
 
-  def set_avatar_url(conn, _params), do: json(conn, %{})
+  def set_avatar_url(conn, _params), do: missing_param(conn, "avatar_url")
 
   # ---------------------------------------------------------------------------
   # Private helpers
@@ -251,24 +254,17 @@ defmodule AxonWeb.ProfileController do
     end
   end
 
-  defp local_server_name, do: Application.fetch_env!(:axon_web, :server_name)
+  defp local_server_name, do: AxonWeb.ServerName.get()
 
   # Propagates the current profile (displayname + avatar_url) to all joined
   # rooms by sending updated m.room.member state events.
   # Per spec §10.5.1, servers SHOULD propagate profile changes to rooms.
   defp propagate_profile_to_rooms(user_id) do
     with {:ok, profile} <- UserStore.get_profile(user_id) do
-      profile_fields = %{}
-
       profile_fields =
-        if profile.displayname,
-          do: Map.put(profile_fields, "displayname", profile.displayname),
-          else: profile_fields
-
-      profile_fields =
-        if profile.avatar_url,
-          do: Map.put(profile_fields, "avatar_url", profile.avatar_url),
-          else: profile_fields
+        %{}
+        |> maybe_put("displayname", profile.displayname)
+        |> maybe_put("avatar_url", profile.avatar_url)
 
       EventStore.get_joined_rooms(user_id)
       |> Enum.each(fn room_id ->
@@ -278,7 +274,9 @@ defmodule AxonWeb.ProfileController do
 
           event_map ->
             current_content = event_map["content"] || %{}
-            new_content = Map.merge(current_content, profile_fields)
+
+            new_content =
+              current_content |> Map.drop(@well_known_keys) |> Map.merge(profile_fields)
 
             AxonRoom.RoomProcess.send_event(room_id, user_id, "m.room.member", new_content,
               state_key: user_id

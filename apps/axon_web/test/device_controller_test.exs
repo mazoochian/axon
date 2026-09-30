@@ -39,6 +39,27 @@ defmodule AxonWeb.DeviceControllerTest do
 
   defp decode(conn), do: Jason.decode!(conn.resp_body)
 
+  defp password_auth(user, password \\ "Test1234!") do
+    %{
+      "type" => "m.login.password",
+      "identifier" => %{"type" => "m.id.user", "user" => user.user_id},
+      "password" => password
+    }
+  end
+
+  defp login(user) do
+    conn =
+      build_conn()
+      |> jp("/_matrix/client/v3/login", %{
+        "type" => "m.login.password",
+        "identifier" => %{"user" => user.user_id},
+        "password" => "Test1234!"
+      })
+
+    assert conn.status == 200
+    decode(conn)
+  end
+
   test "index lists all of the user's devices" do
     alice = register("alice_#{System.unique_integer([:positive])}")
     conn = authed(alice.token) |> get("/_matrix/client/v3/devices")
@@ -146,7 +167,7 @@ defmodule AxonWeb.DeviceControllerTest do
     assert conn.status == 401
   end
 
-  test "delete_devices (bulk) removes multiple devices with m.login.dummy" do
+  test "delete_devices (bulk) removes multiple devices with password UIA" do
     alice = register("alice_#{System.unique_integer([:positive])}")
 
     login_conn =
@@ -167,7 +188,7 @@ defmodule AxonWeb.DeviceControllerTest do
       authed(alice.token)
       |> jp("/_matrix/client/v3/delete_devices", %{
         "devices" => [device2],
-        "auth" => %{"type" => "m.login.dummy"}
+        "auth" => password_auth(alice)
       })
 
     assert conn.status == 200
@@ -284,7 +305,7 @@ defmodule AxonWeb.DeviceControllerTest do
       authed(alice.token)
       |> jp("/_matrix/client/v3/delete_devices", %{
         "devices" => [device2],
-        "auth" => %{"type" => "m.login.dummy"}
+        "auth" => password_auth(alice)
       })
 
     assert conn.status == 200
@@ -316,5 +337,166 @@ defmodule AxonWeb.DeviceControllerTest do
     assert logout_conn.status == 200
 
     assert device_key_rows(alice.user_id, other_device_id) == {0, 0}
+  end
+
+  test "m.login.dummy does not satisfy UIA for device deletion" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    device2 = login(alice)["device_id"]
+
+    conn =
+      authed(alice.token)
+      |> jd("/_matrix/client/v3/devices/#{device2}", %{"auth" => %{"type" => "m.login.dummy"}})
+
+    assert conn.status == 401
+    assert decode(conn)["flows"] == [%{"stages" => ["m.login.password"]}]
+
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/delete_devices", %{
+        "devices" => [device2],
+        "auth" => %{"type" => "m.login.dummy"}
+      })
+
+    assert conn.status == 401
+
+    assert authed(alice.token) |> get("/_matrix/client/v3/devices/#{device2}") |> Map.get(:status) ==
+             200
+  end
+
+  test "malformed UIA auth bodies are rejected without crashing" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    for auth <- [
+          %{"type" => "m.login.password", "identifier" => "alice", "password" => "Test1234!"},
+          %{"type" => "m.login.password", "identifier" => %{"user" => 42}, "password" => "x"},
+          %{"type" => "m.login.password", "user" => alice.user_id, "password" => 1234},
+          "not-a-map"
+        ] do
+      conn =
+        authed(alice.token)
+        |> jd("/_matrix/client/v3/devices/#{alice.device_id}", %{"auth" => auth})
+
+      assert conn.status == 401
+    end
+  end
+
+  test "UIA naming a different user is forbidden" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    bob = register("bob_#{System.unique_integer([:positive])}")
+
+    conn =
+      authed(alice.token)
+      |> jd("/_matrix/client/v3/devices/#{alice.device_id}", %{"auth" => password_auth(bob)})
+
+    assert conn.status == 403
+  end
+
+  test "delete_devices rejects a non-list devices param" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    for devices <- ["DEVICE", %{"a" => 1}, [1, 2]] do
+      conn =
+        authed(alice.token)
+        |> jp("/_matrix/client/v3/delete_devices", %{
+          "devices" => devices,
+          "auth" => password_auth(alice)
+        })
+
+      assert conn.status == 400
+    end
+
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/delete_devices", %{"auth" => password_auth(alice)})
+
+    assert conn.status == 400
+    assert decode(conn)["errcode"] == "M_MISSING_PARAM"
+  end
+
+  defp insert_pusher(user_id, device_id) do
+    Repo.insert_all("pushers", [
+      %{
+        user_id: user_id,
+        device_id: device_id,
+        kind: "http",
+        app_id: "app.#{device_id}",
+        app_display_name: "App",
+        device_display_name: device_id,
+        pushkey: "key_#{device_id}",
+        lang: "en",
+        data: %{"url" => "https://push.example/_matrix/push/v1/notify"}
+      }
+    ])
+  end
+
+  defp pusher_devices(user_id) do
+    Repo.all(from(p in "pushers", where: p.user_id == ^user_id, select: p.device_id))
+    |> Enum.sort()
+  end
+
+  test "deleting devices removes their pushers" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    device2 = login(alice)["device_id"]
+    device3 = login(alice)["device_id"]
+    Enum.each([alice.device_id, device2, device3], &insert_pusher(alice.user_id, &1))
+
+    conn =
+      authed(alice.token)
+      |> jd("/_matrix/client/v3/devices/#{device2}", %{"auth" => password_auth(alice)})
+
+    assert conn.status == 200
+    assert pusher_devices(alice.user_id) == Enum.sort([alice.device_id, device3])
+
+    conn =
+      authed(alice.token)
+      |> jp("/_matrix/client/v3/delete_devices", %{
+        "devices" => [device3],
+        "auth" => password_auth(alice)
+      })
+
+    assert conn.status == 200
+    assert pusher_devices(alice.user_id) == [alice.device_id]
+  end
+
+  test "logout and logout/all remove pushers" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    other = login(alice)
+    Enum.each([alice.device_id, other["device_id"]], &insert_pusher(alice.user_id, &1))
+
+    assert authed(other["access_token"])
+           |> jp("/_matrix/client/v3/logout", %{})
+           |> Map.get(:status) ==
+             200
+
+    assert pusher_devices(alice.user_id) == [alice.device_id]
+
+    assert authed(alice.token) |> jp("/_matrix/client/v3/logout/all", %{}) |> Map.get(:status) ==
+             200
+
+    assert pusher_devices(alice.user_id) == []
+  end
+
+  test "a deleted device's refresh token can no longer be used" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+
+    conn =
+      build_conn()
+      |> jp("/_matrix/client/v3/login", %{
+        "type" => "m.login.password",
+        "identifier" => %{"user" => alice.user_id},
+        "password" => "Test1234!",
+        "refresh_token" => true
+      })
+
+    %{"device_id" => device2, "refresh_token" => refresh} = decode(conn)
+
+    conn =
+      authed(alice.token)
+      |> jd("/_matrix/client/v3/devices/#{device2}", %{"auth" => password_auth(alice)})
+
+    assert conn.status == 200
+
+    conn = build_conn() |> jp("/_matrix/client/v3/refresh", %{"refresh_token" => refresh})
+    assert conn.status in [401, 403]
   end
 end

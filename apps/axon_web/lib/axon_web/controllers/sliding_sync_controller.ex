@@ -61,7 +61,7 @@ defmodule AxonWeb.SlidingSyncController do
     device_id = conn.assigns.current_device_id
 
     pos = params["pos"]
-    timeout = min(String.to_integer(params["timeout"] || "0"), 30_000)
+    timeout = AxonWeb.Params.int(params["timeout"], 0, 0, 30_000)
     is_initial = is_nil(pos)
 
     {since_ordering, dl_since, ad_since, _pr_since, left_since, eph_since} =
@@ -137,6 +137,7 @@ defmodule AxonWeb.SlidingSyncController do
     end
 
     visible_room_ids = Map.keys(room_configs)
+    joined_visible_room_ids = Enum.filter(visible_room_ids, &(membership_by_room[&1] == :join))
 
     dl_next = SyncHelpers.current_dl_max_id()
     ad_next = SyncHelpers.current_ad_max_id()
@@ -158,6 +159,7 @@ defmodule AxonWeb.SlidingSyncController do
         eph_since,
         extensions_req,
         visible_room_ids,
+        joined_visible_room_ids,
         new_pos
       )
 
@@ -334,7 +336,7 @@ defmodule AxonWeb.SlidingSyncController do
     prev_batch =
       case raw_timeline do
         [] -> nil
-        [first | _] -> Integer.to_string(first.stream_ordering - 1)
+        [first | _] -> Integer.to_string(first.stream_ordering)
       end
 
     %{
@@ -430,11 +432,12 @@ defmodule AxonWeb.SlidingSyncController do
          eph_since,
          extensions_req,
          visible_room_ids,
+         joined_room_ids,
          pos
        ) do
     %{}
     |> maybe_put_extension("to_device", extensions_req, fn cfg ->
-      limit = cfg["limit"] || 100
+      limit = AxonWeb.Params.int(cfg["limit"], 100, 1, 1000)
       {events, _max_id} = SyncHelpers.drain_to_device_messages(user_id, device_id, limit)
       %{"events" => events, "next_batch" => pos}
     end)
@@ -468,10 +471,10 @@ defmodule AxonWeb.SlidingSyncController do
       eph_floor = if is_initial, do: -1, else: eph_since
 
       rooms =
-        visible_room_ids
+        joined_room_ids
         |> Enum.filter(&SyncHelpers.has_ephemeral_change?(&1, eph_floor))
         |> Enum.map(fn room_id ->
-          case SyncHelpers.build_receipt_events(room_id) do
+          case SyncHelpers.build_receipt_events(room_id, user_id) do
             [event] -> {room_id, event}
             [] -> {room_id, nil}
           end
@@ -483,7 +486,7 @@ defmodule AxonWeb.SlidingSyncController do
     end)
     |> maybe_put_extension("typing", extensions_req, fn _cfg ->
       rooms =
-        Enum.into(visible_room_ids, %{}, fn room_id ->
+        Enum.into(joined_room_ids, %{}, fn room_id ->
           [event] = SyncHelpers.build_typing_event(room_id)
           {room_id, event}
         end)

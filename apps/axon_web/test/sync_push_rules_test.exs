@@ -23,7 +23,7 @@ defmodule AxonWeb.SyncPushRulesTest do
   defp push_rules_global(sync_resp) do
     sync_resp["account_data"]["events"]
     |> Enum.find(&(&1["type"] == "m.push_rules"))
-    |> then(& &1 && &1["content"]["global"])
+    |> then(&(&1 && &1["content"]["global"]))
   end
 
   test "an initial sync includes m.push_rules with the server defaults" do
@@ -47,6 +47,12 @@ defmodule AxonWeb.SyncPushRulesTest do
 
   test "customizing a push rule is reflected on the next sync" do
     alice = register("sprt_custom_#{System.unique_integer([:positive])}")
+
+    assert authed(alice.token)
+           |> jpu("/_matrix/client/v3/pushrules/global/room/!foo:example.com", %{
+             "actions" => []
+           })
+           |> Map.get(:status) == 200
 
     conn =
       authed(alice.token)

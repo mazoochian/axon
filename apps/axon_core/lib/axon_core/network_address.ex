@@ -74,12 +74,13 @@ defmodule AxonCore.NetworkAddress do
 
   IPv4: 10/8, 172.16/12, 192.168/16, 127/8 (loopback), 169.254/16
   (link-local, which is where cloud instance metadata lives), 0/8,
-  100.64/10 (CGNAT), 224/4 (multicast), 240/4 (reserved).
+  100.64/10 (CGNAT), 198.18/15 (benchmarking), 224/4 (multicast),
+  240/4 (reserved).
 
   IPv6: `::/128`, `::1` loopback, fe80::/10 link-local, fc00::/7
-  unique-local, and IPv4-mapped `::ffff:a.b.c.d` unwrapped and re-checked as
-  IPv4 (otherwise `::ffff:127.0.0.1` walks straight past an IPv4-only
-  check).
+  unique-local, ff00::/8 multicast, and both IPv4-mapped `::ffff:a.b.c.d`
+  and NAT64 `64:ff9b::a.b.c.d` unwrapped and re-checked as IPv4 (otherwise
+  `::ffff:127.0.0.1` walks straight past an IPv4-only check).
   """
   @spec private?(address()) :: boolean()
   def private?({10, _, _, _}), do: true
@@ -89,17 +90,20 @@ defmodule AxonCore.NetworkAddress do
   def private?({a, b, _, _}) when a == 172 and b in 16..31, do: true
   def private?({192, 168, _, _}), do: true
   def private?({100, b, _, _}) when b in 64..127, do: true
+  def private?({198, b, _, _}) when b in 18..19, do: true
   def private?({a, _, _, _}) when a >= 224, do: true
   def private?({0, 0, 0, 0, 0, 0, 0, 0}), do: true
   def private?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
   def private?({a, _, _, _, _, _, _, _}) when (a &&& 0xFFC0) == 0xFE80, do: true
   def private?({a, _, _, _, _, _, _, _}) when (a &&& 0xFE00) == 0xFC00, do: true
-
-  def private?({0, 0, 0, 0, 0, 0xFFFF, high, low}) do
-    private?({div(high, 256), rem(high, 256), div(low, 256), rem(low, 256)})
-  end
+  def private?({a, _, _, _, _, _, _, _}) when (a &&& 0xFF00) == 0xFF00, do: true
+  def private?({0, 0, 0, 0, 0, 0xFFFF, high, low}), do: private_embedded_v4?(high, low)
+  def private?({0x64, 0xFF9B, 0, 0, 0, 0, high, low}), do: private_embedded_v4?(high, low)
 
   def private?(_), do: false
+
+  defp private_embedded_v4?(high, low),
+    do: private?({div(high, 256), rem(high, 256), div(low, 256), rem(low, 256)})
 
   @doc """
   Resolves `host` and returns `{:ok, addresses}` only if *none* of them is

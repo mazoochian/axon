@@ -32,8 +32,6 @@ defmodule AxonFederation.MediaFetch do
   alias AxonFederation.{AddressGuard, HttpClient, ServerResolver}
   require Logger
 
-  @user_agent "Axon/1.0"
-
   @doc """
   Fetch the original media. Returns `{:ok, content_type, body, filename}`
   (filename is `nil` if the remote didn't supply one via
@@ -136,19 +134,19 @@ defmodule AxonFederation.MediaFetch do
   end
 
   defp content_type_boundary(headers) do
-    headers
-    |> Enum.find(fn {k, _} -> String.downcase(k) == "content-type" end)
-    |> case do
-      {_, v} ->
-        case Regex.run(~r/boundary="?([^";]+)"?/, v) do
-          [_, boundary] -> {:ok, boundary}
-          _ -> :error
-        end
-
-      _ ->
-        :error
+    with v when is_binary(v) <- header(headers, "content-type"),
+         [_, boundary] <- Regex.run(~r/boundary="?([^";]+)"?/, v) do
+      {:ok, boundary}
+    else
+      _ -> :error
     end
   end
+
+  defp header(headers, name) do
+    Enum.find_value(headers, fn {k, v} -> if String.downcase(k) == name, do: v end)
+  end
+
+  defp content_type(headers), do: header(headers, "content-type") || "application/octet-stream"
 
   # Splits on the boundary marker and drops the leading preamble ("", before
   # the first marker) and the trailing "--\r\n" epilogue (after the final
@@ -240,19 +238,11 @@ defmodule AxonFederation.MediaFetch do
   end
 
   defp do_follow_location(url, filename) do
-    req = Finch.build(:get, url, [{"user-agent", @user_agent}])
+    req = Finch.build(:get, url, [{"user-agent", HttpClient.user_agent()}])
 
     case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do
       {:ok, %{status: 200, headers: headers, body: body}} ->
-        content_type =
-          headers
-          |> Enum.find(fn {k, _} -> String.downcase(k) == "content-type" end)
-          |> case do
-            {_, v} -> v
-            nil -> "application/octet-stream"
-          end
-
-        {:ok, content_type, body, filename}
+        {:ok, content_type(headers), body, filename}
 
       {:ok, %{status: status}} ->
         {:error, {:http_error, status}}
@@ -270,27 +260,12 @@ defmodule AxonFederation.MediaFetch do
   # caller — re-resolving here would mean a second `.well-known` lookup
   # whose (possibly different) answer never went through the guard.
   defp legacy_fetch(base, path_with_query) do
-    req = Finch.build(:get, base <> path_with_query, [{"user-agent", @user_agent}])
+    req = Finch.build(:get, base <> path_with_query, [{"user-agent", HttpClient.user_agent()}])
 
     case Finch.request(req, Axon.Finch, receive_timeout: 30_000) do
       {:ok, %{status: 200, headers: headers, body: body}} ->
-        content_type =
-          headers
-          |> Enum.find(fn {k, _} -> String.downcase(k) == "content-type" end)
-          |> case do
-            {_, v} -> v
-            nil -> "application/octet-stream"
-          end
-
-        filename =
-          headers
-          |> Enum.find(fn {k, _} -> String.downcase(k) == "content-disposition" end)
-          |> case do
-            {_, v} -> filename_from_content_disposition(v)
-            nil -> nil
-          end
-
-        {:ok, content_type, body, filename}
+        filename = filename_from_content_disposition(header(headers, "content-disposition"))
+        {:ok, content_type(headers), body, filename}
 
       {:ok, %{status: status}} when status in [403, 404] ->
         {:error, :not_found}

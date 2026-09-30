@@ -35,11 +35,31 @@ defmodule AxonCrypto.CanonicalJSON do
   def encode(false), do: "false"
   def encode(nil), do: "null"
 
+  def encode(value) do
+    raise ArgumentError, "Value is not encodable as Matrix canonical JSON: #{inspect(value)}"
+  end
+
   @spec encode_to_binary(term()) :: binary()
   def encode_to_binary(value), do: value |> encode() |> IO.iodata_to_binary()
 
+  @doc """
+  Like `encode_to_binary/1`, but returns `{:error, :invalid_canonical_json}`
+  instead of raising for floats, non-string keys, invalid UTF-8 or other
+  unencodable terms — for verifying untrusted input.
+  """
+  @spec safe_encode_to_binary(term()) :: {:ok, binary()} | {:error, :invalid_canonical_json}
+  def safe_encode_to_binary(value) do
+    {:ok, encode_to_binary(value)}
+  rescue
+    _ in [ArgumentError, UnicodeConversionError] -> {:error, :invalid_canonical_json}
+  end
+
   defp encode_string(str) when is_binary(str) do
     [?", escape_string(str), ?"]
+  end
+
+  defp encode_string(key) do
+    raise ArgumentError, "Object keys must be strings in Matrix canonical JSON: #{inspect(key)}"
   end
 
   defp escape_string(str) do

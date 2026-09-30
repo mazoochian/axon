@@ -45,6 +45,26 @@ defmodule AxonWeb.RateLimitTest do
     assert RateLimiter.check(key_b, 1, 60_000) == :ok
   end
 
+  test "check/3 never admits more than max requests from concurrent callers" do
+    key = {:test_bucket, "concurrent_#{System.unique_integer([:positive])}"}
+
+    admitted =
+      1..50
+      |> Task.async_stream(fn _ -> RateLimiter.check(key, 5, 60_000) end, max_concurrency: 50)
+      |> Enum.count(&(&1 == {:ok, :ok}))
+
+    assert admitted in 1..5
+  end
+
+  test "peek/3 does not record and record_hit/1 counts towards the limit" do
+    key = {:test_bucket, "peek_#{System.unique_integer([:positive])}"}
+
+    assert RateLimiter.peek(key, 1, 60_000) == :ok
+    assert RateLimiter.peek(key, 1, 60_000) == :ok
+    RateLimiter.record_hit(key)
+    assert {:error, _} = RateLimiter.peek(key, 1, 60_000)
+  end
+
   test "the login plug returns 429 M_LIMIT_EXCEEDED once the configured limit is exceeded" do
     original = Application.get_env(:axon_web, :rate_limits)
     on_exit(fn -> Application.put_env(:axon_web, :rate_limits, original) end)
@@ -59,7 +79,7 @@ defmodule AxonWeb.RateLimitTest do
     # the shared {:login, "127.0.0.1"} ETS bucket already has a long
     # history by the time this test runs — clear it so the 2-request limit
     # set above actually starts from zero instead of being pre-exhausted.
-    :ets.match_delete(:axon_rate_limiter, {{:login, :_}, :_})
+    AxonWeb.RateLimiter.reset(:login)
 
     username = "rl_login_#{System.unique_integer([:positive])}"
     register(username)
@@ -104,7 +124,7 @@ defmodule AxonWeb.RateLimitTest do
       Keyword.put(original, bucket, max: max, window_ms: window_ms)
     )
 
-    :ets.match_delete(:axon_rate_limiter, {{bucket, :_}, :_})
+    AxonWeb.RateLimiter.reset(bucket)
     :ok
   end
 

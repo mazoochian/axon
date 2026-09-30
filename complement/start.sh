@@ -61,6 +61,7 @@ export URL_PREVIEW_ALLOW_PRIVATE_ADDRESSES=true
 # SSRF guard otherwise always blocks — see config/runtime.exs and
 # AxonFederation.AddressGuard.
 export FEDERATION_ALLOW_PRIVATE_ADDRESSES=true
+export PUSH_ALLOW_PRIVATE_ADDRESSES=true
 
 # Complement's Synapse-compat harness mints its admin/test accounts through
 # POST /_synapse/admin/v1/register, MACed with the shared secret its own

@@ -56,7 +56,8 @@ defmodule AxonWeb.Oidc do
       # JSON default) would otherwise fall through as a real subject rather
       # than the localpart fallback below it — every such token would then
       # collapse onto the same `oidc_subject: ""` account.
-      subject = if is_binary(claims["sub"]) and claims["sub"] != "", do: claims["sub"], else: localpart
+      subject =
+        if is_binary(claims["sub"]) and claims["sub"] != "", do: claims["sub"], else: localpart
 
       case UserStore.authenticate_via_oidc(subject, localpart, device_id, server_name) do
         {:ok, result} ->
@@ -134,14 +135,14 @@ defmodule AxonWeb.Oidc do
   # to ever hold a coherent device/cross-signing identity), pin one device_id
   # per token by hash, generating it once on first use.
   defp stable_fallback_device_id(raw_token) do
-    hash = token_hash(raw_token)
+    hash = UserStore.token_hash(raw_token)
 
     case Repo.get_by(OidcDeviceBinding, token_hash: hash) do
       %OidcDeviceBinding{device_id: device_id} ->
         device_id
 
       nil ->
-        candidate = generate_device_id()
+        candidate = UserStore.generate_device_id()
 
         Logger.warning(
           "OIDC token introspection response has no urn:matrix:client:device:<id> scope; " <>
@@ -161,8 +162,6 @@ defmodule AxonWeb.Oidc do
         end
     end
   end
-
-  defp token_hash(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
 
   # `username` is the documented claim real ASes (Matrix Authentication
   # Service, Synapse's delegated-auth client) send for the Matrix localpart.
@@ -203,10 +202,6 @@ defmodule AxonWeb.Oidc do
       "" -> nil
       localpart -> localpart
     end
-  end
-
-  defp generate_device_id do
-    :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false) |> String.upcase()
   end
 
   defp config, do: Application.get_env(:axon_web, :oidc, [])

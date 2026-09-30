@@ -240,7 +240,7 @@ defmodule AxonWeb.Phase4Test do
         "device_display_name" => "Phone",
         "pushkey" => pushkey,
         "lang" => "en",
-        "data" => %{"url" => "https://push.example.com/v1"}
+        "data" => %{"url" => "https://push1.example.com/_matrix/push/v1/notify"}
       })
       |> then(fn c -> assert c.status == 200 end)
 
@@ -252,7 +252,7 @@ defmodule AxonWeb.Phase4Test do
         "device_display_name" => "Phone",
         "pushkey" => pushkey,
         "lang" => "fr",
-        "data" => %{"url" => "https://push.example.com/v2"}
+        "data" => %{"url" => "https://push2.example.com/_matrix/push/v1/notify"}
       })
       |> then(fn c -> assert c.status == 200 end)
 
@@ -275,7 +275,7 @@ defmodule AxonWeb.Phase4Test do
         "device_display_name" => "Phone",
         "pushkey" => pushkey,
         "lang" => "en",
-        "data" => %{"url" => "https://push.example.com/notify"}
+        "data" => %{"url" => "https://push.example.com/_matrix/push/v1/notify"}
       })
       |> then(fn c -> assert c.status == 200 end)
 

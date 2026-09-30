@@ -3,6 +3,7 @@ defmodule AxonWeb.PusherController do
 
   import Ecto.Query
   alias AxonCore.Repo
+  alias AxonPush.Dispatcher
 
   # GET /_matrix/client/v3/pushers
   def index(conn, _params) do
@@ -63,6 +64,19 @@ defmodule AxonWeb.PusherController do
         conn
         |> put_status(400)
         |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "pushkey required"})
+
+      kind == "http" and not is_map(params["data"]) ->
+        conn
+        |> put_status(400)
+        |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "data.url required"})
+
+      kind == "http" and not Dispatcher.valid_push_url?(params["data"]["url"]) ->
+        conn
+        |> put_status(400)
+        |> json(%{
+          "errcode" => "M_INVALID_PARAM",
+          "error" => "data.url must be an http(s) URL with path /_matrix/push/v1/notify"
+        })
 
       true ->
         row = %{

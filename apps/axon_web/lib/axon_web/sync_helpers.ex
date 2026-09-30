@@ -208,11 +208,15 @@ defmodule AxonWeb.SyncHelpers do
     |> Enum.map(fn r -> %{"type" => r.type, "content" => r.content} end)
   end
 
-  def build_receipt_events(room_id) do
+  # m.read.private receipts are only ever shown to their own user.
+  def build_receipt_events(room_id, viewer_id) do
     receipts =
       Repo.all(
         from(r in "receipts",
-          where: r.room_id == ^room_id and r.receipt_type in ["m.read", "m.read.private"],
+          where:
+            r.room_id == ^room_id and
+              (r.receipt_type == "m.read" or
+                 (r.receipt_type == "m.read.private" and r.user_id == ^viewer_id)),
           select: %{
             user_id: r.user_id,
             receipt_type: r.receipt_type,
@@ -405,30 +409,19 @@ defmodule AxonWeb.SyncHelpers do
     end)
   end
 
-  @doc "The stream_ordering of `user_id`'s current `m.read` receipt in `room_id`, or 0 if they've never sent one."
+  @doc "The stream_ordering of `user_id`'s furthest `m.read`/`m.read.private` receipt in `room_id`, or 0 if they've never sent one."
   def read_receipt_ordering(room_id, user_id) do
-    receipt_event_id =
-      Repo.one(
-        from(r in "receipts",
-          where: r.room_id == ^room_id and r.user_id == ^user_id and r.receipt_type == "m.read",
-          select: r.event_id
-        )
+    Repo.one(
+      from(r in "receipts",
+        join: e in "events",
+        on: e.event_id == r.event_id,
+        where:
+          r.room_id == ^room_id and r.user_id == ^user_id and
+            r.receipt_type in ["m.read", "m.read.private"],
+        select: max(e.stream_ordering)
       )
-
-    with event_id when not is_nil(event_id) <- receipt_event_id,
-         {:ok, event} <- EventStore.get_event(event_id) do
-      event.stream_ordering
-    else
-      _ -> 0
-    end
+    ) || 0
   end
 
-  @doc "True if a push rule's actions include the `highlight` tweak set to a truthy value."
-  def highlight?(actions) do
-    Enum.any?(actions, fn
-      %{"set_tweak" => "highlight", "value" => value} -> value != false
-      %{"set_tweak" => "highlight"} -> true
-      _ -> false
-    end)
-  end
+  defdelegate highlight?(actions), to: AxonPush.Notifications
 end

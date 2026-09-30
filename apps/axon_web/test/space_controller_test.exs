@@ -303,6 +303,18 @@ defmodule AxonWeb.SpaceControllerTest do
     refute Map.has_key?(body2, "next_batch")
   end
 
+  test "out-of-range limit/max_depth are clamped and a malformed via list doesn't crash" do
+    alice = register("alice_#{System.unique_integer([:positive])}")
+    top = space(alice.token, "Top Space")
+    add_child(alice.token, top, "!remote_child:unreachable.example", %{"via" => "notalist"})
+
+    for query <- ["limit=-1", "limit=0", "max_depth=-5", "limit=abc"] do
+      conn = authed(alice.token) |> get("/_matrix/client/v1/rooms/#{top}/hierarchy?#{query}")
+      assert conn.status == 200
+      assert [%{"room_id" => ^top} | _] = decode(conn)["rooms"]
+    end
+  end
+
   # GET /_matrix/client/v1/room_summary/:room_id_or_alias — a different
   # endpoint from /hierarchy, and the one TestRoomSummaryAllowedRoomIDs hits.
   describe "room_summary" do

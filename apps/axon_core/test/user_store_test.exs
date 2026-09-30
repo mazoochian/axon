@@ -7,7 +7,7 @@ defmodule AxonCore.UserStoreTest do
 
   use AxonCore.DataCase, async: false
 
-  alias AxonCore.UserStore
+  alias AxonCore.{KeyStore, UserStore}
 
   defp uniq(prefix), do: "#{prefix}_#{System.unique_integer([:positive])}"
 
@@ -136,6 +136,14 @@ defmodule AxonCore.UserStoreTest do
     test "login by full user_id (not just localpart) works", %{user_id: user_id} do
       assert {:ok, _} = UserStore.login(user_id, "Test1234!", server_name: "localhost")
     end
+
+    test "a password-less (OIDC-provisioned) user is forbidden rather than crashing" do
+      localpart = uniq("oidcuser")
+      {:ok, _} = UserStore.authenticate_via_oidc(uniq("subject"), localpart, "DEV1", "localhost")
+
+      assert UserStore.login(localpart, "anything", server_name: "localhost") ==
+               {:error, :forbidden}
+    end
   end
 
   describe "token lifecycle" do
@@ -166,6 +174,34 @@ defmodule AxonCore.UserStoreTest do
 
       assert UserStore.validate_token(reg.access_token) == :error
       assert UserStore.validate_token(reg2.access_token) == {:ok, {reg.user_id, reg2.device_id}}
+    end
+
+    test "logout_all deletes the other devices and their keys, sparing the excluded one", %{
+      reg: reg
+    } do
+      {:ok, reg2} = UserStore.login(reg.user_id, "Test1234!", server_name: "localhost")
+
+      Repo.insert_all("device_keys", [
+        %{
+          user_id: reg.user_id,
+          device_id: reg.device_id,
+          algorithms: [],
+          keys: %{},
+          signatures: %{},
+          inserted_at: DateTime.utc_now(:microsecond),
+          updated_at: DateTime.utc_now(:microsecond)
+        }
+      ])
+
+      :ok = UserStore.logout_all(reg.user_id, reg2.access_token)
+
+      assert KeyStore.device_ids_for_user(reg.user_id) == [reg2.device_id]
+      assert KeyStore.device_keys_for_user(reg.user_id) == %{}
+    end
+
+    test "logout_all without an exclusion deletes every device", %{reg: reg} do
+      :ok = UserStore.logout_all(reg.user_id)
+      assert KeyStore.device_ids_for_user(reg.user_id) == []
     end
   end
 

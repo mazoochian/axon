@@ -243,4 +243,41 @@ defmodule AxonFederation.EventVerificationTest do
                EventVerification.verify_signature_from(event, "third-party.test", "11")
     end
   end
+
+  describe "restricted-join authorising signature" do
+    defp restricted_join(joiner_server, authoriser_server) do
+      user = "@joiner:#{joiner_server}"
+
+      base_event(user)
+      |> Map.merge(%{
+        "type" => "m.room.member",
+        "state_key" => user,
+        "content" => %{
+          "membership" => "join",
+          "join_authorised_via_users_server" => "@admin:#{authoriser_server}"
+        }
+      })
+    end
+
+    test "a v8+ join vouched for by another server must carry that server's signature",
+         %{good: good, good_port: good_port, evil: evil, evil_port: evil_port} do
+      event =
+        restricted_join(good, evil)
+        |> then(&FakeRemoteMatrixServer.sign_event(good_port, &1, "10"))
+
+      assert EventVerification.verify(event, "10") == {:error, :missing_signature}
+
+      countersigned = FakeRemoteMatrixServer.sign_event(evil_port, event, "10")
+      assert {:ok, _} = EventVerification.verify(countersigned, "10")
+    end
+
+    test "room versions before 8 have no authorising-server requirement",
+         %{good: good, good_port: good_port, evil: evil} do
+      event =
+        restricted_join(good, evil)
+        |> then(&FakeRemoteMatrixServer.sign_event(good_port, &1, "7"))
+
+      assert {:ok, _} = EventVerification.verify(event, "7")
+    end
+  end
 end

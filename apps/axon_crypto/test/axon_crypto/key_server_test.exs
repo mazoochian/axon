@@ -105,12 +105,22 @@ defmodule AxonCrypto.KeyServerTest do
       refute :crypto.verify(:eddsa, :none, payload, sig_bytes, [pub_key, :ed25519])
     end
 
-    test "valid_until_ts is roughly 7 days out", %{pid: pid} do
+    test "valid_until_ts is 7 days out, rounded up to the hour", %{pid: pid} do
+      now = System.os_time(:millisecond)
       info = GenServer.call(pid, :server_key_info)
       seven_days_ms = 7 * 24 * 60 * 60 * 1000
-      now = System.os_time(:millisecond)
+      hour_ms = 60 * 60 * 1000
 
-      assert_in_delta info.valid_until_ts, now + seven_days_ms, 5_000
+      assert rem(info.valid_until_ts, hour_ms) == 0
+      assert info.valid_until_ts > now + seven_days_ms
+      assert info.valid_until_ts <= now + seven_days_ms + hour_ms + 5_000
+    end
+
+    test "valid_until_ts is computed per request, not frozen at startup", %{pid: pid} do
+      :sys.replace_state(pid, &Map.put(&1, :valid_until_ts, 0))
+      info = GenServer.call(pid, :server_key_info)
+
+      assert info.valid_until_ts > System.os_time(:millisecond) + 6 * 24 * 60 * 60 * 1000
     end
   end
 
@@ -167,7 +177,10 @@ defmodule AxonCrypto.KeyServerTest do
       # I4 fix below), and doing that to `System.tmp_dir!()` itself would
       # lock every other process on the box out of `/tmp`.
       dir =
-        Path.join(System.tmp_dir!(), "axon_test_signing_key_dir_#{System.unique_integer([:positive])}")
+        Path.join(
+          System.tmp_dir!(),
+          "axon_test_signing_key_dir_#{System.unique_integer([:positive])}"
+        )
 
       path = Path.join(dir, "signing_key.json")
 
@@ -255,7 +268,9 @@ defmodule AxonCrypto.KeyServerTest do
     # all. 0700 removes that access outright rather than racing it.
     test "the key's directory is locked down to its owner", %{dir: dir} do
       name = :"key_server_dirperm_#{System.unique_integer([:positive])}"
-      {:ok, _pid} = GenServer.start_link(KeyServer, [server_name: "dirperm.example.org"], name: name)
+
+      {:ok, _pid} =
+        GenServer.start_link(KeyServer, [server_name: "dirperm.example.org"], name: name)
 
       mode = File.stat!(dir).mode |> Bitwise.band(0o777)
       assert mode == 0o700

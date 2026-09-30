@@ -88,4 +88,16 @@ defmodule AxonWeb.MailerTest do
     configure_smtp()
     assert Mailer.configured?()
   end
+
+  test "an address containing CR/LF is refused, so it can't inject headers" do
+    configure_smtp()
+    invite = %{inviter_id: "@alice:localhost", room_id: "!room:localhost", token: "tok"}
+
+    for address <- ["bob@example.com\r\nBcc: eve@evil.example", "bob@example.com\nX: y"] do
+      assert Mailer.deliver_3pid_invite(address, invite) == {:error, :invalid_address}
+    end
+
+    Process.sleep(100)
+    assert FakeSmtpServer.received(@port) == []
+  end
 end

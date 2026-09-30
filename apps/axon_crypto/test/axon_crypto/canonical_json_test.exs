@@ -124,5 +124,18 @@ defmodule AxonCrypto.CanonicalJSONTest do
     end
   end
 
+  describe "safe_encode_to_binary/1" do
+    test "returns {:ok, binary} for encodable input" do
+      assert CanonicalJSON.safe_encode_to_binary(%{"b" => [1, nil], "a" => true}) ==
+               {:ok, ~s({"a":true,"b":[1,null]})}
+    end
+
+    test "returns an error instead of raising for unencodable input" do
+      for bad <- [%{"a" => 1.5}, %{1 => "x"}, %{"a" => <<0xFF>>}, %{"a" => {:tuple}}] do
+        assert CanonicalJSON.safe_encode_to_binary(bad) == {:error, :invalid_canonical_json}
+      end
+    end
+  end
+
   defp to_binary(value), do: CanonicalJSON.encode_to_binary(value)
 end

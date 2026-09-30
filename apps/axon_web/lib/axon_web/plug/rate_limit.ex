@@ -117,10 +117,11 @@ defmodule AxonWeb.Plug.RateLimit do
     # raise out of `identifier["user"]` (`Access` isn't implemented for
     # those), turning a malformed request into a 500 instead of just falling
     # through to "no account identifiable, per-IP limiting only" below.
-    identifier = case params["identifier"] do
-      %{} = m -> m
-      _ -> %{}
-    end
+    identifier =
+      case params["identifier"] do
+        %{} = m -> m
+        _ -> %{}
+      end
 
     case identifier["user"] || params["user"] do
       user when is_binary(user) and user != "" ->

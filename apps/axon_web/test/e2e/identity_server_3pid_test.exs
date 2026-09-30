@@ -88,7 +88,16 @@ defmodule AxonWeb.E2E.IdentityServer3pidTest do
       id: :e2e_federation_listener,
       start:
         {Bandit, :start_link,
-         [[plug: AxonWeb.FederationEndpoint, scheme: :https, ip: {0, 0, 0, 0}, port: @fed_port, certfile: @cert, keyfile: @key]]}
+         [
+           [
+             plug: AxonWeb.FederationEndpoint,
+             scheme: :https,
+             ip: {0, 0, 0, 0},
+             port: @fed_port,
+             certfile: @cert,
+             keyfile: @key
+           ]
+         ]}
     })
 
     :ok
@@ -109,7 +118,10 @@ defmodule AxonWeb.E2E.IdentityServer3pidTest do
     #    nothing has bound bob_email yet) and a real store-invite.
     invite_conn =
       authed(alice.token)
-      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", %{"medium" => "email", "address" => bob_email})
+      |> jp("/_matrix/client/v3/rooms/#{room_id}/invite", %{
+        "medium" => "email",
+        "address" => bob_email
+      })
 
     assert invite_conn.status == 200
 
@@ -121,7 +133,9 @@ defmodule AxonWeb.E2E.IdentityServer3pidTest do
     token = invite_event["state_key"]
 
     # It's Sydent's own real long-term key, not axon's.
-    refute invite_event["content"]["public_key"] == AxonCrypto.KeyServer.server_key_info().public_key_b64
+    refute invite_event["content"]["public_key"] ==
+             AxonCrypto.KeyServer.server_key_info().public_key_b64
+
     assert [_long_term, _ephemeral] = invite_event["content"]["public_keys"]
 
     assert Enum.all?(invite_event["content"]["public_keys"], fn %{"key_validity_url" => url} ->
@@ -135,37 +149,61 @@ defmodule AxonWeb.E2E.IdentityServer3pidTest do
     #    it. v1 (unauthenticated) endpoints, matching what a client with
     #    no id_access_token of its own yet would actually call.
     request_body =
-      Jason.encode!(%{"client_secret" => client_secret, "email" => bob_email, "send_attempt" => 1})
+      Jason.encode!(%{
+        "client_secret" => client_secret,
+        "email" => bob_email,
+        "send_attempt" => 1
+      })
 
     {:ok, request_resp} =
-      Finch.build(:post, @sydent_url <> "/_matrix/identity/api/v1/validate/email/requestToken", [
-        {"content-type", "application/json"}
-      ], request_body)
+      Finch.build(
+        :post,
+        @sydent_url <> "/_matrix/identity/api/v1/validate/email/requestToken",
+        [
+          {"content-type", "application/json"}
+        ],
+        request_body
+      )
       |> Finch.request(Axon.Finch)
 
     %{"sid" => sid} = Jason.decode!(request_resp.body)
 
     validation_code = wait_for_validation_code(bob_email)
 
-    submit_body = Jason.encode!(%{"sid" => sid, "client_secret" => client_secret, "token" => validation_code})
+    submit_body =
+      Jason.encode!(%{"sid" => sid, "client_secret" => client_secret, "token" => validation_code})
 
     {:ok, submit_resp} =
-      Finch.build(:post, @sydent_url <> "/_matrix/identity/api/v1/validate/email/submitToken", [
-        {"content-type", "application/json"}
-      ], submit_body)
+      Finch.build(
+        :post,
+        @sydent_url <> "/_matrix/identity/api/v1/validate/email/submitToken",
+        [
+          {"content-type", "application/json"}
+        ],
+        submit_body
+      )
       |> Finch.request(Axon.Finch)
 
     assert %{"success" => true} = Jason.decode!(submit_resp.body)
 
-    bind_body = Jason.encode!(%{"sid" => sid, "client_secret" => client_secret, "mxid" => bob_mxid})
+    bind_body =
+      Jason.encode!(%{"sid" => sid, "client_secret" => client_secret, "mxid" => bob_mxid})
 
     {:ok, bind_resp} =
-      Finch.build(:post, @sydent_url <> "/_matrix/identity/api/v1/3pid/bind", [{"content-type", "application/json"}], bind_body)
+      Finch.build(
+        :post,
+        @sydent_url <> "/_matrix/identity/api/v1/3pid/bind",
+        [{"content-type", "application/json"}],
+        bind_body
+      )
       |> Finch.request(Axon.Finch)
 
     bind_data = Jason.decode!(bind_resp.body)
     invite = Enum.find(bind_data["invites"], &(&1["token"] == token))
-    assert invite, "Sydent's real bind response didn't include a signed proof for this invite's token"
+
+    assert invite,
+           "Sydent's real bind response didn't include a signed proof for this invite's token"
+
     proof = invite["signed"]
     assert proof["mxid"] == bob_mxid
     assert proof["signatures"]
@@ -184,7 +222,9 @@ defmodule AxonWeb.E2E.IdentityServer3pidTest do
 
     assert join_conn.status == 200
 
-    members_conn = authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/joined_members")
+    members_conn =
+      authed(alice.token) |> get("/_matrix/client/v3/rooms/#{room_id}/joined_members")
+
     assert Map.has_key?(decode(members_conn)["joined"], bob_mxid)
   end
 
@@ -195,7 +235,8 @@ defmodule AxonWeb.E2E.IdentityServer3pidTest do
   # than assuming ordering.
   defp wait_for_validation_code(_email, attempts_left \\ 20)
 
-  defp wait_for_validation_code(email, 0), do: flunk("no validation email arrived for #{email} within the timeout")
+  defp wait_for_validation_code(email, 0),
+    do: flunk("no validation email arrived for #{email} within the timeout")
 
   defp wait_for_validation_code(email, attempts_left) do
     case Enum.find(FakeSmtpServer.received(@smtp_port), &String.contains?(&1.data, "code is")) do

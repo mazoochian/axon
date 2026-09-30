@@ -2148,4 +2148,246 @@ defmodule AxonCore.EventStoreTest do
       assert EventStore.trustworthy_local_timestamp_answer?(@room, stranded, "b") == false
     end
   end
+
+  describe "insert_event/2 — re-sending an already-accepted event" do
+    test "does not roll current state back to the older event" do
+      old =
+        event(%{"type" => "m.room.topic", "state_key" => "", "content" => %{"topic" => "old"}})
+
+      new =
+        event(%{"type" => "m.room.topic", "state_key" => "", "content" => %{"topic" => "new"}})
+
+      {:ok, _} = EventStore.insert_event(old, "10")
+      {:ok, _} = EventStore.insert_event(new, "10")
+      {:ok, resent} = EventStore.insert_event(old, "10")
+
+      assert resent.event_id == old["event_id"]
+
+      assert {:ok, %{content: %{"topic" => "new"}}} =
+               EventStore.get_state_event(@room, "m.room.topic", "")
+    end
+
+    test "does not roll membership back to the older event" do
+      bob = "@bob:remote.example"
+
+      member =
+        &event(%{
+          "type" => "m.room.member",
+          "state_key" => bob,
+          "sender" => bob,
+          "content" => %{"membership" => &1}
+        })
+
+      join = member.("join")
+
+      {:ok, _} = EventStore.insert_event(join, "10")
+      {:ok, _} = EventStore.insert_event(member.("leave"), "10")
+      {:ok, _} = EventStore.insert_event(join, "10")
+
+      assert EventStore.get_membership(@room, bob) == {:ok, "leave"}
+    end
+  end
+
+  describe "redaction power" do
+    defp redacted?(event_id) do
+      {:ok, e} = EventStore.get_event(event_id)
+      e.redacted
+    end
+
+    defp redact(room_id, sender, target_id, version) do
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "room_id" => room_id,
+            "sender" => sender,
+            "type" => "m.room.redaction",
+            "content" => %{"redacts" => target_id}
+          }),
+          version
+        )
+    end
+
+    defp message(room_id, sender, version) do
+      ev = event(%{"room_id" => room_id, "sender" => sender})
+      {:ok, _} = EventStore.insert_event(ev, version)
+      ev["event_id"]
+    end
+
+    defp state(room_id, type, sender, content, version) do
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "room_id" => room_id,
+            "sender" => sender,
+            "type" => type,
+            "state_key" => "",
+            "content" => content
+          }),
+          version
+        )
+    end
+
+    test "a v12 creator and additional creator can redact despite no power_levels entry" do
+      room = "!v12redact:localhost"
+      {:ok, _} = EventStore.insert_room(room, @creator, "12", false)
+      state(room, "m.room.create", @creator, %{"additional_creators" => ["@co:localhost"]}, "12")
+      state(room, "m.room.power_levels", @creator, %{"users" => %{}, "redact" => 50}, "12")
+
+      target = message(room, "@bob:localhost", "12")
+      redact(room, @creator, target, "12")
+      assert redacted?(target)
+
+      target = message(room, "@bob:localhost", "12")
+      redact(room, "@co:localhost", target, "12")
+      assert redacted?(target)
+    end
+
+    test "with no power_levels event the creator has level 100 and others 0" do
+      state(@room, "m.room.create", @creator, %{"creator" => @creator}, "10")
+
+      target = message(@room, "@bob:localhost", "10")
+      redact(@room, "@eve:localhost", target, "10")
+      refute redacted?(target)
+
+      redact(@room, @creator, target, "10")
+      assert redacted?(target)
+    end
+
+    test "string power levels compare numerically" do
+      state(@room, "m.room.create", @creator, %{"creator" => @creator}, "10")
+
+      state(
+        @room,
+        "m.room.power_levels",
+        @creator,
+        %{"users" => %{"@mod:localhost" => "100", "@low:localhost" => "9"}, "redact" => "50"},
+        "10"
+      )
+
+      target = message(@room, "@bob:localhost", "10")
+      redact(@room, "@low:localhost", target, "10")
+      refute redacted?(target)
+
+      redact(@room, "@mod:localhost", target, "10")
+      assert redacted?(target)
+    end
+
+    test "a redaction in another room never applies, even from the original sender" do
+      other = "!otherroom:localhost"
+      {:ok, _} = EventStore.insert_room(other, @creator, "10", false)
+
+      target = message(@room, "@bob:localhost", "10")
+      redact(other, "@bob:localhost", target, "10")
+      refute redacted?(target)
+    end
+  end
+
+  describe "room upgrade push rules with v12 room IDs" do
+    test "copies rules when the successor has a hash-only room ID" do
+      successor = "!v12successorhashonly"
+      now = DateTime.utc_now(:microsecond)
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "type" => "m.room.member",
+            "state_key" => @creator,
+            "content" => %{"membership" => "join"}
+          }),
+          "10"
+        )
+
+      Repo.insert_all("user_push_rules", [
+        %{
+          user_id: @creator,
+          kind: "room",
+          rule_id: @room,
+          is_default: false,
+          actions: ["dont_notify"],
+          enabled: true,
+          inserted_at: now
+        }
+      ])
+
+      {:ok, _} = EventStore.insert_room(successor, @creator, "12", false)
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "type" => "m.room.tombstone",
+            "state_key" => "",
+            "content" => %{"body" => "upgraded", "replacement_room" => successor}
+          }),
+          "10"
+        )
+
+      {:ok, _} =
+        EventStore.insert_event(
+          event(%{
+            "room_id" => successor,
+            "type" => "m.room.create",
+            "state_key" => "",
+            "content" => %{"predecessor" => %{"room_id" => @room}}
+          }),
+          "12"
+        )
+
+      assert Repo.all(
+               from(r in "user_push_rules", where: r.rule_id == ^successor, select: r.actions)
+             ) == [["dont_notify"]]
+    end
+  end
+
+  describe "search_messages/5 soft-failed events" do
+    test "never returns a soft-failed message" do
+      {:ok, _} =
+        EventStore.insert_soft_failed_event(
+          event(%{"content" => %{"msgtype" => "m.text", "body" => "hidden softfail"}}),
+          "10"
+        )
+
+      assert EventStore.search_messages([@room], "softfail", "rank", 10) == {[], 0, nil}
+    end
+  end
+
+  describe "purge_room/1 related rows" do
+    test "also removes auth edges, notifications and client transactions" do
+      ev = event(%{"auth_events" => ["$some-auth-event"]})
+      {:ok, _} = EventStore.insert_event(ev, "10")
+      event_id = ev["event_id"]
+      now = DateTime.utc_now(:microsecond)
+
+      Repo.insert_all("notifications", [
+        %{
+          user_id: @creator,
+          room_id: @room,
+          event_id: event_id,
+          sender: @creator,
+          actions: [],
+          stream_ordering: 1,
+          ts: 1,
+          inserted_at: now
+        }
+      ])
+
+      Repo.insert_all("client_txns", [
+        %{
+          user_id: @creator,
+          device_id: "DEV",
+          txn_id: "t1",
+          event_id: event_id,
+          request_scope: "s",
+          inserted_at: now
+        }
+      ])
+
+      :ok = EventStore.purge_room(@room)
+
+      for table <- ["event_auth_edges", "client_txns"] do
+        assert Repo.aggregate(from(r in table, where: r.event_id == ^event_id), :count) == 0
+      end
+
+      assert Repo.aggregate(from(n in "notifications", where: n.room_id == ^@room), :count) == 0
+    end
+  end
 end

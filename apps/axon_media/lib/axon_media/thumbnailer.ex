@@ -11,8 +11,23 @@ defmodule AxonMedia.Thumbnailer do
 
   require Logger
 
-  @supported_content_types ~w(image/jpeg image/png image/gif image/webp)
+  # content type => {ImageMagick coder, cache file extension}
+  @formats %{
+    "image/jpeg" => {"jpeg", "jpg"},
+    "image/png" => {"png", "png"},
+    "image/gif" => {"gif", "gif"},
+    "image/webp" => {"webp", "webp"}
+  }
   @max_dimension 1600
+  @resource_limits [
+    ["-limit", "memory", "256MiB"],
+    ["-limit", "map", "512MiB"],
+    ["-limit", "disk", "1GiB"],
+    ["-limit", "area", "128MP"],
+    ["-limit", "width", "16KP"],
+    ["-limit", "height", "16KP"],
+    ["-limit", "time", "30"]
+  ]
 
   @doc """
   Generates (or reuses a cached) thumbnail for `media_id`.
@@ -22,46 +37,49 @@ defmodule AxonMedia.Thumbnailer do
   the source isn't a thumbnailable image, or `{:error, reason}` on failure.
   """
   def generate(media_id, source_path, content_type, width, height, method) do
-    if content_type in @supported_content_types do
-      width = clamp(width)
-      height = clamp(height)
-      method = if method == "crop", do: "crop", else: "scale"
-      cache_path = cache_path(media_id, width, height, method, content_type)
+    case Map.fetch(@formats, content_type) do
+      {:ok, {coder, ext}} ->
+        width = clamp(width)
+        height = clamp(height)
+        method = if method == "crop", do: "crop", else: "scale"
+        cache_path = cache_path(media_id, width, height, method, ext)
 
-      cond do
-        File.exists?(cache_path) ->
-          read_cached(cache_path, content_type)
+        with :ok <- ensure_thumbnail(source_path, cache_path, coder, width, height, method),
+             {:ok, data} <- File.read(cache_path) do
+          {:ok, {content_type, data}}
+        end
 
-        true ->
-          with :ok <- run_convert(source_path, cache_path, width, height, method) do
-            read_cached(cache_path, content_type)
-          end
-      end
-    else
-      {:error, :unsupported_content_type}
+      :error ->
+        {:error, :unsupported_content_type}
     end
   end
 
-  defp read_cached(path, content_type) do
-    case File.read(path) do
-      {:ok, data} -> {:ok, {content_type, data}}
-      {:error, reason} -> {:error, reason}
-    end
+  defp ensure_thumbnail(source_path, cache_path, coder, width, height, method) do
+    if File.exists?(cache_path),
+      do: :ok,
+      else: run_convert(source_path, cache_path, coder, width, height, method)
   end
 
-  # ImageMagick infers the output format from output_path's extension, which
-  # cache_path/4 already set to match the source content-type.
-  defp run_convert(source_path, output_path, width, height, method) do
+  # The explicit coder prefix on both input and output stops ImageMagick
+  # from sniffing the source format, so a file stored as image/png that is
+  # really SVG/MVG/etc. fails to decode instead of reaching a riskier coder.
+  # "[0]" selects the first frame only. Output goes to a temp file renamed
+  # into place, so a concurrent reader never sees a partial thumbnail.
+  defp run_convert(source_path, output_path, coder, width, height, method) do
     File.mkdir_p!(Path.dirname(output_path))
-    resize_args = resize_args(width, height, method)
-    # "[0]" selects the first frame only — good enough for a thumbnail of an animated format.
-    source = "#{source_path}[0]"
+    tmp_path = "#{output_path}.#{System.unique_integer([:positive])}.tmp"
 
-    case System.cmd("convert", [source | resize_args] ++ [output_path], stderr_to_stdout: true) do
+    args =
+      List.flatten(@resource_limits) ++
+        ["#{coder}:#{source_path}[0]"] ++
+        resize_args(width, height, method) ++ ["#{coder}:#{tmp_path}"]
+
+    case System.cmd("convert", args, stderr_to_stdout: true) do
       {_, 0} ->
-        :ok
+        File.rename(tmp_path, output_path)
 
       {output, _status} ->
+        File.rm(tmp_path)
         Logger.warning("Thumbnail generation failed for #{source_path}: #{output}")
         {:error, :convert_failed}
     end
@@ -79,14 +97,9 @@ defmodule AxonMedia.Thumbnailer do
     ["-resize", "#{width}x#{height}>"]
   end
 
-  defp ext_for("image/jpeg"), do: "jpg"
-  defp ext_for("image/png"), do: "png"
-  defp ext_for("image/gif"), do: "gif"
-  defp ext_for("image/webp"), do: "webp"
-
-  defp cache_path(media_id, width, height, method, content_type) do
+  defp cache_path(media_id, width, height, method, ext) do
     dir = Path.join(AxonMedia.Store.base_dir(), "thumbnails")
-    Path.join(dir, "#{media_id}-#{width}x#{height}-#{method}.#{ext_for(content_type)}")
+    Path.join(dir, "#{media_id}-#{width}x#{height}-#{method}.#{ext}")
   end
 
   defp clamp(nil), do: 96

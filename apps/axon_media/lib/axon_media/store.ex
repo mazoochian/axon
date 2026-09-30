@@ -2,7 +2,8 @@ defmodule AxonMedia.Store do
   @moduledoc """
   Local filesystem media storage backend.
 
-  Files are stored under a configurable base directory (defaults to
+  Files are stored under the `:axon_media, :storage_path` directory
+  (`MEDIA_STORE_PATH` in prod, see config/runtime.exs; defaults to
   `$TMPDIR/axon_media`). Each file is named by its media_id.
   """
 
@@ -25,12 +26,9 @@ defmodule AxonMedia.Store do
   Returns {:ok, media_id} or {:error, reason}.
   """
   def upload(user_id, content_type, data, server_name, filename \\ nil) do
-    media_id = :crypto.strong_rand_bytes(@id_bytes) |> Base.url_encode64(padding: false)
-    dir = base_dir()
-    File.mkdir_p!(dir)
-    path = Path.join(dir, media_id)
+    media_id = new_media_id()
 
-    with :ok <- File.write(path, data) do
+    with {:ok, path} <- write_media(media_id, data) do
       Repo.insert_all("media", [
         %{
           media_id: media_id,
@@ -93,7 +91,7 @@ defmodule AxonMedia.Store do
   media_id in this state returns `{:error, :not_yet_uploaded}`.
   """
   def create_pending(user_id, server_name) do
-    media_id = :crypto.strong_rand_bytes(@id_bytes) |> Base.url_encode64(padding: false)
+    media_id = new_media_id()
 
     Repo.insert_all("media", [
       %{
@@ -133,24 +131,44 @@ defmodule AxonMedia.Store do
   """
   def complete_upload(media_id, user_id, content_type, data, filename \\ nil) do
     with :ok <- complete_upload_precheck(media_id, user_id) do
-      dir = base_dir()
-      File.mkdir_p!(dir)
-      path = Path.join(dir, media_id)
+      # The conditional update claims the reservation atomically; its row
+      # lock is held until the file is written, so a concurrent fill-in of
+      # the same media_id gets :already_uploaded instead of overwriting it,
+      # and readers never see a storage_path whose file isn't there yet.
+      Repo.transaction(fn ->
+        {claimed, _} =
+          Repo.update_all(
+            from(m in "media",
+              where: m.media_id == ^media_id and m.uploader == ^user_id and is_nil(m.storage_path)
+            ),
+            set: [
+              content_type: content_type,
+              file_size: byte_size(data),
+              storage_path: media_path(media_id),
+              filename: filename
+            ]
+          )
 
-      with :ok <- File.write(path, data) do
-        Repo.update_all(
-          from(m in "media", where: m.media_id == ^media_id),
-          set: [
-            content_type: content_type,
-            file_size: byte_size(data),
-            storage_path: path,
-            filename: filename
-          ]
-        )
-
-        {:ok, media_id}
-      end
+        with {:claimed, 1} <- {:claimed, claimed},
+             {:ok, _path} <- write_media(media_id, data) do
+          media_id
+        else
+          {:claimed, _} -> Repo.rollback(:already_uploaded)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
     end
+  end
+
+  defp new_media_id, do: :crypto.strong_rand_bytes(@id_bytes) |> Base.url_encode64(padding: false)
+
+  defp media_path(media_id), do: Path.join(base_dir(), media_id)
+
+  defp write_media(media_id, data) do
+    File.mkdir_p!(base_dir())
+    path = media_path(media_id)
+
+    with :ok <- File.write(path, data), do: {:ok, path}
   end
 
   defp pending_upload_lookup(media_id) do

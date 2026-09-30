@@ -22,10 +22,8 @@ defmodule AxonWeb.SpaceController do
   A child room that isn't resident on this server is fetched via
   `GET /_matrix/federation/v1/hierarchy/{roomId}` on whichever server the
   `m.space.child` event's `via` list names (first one that answers wins).
-  That federation endpoint does not exist yet in this codebase — see the
-  handoff note in this repo's coordination scratchpad. Until it's wired up,
-  federated children are silently omitted (same as any other inaccessible
-  room), which is a graceful degradation, not a crash.
+  Children that can't be fetched are omitted, like any other inaccessible
+  room.
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -34,7 +32,8 @@ defmodule AxonWeb.SpaceController do
 
   import Ecto.Query
 
-  alias AxonCore.Repo
+  alias AxonCore.{EventStore, Repo}
+  alias AxonWeb.{Params, RoomSummary}
 
   @default_max_depth 5
   @default_limit 50
@@ -43,6 +42,7 @@ defmodule AxonWeb.SpaceController do
   # pagination (recursion is already guarded by `max_depth` and a visited
   # set, but a very wide graph could still be large).
   @max_total_rooms 1000
+  @max_depth 50
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/client/v1/rooms/:room_id/hierarchy
@@ -51,8 +51,8 @@ defmodule AxonWeb.SpaceController do
   def hierarchy(conn, %{"room_id" => room_id} = params) do
     user_id = conn.assigns.current_user_id
     suggested_only = params["suggested_only"] in ["true", true]
-    max_depth = parse_int(params["max_depth"], @default_max_depth)
-    limit = parse_int(params["limit"], @default_limit)
+    max_depth = Params.int(params["max_depth"], @default_max_depth, 0, @max_depth)
+    limit = Params.int(params["limit"], @default_limit, 1, @max_total_rooms)
     offset = decode_offset(params["from"])
 
     if not (local_room_exists?(room_id) and accessible?(room_id, user_id)) do
@@ -76,9 +76,6 @@ defmodule AxonWeb.SpaceController do
 
   # ---------------------------------------------------------------------------
   # GET /_matrix/client/v1/room_summary/:room_id_or_alias  (MSC3266)
-  #
-  # Not yet routed — see the handoff note for the router change this needs.
-  # Implemented here so it's ready to wire up.
   # ---------------------------------------------------------------------------
 
   def room_summary(conn, %{"room_id_or_alias" => room_id_or_alias}) do
@@ -125,17 +122,6 @@ defmodule AxonWeb.SpaceController do
       )
     )
   end
-
-  defp parse_int(nil, default), do: default
-
-  defp parse_int(v, default) when is_binary(v) do
-    case Integer.parse(v) do
-      {n, _} -> n
-      :error -> default
-    end
-  end
-
-  defp parse_int(v, _default) when is_integer(v), do: v
 
   # ---------------------------------------------------------------------------
   # Pagination token — an opaque (to the client) offset into the fully
@@ -186,11 +172,11 @@ defmodule AxonWeb.SpaceController do
         {entry, children} ->
           next_stack =
             if depth < max_depth and entry["room_type"] == "m.space" do
-              children
-              |> Enum.map(fn c ->
-                {c["state_key"], depth + 1, get_in(c, ["content", "via"]) || []}
-              end)
-              |> Kernel.++(rest)
+              child_stack =
+                for %{"state_key" => child_id} = c when is_binary(child_id) <- children,
+                    do: {child_id, depth + 1, via_servers(c)}
+
+              child_stack ++ rest
             else
               rest
             end
@@ -199,6 +185,11 @@ defmodule AxonWeb.SpaceController do
       end
     end
   end
+
+  defp via_servers(%{"content" => %{"via" => via}}) when is_list(via),
+    do: Enum.filter(via, &is_binary/1)
+
+  defp via_servers(_child), do: []
 
   # Resolves one room's summary + its space-children (stripped state), either
   # from local state or, when the room isn't resident here, via federation.
@@ -226,7 +217,8 @@ defmodule AxonWeb.SpaceController do
     Enum.find_value(via_servers, fn server ->
       case AxonFederation.HttpClient.get(server, path) do
         {:ok, %{"room" => room}} when is_map(room) ->
-          {room, room["children_state"] || []}
+          children = room["children_state"]
+          {room, if(is_list(children), do: Enum.filter(children, &is_map/1), else: [])}
 
         _ ->
           nil
@@ -264,48 +256,21 @@ defmodule AxonWeb.SpaceController do
   end
 
   defp publicly_visible?(room_id) do
-    state = current_state_map(room_id, ["m.room.join_rules", "m.room.history_visibility"])
+    state = RoomSummary.current_state(room_id, ["m.room.join_rules", "m.room.history_visibility"])
     join_rule = get_in(state, ["m.room.join_rules", "join_rule"])
     history_visibility = get_in(state, ["m.room.history_visibility", "history_visibility"])
     join_rule in ["public", "knock"] or history_visibility == "world_readable"
   end
 
   defp satisfies_restricted_allow?(room_id, user_id) do
-    state = current_state_map(room_id, ["m.room.join_rules"])
+    state = RoomSummary.current_state(room_id, ["m.room.join_rules"])
     join_rule = get_in(state, ["m.room.join_rules", "join_rule"])
 
     if join_rule in ["restricted", "knock_restricted"] do
-      allow = get_in(state, ["m.room.join_rules", "allow"]) || []
-
-      allow
-      |> Enum.filter(&(&1["type"] == "m.room_membership"))
-      |> Enum.map(& &1["room_id"])
-      |> Enum.reject(&is_nil/1)
-      |> Enum.any?(&joined?(&1, user_id))
+      state |> RoomSummary.allow_room_ids() |> Enum.any?(&EventStore.joined?(&1, user_id))
     else
       false
     end
-  end
-
-  defp joined?(room_id, user_id) do
-    Repo.one(
-      from(m in "room_memberships",
-        where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "join",
-        select: 1
-      )
-    ) != nil
-  end
-
-  defp current_state_map(room_id, types) do
-    Repo.all(
-      from(s in "current_room_state",
-        join: e in "events",
-        on: e.event_id == s.event_id,
-        where: s.room_id == ^room_id and s.type in ^types,
-        select: %{type: s.type, content: e.content}
-      )
-    )
-    |> Enum.into(%{}, fn r -> {r.type, r.content} end)
   end
 
   defp child_events(room_id, suggested_only) do
@@ -350,73 +315,11 @@ defmodule AxonWeb.SpaceController do
   end
 
   defp build_entry(room_id, children) do
-    state =
-      current_state_map(room_id, [
-        "m.room.name",
-        "m.room.topic",
-        "m.room.avatar",
-        "m.room.canonical_alias",
-        "m.room.history_visibility",
-        "m.room.guest_access",
-        "m.room.join_rules",
-        "m.room.create",
-        "m.room.encryption"
-      ])
-
-    num_joined =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.membership == "join",
-          select: count(m.user_id)
-        )
-      ) || 0
-
-    room_type = get_in(state, ["m.room.create", "type"])
-    guest_access = get_in(state, ["m.room.guest_access", "guest_access"]) || "forbidden"
-
-    history_visibility =
-      get_in(state, ["m.room.history_visibility", "history_visibility"]) || "shared"
-
-    join_rule = get_in(state, ["m.room.join_rules", "join_rule"]) || "invite"
-
     room_version =
       Repo.one(from(r in "rooms", where: r.room_id == ^room_id, select: r.version)) || "1"
 
-    entry = %{
-      "room_id" => room_id,
-      "num_joined_members" => num_joined,
-      "world_readable" => history_visibility == "world_readable",
-      "guest_can_join" => guest_access == "can_join",
-      "join_rule" => join_rule,
-      "room_version" => room_version,
-      "children_state" => children
-    }
-
-    entry
-    |> put_if(get_in(state, ["m.room.name", "name"]), "name")
-    |> put_if(get_in(state, ["m.room.topic", "topic"]), "topic")
-    |> put_if(get_in(state, ["m.room.avatar", "url"]), "avatar_url")
-    |> put_if(get_in(state, ["m.room.canonical_alias", "alias"]), "canonical_alias")
-    |> put_if(room_type, "room_type")
-    |> put_if(get_in(state, ["m.room.encryption", "algorithm"]), "encryption")
-    |> put_allowed_room_ids(join_rule, state)
+    room_id
+    |> RoomSummary.build("invite")
+    |> Map.merge(%{"room_version" => room_version, "children_state" => children})
   end
-
-  defp put_allowed_room_ids(entry, join_rule, state)
-       when join_rule in ["restricted", "knock_restricted"] do
-    allow = get_in(state, ["m.room.join_rules", "allow"]) || []
-
-    ids =
-      allow
-      |> Enum.filter(&(&1["type"] == "m.room_membership"))
-      |> Enum.map(& &1["room_id"])
-      |> Enum.reject(&is_nil/1)
-
-    if ids == [], do: entry, else: Map.put(entry, "allowed_room_ids", ids)
-  end
-
-  defp put_allowed_room_ids(entry, _join_rule, _state), do: entry
-
-  defp put_if(map, nil, _key), do: map
-  defp put_if(map, value, key), do: Map.put(map, key, value)
 end

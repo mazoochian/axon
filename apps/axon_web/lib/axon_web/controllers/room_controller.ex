@@ -8,11 +8,13 @@ defmodule AxonWeb.RoomController do
   alias AxonCore.{EventStore, Repo}
   alias AxonRoom.{AuthRules, CreateRoom, EventBuilder, RestrictedJoin, RoomProcess, RoomUpgrade}
   alias AxonSync.Typing
+  alias AxonWeb.EventController
+  import AxonCore.MapUtil, only: [maybe_put: 3]
 
   # POST /_matrix/client/v3/createRoom
   def create(conn, params) do
     user_id = conn.assigns.current_user_id
-    server_name = Application.fetch_env!(:axon_web, :server_name)
+    server_name = local_server()
 
     # Validate room_version type — must be string if present
     if Map.has_key?(params, "room_version") and not is_binary(params["room_version"]) do
@@ -85,11 +87,11 @@ defmodule AxonWeb.RoomController do
   # POST /_matrix/client/v3/rooms/:room_id/join
   def join(conn, %{"room_id" => room_id_or_alias} = params) do
     user_id = conn.assigns.current_user_id
-    local_server = Application.get_env(:axon_web, :server_name, "localhost")
-    server_params = server_name_hints(conn)
+    local_server = local_server()
+    server_params = AxonWeb.Params.query_values(conn, ["via", "server_name"])
 
     # Resolve alias to room_id (local lookup first, then federation)
-    {room_id, hint_servers} = resolve_room(room_id_or_alias, local_server, server_params)
+    {room_id, hint_servers} = resolve_room(room_id_or_alias, server_params)
 
     if is_nil(room_id) do
       conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
@@ -109,7 +111,7 @@ defmodule AxonWeb.RoomController do
         end
       else
         # Remote room — use federation join flow
-        case resolve_via_servers(room_id, room_server, hint_servers) do
+        case resolve_via_servers(room_server, hint_servers) do
           {:error, :missing_via_hint} ->
             conn
             |> put_status(400)
@@ -143,11 +145,11 @@ defmodule AxonWeb.RoomController do
   # nil for one — and federating to a nil (or, before that helper existed,
   # to the whole room_id string) as if it were a hostname would silently
   # fail with a bad DNS lookup instead of explaining what's missing.
-  defp resolve_via_servers(_room_id, _room_server, hint_servers) when hint_servers != [],
+  defp resolve_via_servers(_room_server, hint_servers) when hint_servers != [],
     do: {:ok, hint_servers}
 
-  defp resolve_via_servers(_room_id, nil, []), do: {:error, :missing_via_hint}
-  defp resolve_via_servers(_room_id, room_server, []), do: {:ok, [room_server]}
+  defp resolve_via_servers(nil, []), do: {:error, :missing_via_hint}
+  defp resolve_via_servers(room_server, []), do: {:ok, [room_server]}
 
   # POST /_matrix/client/v1/knock/:room_id_or_alias
   # POST /_matrix/client/v1/rooms/:room_id/knock
@@ -161,10 +163,10 @@ defmodule AxonWeb.RoomController do
 
   defp do_knock(conn, room_id_or_alias, params) do
     user_id = conn.assigns.current_user_id
-    local_server = Application.get_env(:axon_web, :server_name, "localhost")
-    server_params = server_name_hints(conn)
+    local_server = local_server()
+    server_params = AxonWeb.Params.query_values(conn, ["via", "server_name"])
 
-    {room_id, hint_servers} = resolve_room(room_id_or_alias, local_server, server_params)
+    {room_id, hint_servers} = resolve_room(room_id_or_alias, server_params)
 
     if is_nil(room_id) do
       conn |> put_status(404) |> json(%{"errcode" => "M_NOT_FOUND", "error" => "Room not found"})
@@ -192,7 +194,7 @@ defmodule AxonWeb.RoomController do
           json(conn, %{"room_id" => room_id})
         end
       else
-        case resolve_via_servers(room_id, room_server, hint_servers) do
+        case resolve_via_servers(room_server, hint_servers) do
           {:error, :missing_via_hint} ->
             conn
             |> put_status(400)
@@ -278,13 +280,7 @@ defmodule AxonWeb.RoomController do
       from(r in "server_notice_rooms",
         where: r.room_id == ^room_id and r.user_id == ^user_id
       )
-    ) and
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: m.membership
-        )
-      ) == "invite"
+    ) and EventStore.get_membership(room_id, user_id) == {:ok, "invite"}
   end
 
   # Whether we have this room's own real state locally (we created it, or
@@ -334,7 +330,7 @@ defmodule AxonWeb.RoomController do
           "error" => "Cannot set another user's typing state"
         })
 
-      not joined?(room_id, current_user_id) ->
+      not EventStore.joined?(room_id, current_user_id) ->
         conn
         |> put_status(403)
         |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
@@ -369,13 +365,6 @@ defmodule AxonWeb.RoomController do
     )
   end
 
-  defp joined?(room_id, user_id) do
-    case EventStore.get_membership(room_id, user_id) do
-      {:ok, "join"} -> true
-      _ -> false
-    end
-  end
-
   defp federate_typing(room_id, user_id, typing, timeout_ms) do
     case EventStore.remote_servers_for_room(room_id) do
       [] ->
@@ -402,21 +391,15 @@ defmodule AxonWeb.RoomController do
   def forget(conn, %{"room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
 
-    row =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: %{membership: m.membership}
-        )
-      )
+    {:ok, membership} = EventStore.get_membership(room_id, user_id)
 
     cond do
-      row != nil and row.membership in ["join", "invite"] ->
+      membership in ["join", "invite"] ->
         conn
         |> put_status(400)
         |> json(%{"errcode" => "M_UNKNOWN", "error" => "You must leave the room first"})
 
-      row == nil ->
+      is_nil(membership) ->
         json(conn, %{})
 
       true ->
@@ -436,7 +419,7 @@ defmodule AxonWeb.RoomController do
   def upgrade(conn, %{"room_id" => room_id, "new_version" => new_version} = params)
       when is_binary(new_version) do
     user_id = conn.assigns.current_user_id
-    server_name = Application.fetch_env!(:axon_web, :server_name)
+    server_name = local_server()
     upgrade_opts = [additional_creators: params["additional_creators"]]
 
     with :ok <- RoomUpgrade.ensure_joined(room_id, user_id),
@@ -512,7 +495,7 @@ defmodule AxonWeb.RoomController do
   # no inbound route to receive one either), so a federated invite was
   # silently a no-op from the invitee's perspective.
   defp invite_user(room_id, sender, target_user_id, content \\ %{"membership" => "invite"}) do
-    local_server = AxonCrypto.KeyServer.server_name()
+    local_server = local_server()
     target_server = target_user_id |> AxonCore.MatrixId.server_name()
 
     if target_server == local_server do
@@ -573,8 +556,16 @@ defmodule AxonWeb.RoomController do
   # any other remote-originated event takes, so local /sync fan-out works
   # identically to a same-server invite.
   defp federate_invite(room_id, sender, target_user_id, target_server, content) do
-    room_ctx = RoomProcess.get_room_ctx(room_id)
+    case RoomProcess.get_room_ctx(room_id) do
+      %{} = room_ctx ->
+        send_federated_invite(room_ctx, room_id, sender, target_user_id, target_server, content)
 
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  defp send_federated_invite(room_ctx, room_id, sender, target_user_id, target_server, content) do
     invite_event =
       EventBuilder.build(sender, "m.room.member", content, room_ctx, state_key: target_user_id)
 
@@ -666,7 +657,8 @@ defmodule AxonWeb.RoomController do
         |> put_status(400)
         |> json(%{
           "errcode" => "M_MISSING_PARAM",
-          "error" => "id_server is required for 3pid invites (no DEFAULT_IDENTITY_SERVER configured)"
+          "error" =>
+            "id_server is required for 3pid invites (no DEFAULT_IDENTITY_SERVER configured)"
         })
 
       {:error, :missing_id_access_token} ->
@@ -687,7 +679,10 @@ defmodule AxonWeb.RoomController do
 
         conn
         |> put_status(502)
-        |> json(%{"errcode" => "M_UNKNOWN", "error" => "Failed to contact identity server: #{inspect(reason)}"})
+        |> json(%{
+          "errcode" => "M_UNKNOWN",
+          "error" => "Failed to contact identity server: #{inspect(reason)}"
+        })
 
       {:error, reason} ->
         {:error, reason}
@@ -767,7 +762,9 @@ defmodule AxonWeb.RoomController do
   defp create_third_party_invite(room_id, user_id, "email", address, id_server, id_access_token) do
     current_state = EventStore.get_current_state_map(room_id)
     room_name = get_in(current_state[{"m.room.name", ""}], ["content", "name"])
-    sender_display_name = get_in(current_state[{"m.room.member", user_id}], ["content", "displayname"])
+
+    sender_display_name =
+      get_in(current_state[{"m.room.member", user_id}], ["content", "displayname"])
 
     store_params =
       %{
@@ -804,7 +801,14 @@ defmodule AxonWeb.RoomController do
     end
   end
 
-  defp create_third_party_invite(room_id, user_id, "msisdn" = medium, address, id_server, id_access_token) do
+  defp create_third_party_invite(
+         room_id,
+         user_id,
+         "msisdn" = medium,
+         address,
+         id_server,
+         id_access_token
+       ) do
     # No store-invite equivalent for msisdn (spec restricts it to email) —
     # see AxonWeb.IdentityServer.request_msisdn_token/3's moduledoc. Still
     # a real, spec-shaped call: opens an actual SMS validation session on
@@ -829,7 +833,7 @@ defmodule AxonWeb.RoomController do
     end
 
     token = :crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false)
-    server_name = AxonCrypto.KeyServer.server_name()
+    server_name = local_server()
     %{public_key_b64: public_key_b64} = AxonCrypto.KeyServer.server_key_info()
     key_validity_url = "https://#{server_name}/_matrix/identity/v2/pubkey/isvalid"
 
@@ -847,7 +851,14 @@ defmodule AxonWeb.RoomController do
          do: :ok
   end
 
-  defp create_third_party_invite(_room_id, _user_id, _medium, _address, _id_server, _id_access_token) do
+  defp create_third_party_invite(
+         _room_id,
+         _user_id,
+         _medium,
+         _address,
+         _id_server,
+         _id_access_token
+       ) do
     {:error, :unsupported_medium}
   end
 
@@ -866,7 +877,9 @@ defmodule AxonWeb.RoomController do
   defp third_party_invite_content(%{"token" => _} = response, id_server) do
     public_keys =
       (response["public_keys"] || [])
-      |> Enum.map(fn entry -> Map.update(entry, "key_validity_url", nil, &resolve_url(id_server, &1)) end)
+      |> Enum.map(fn entry ->
+        Map.update(entry, "key_validity_url", nil, &resolve_url(id_server, &1))
+      end)
 
     first = List.first(public_keys) || %{}
 
@@ -886,12 +899,9 @@ defmodule AxonWeb.RoomController do
     if String.starts_with?(url, "http://") or String.starts_with?(url, "https://") do
       url
     else
-      base_url <> (if String.starts_with?(url, "/"), do: url, else: "/" <> url)
+      base_url <> if String.starts_with?(url, "/"), do: url, else: "/" <> url
     end
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp obfuscate_3pid(_medium, address) do
     case String.split(address, "@", parts: 2) do
@@ -908,46 +918,44 @@ defmodule AxonWeb.RoomController do
   end
 
   # POST /_matrix/client/v3/rooms/:room_id/kick
-  def kick(conn, %{"room_id" => room_id} = params) do
-    user_id = conn.assigns.current_user_id
-    target = params["user_id"]
-    reason = params["reason"]
-
-    content = %{"membership" => "leave"}
-    content = if reason, do: Map.put(content, "reason", reason), else: content
-
-    with {:ok, _event_id} <-
-           RoomProcess.send_event(room_id, user_id, "m.room.member", content, state_key: target) do
-      json(conn, %{})
-    end
-  end
+  def kick(conn, params), do: set_target_membership(conn, params, "leave")
 
   # POST /_matrix/client/v3/rooms/:room_id/ban
-  def ban(conn, %{"room_id" => room_id} = params) do
-    user_id = conn.assigns.current_user_id
-    target = params["user_id"]
-    reason = params["reason"]
+  def ban(conn, params), do: set_target_membership(conn, params, "ban")
 
-    content = %{"membership" => "ban"}
-    content = if reason, do: Map.put(content, "reason", reason), else: content
-
-    with {:ok, _event_id} <-
-           RoomProcess.send_event(room_id, user_id, "m.room.member", content, state_key: target) do
-      json(conn, %{})
+  # POST /_matrix/client/v3/rooms/:room_id/unban
+  def unban(conn, %{"room_id" => room_id, "user_id" => target} = params) when is_binary(target) do
+    if EventStore.get_membership(room_id, target) == {:ok, "ban"} do
+      set_target_membership(conn, params, "leave")
+    else
+      conn
+      |> put_status(403)
+      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "#{target} is not banned from this room"})
     end
   end
 
-  # POST /_matrix/client/v3/rooms/:room_id/unban
-  def unban(conn, %{"room_id" => room_id} = params) do
-    user_id = conn.assigns.current_user_id
-    target = params["user_id"]
+  def unban(conn, params), do: set_target_membership(conn, params, "leave")
+
+  defp set_target_membership(
+         conn,
+         %{"room_id" => room_id, "user_id" => target} = params,
+         membership
+       )
+       when is_binary(target) do
+    content = maybe_put(%{"membership" => membership}, "reason", params["reason"])
 
     with {:ok, _event_id} <-
-           RoomProcess.send_event(room_id, user_id, "m.room.member", %{"membership" => "leave"},
+           RoomProcess.send_event(room_id, conn.assigns.current_user_id, "m.room.member", content,
              state_key: target
            ) do
       json(conn, %{})
     end
+  end
+
+  defp set_target_membership(conn, _params, _membership) do
+    conn
+    |> put_status(400)
+    |> json(%{"errcode" => "M_MISSING_PARAM", "error" => "Missing or invalid user_id"})
   end
 
   # GET /_matrix/client/v3/rooms/:room_id/members
@@ -967,8 +975,18 @@ defmodule AxonWeb.RoomController do
   # boundary GET /event/{id} and /messages already cap a departed
   # member's visibility at) rather than re-deriving it.
   def members(conn, %{"room_id" => room_id} = params) do
-    user_id = conn.assigns.current_user_id
+    bounds = EventController.visibility_bounds(room_id, conn.assigns.current_user_id)
 
+    if EventController.room_readable?(bounds) do
+      json(conn, %{"chunk" => member_chunk(room_id, bounds, params)})
+    else
+      conn
+      |> put_status(403)
+      |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
+    end
+  end
+
+  defp member_chunk(room_id, bounds, params) do
     filter_memberships =
       case params["membership"] do
         nil -> ["join", "invite", "ban", "leave", "knock"]
@@ -981,34 +999,33 @@ defmodule AxonWeb.RoomController do
         m -> List.delete(filter_memberships, m)
       end
 
+    leave_ordering =
+      case bounds do
+        %{membership: m, leave_ordering: ord} when m in ["leave", "ban"] -> ord
+        _ -> nil
+      end
+
+    # A departed member never sees membership past their own departure.
     stream_ordering =
-      case params["at"] do
-        nil ->
-          case AxonWeb.EventController.visibility_bounds(room_id, user_id) do
-            %{membership: m, leave_ordering: ord} when m in ["leave", "ban"] -> ord
-            _ -> nil
-          end
-
-        token ->
-          elem(AxonWeb.SyncHelpers.parse_token(token), 0)
+      case {params["at"], leave_ordering} do
+        {nil, ord} -> ord
+        {token, nil} -> elem(AxonWeb.SyncHelpers.parse_token(token), 0)
+        {token, ord} -> min(elem(AxonWeb.SyncHelpers.parse_token(token), 0), ord)
       end
 
-    chunk =
-      case stream_ordering do
-        nil ->
-          EventStore.get_room_members(room_id, filter_memberships)
-          |> Enum.map(fn m ->
-            member_chunk_entry(room_id, m.user_id, m.sender, m.membership)
-          end)
+    case stream_ordering do
+      nil ->
+        EventStore.get_room_members(room_id, filter_memberships)
+        |> Enum.map(fn m ->
+          member_chunk_entry(room_id, m.user_id, m.sender, m.membership)
+        end)
 
-        ordering ->
-          EventStore.get_room_members_at(room_id, ordering, filter_memberships)
-          |> Enum.map(fn e ->
-            member_chunk_entry(room_id, e.state_key, e.sender, e.content["membership"])
-          end)
-      end
-
-    json(conn, %{"chunk" => chunk})
+      ordering ->
+        EventStore.get_room_members_at(room_id, ordering, filter_memberships)
+        |> Enum.map(fn e ->
+          member_chunk_entry(room_id, e.state_key, e.sender, e.content["membership"])
+        end)
+    end
   end
 
   defp member_chunk_entry(room_id, user_id, sender, membership) do
@@ -1026,15 +1043,7 @@ defmodule AxonWeb.RoomController do
   def joined_members(conn, %{"room_id" => room_id}) do
     user_id = conn.assigns.current_user_id
 
-    membership =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id,
-          select: m.membership
-        )
-      )
-
-    if membership != "join" do
+    if not EventStore.joined?(room_id, user_id) do
       conn
       |> put_status(403)
       |> json(%{"errcode" => "M_FORBIDDEN", "error" => "Not a member of this room"})
@@ -1066,7 +1075,7 @@ defmodule AxonWeb.RoomController do
   # server-computed fields are merged on *top* of what's left, so a client
   # can't forge its own "membership" or "join_authorised_via_users_server".
   defp build_join_content(room_id, user_id, params) do
-    client_content = Map.drop(params, ~w(room_id third_party_signed server_name))
+    client_content = Map.drop(params, ~w(room_id third_party_signed server_name via))
     third_party_signed = params["third_party_signed"]
 
     current_state = EventStore.get_current_state_map(room_id)
@@ -1124,9 +1133,14 @@ defmodule AxonWeb.RoomController do
   # real for a delegated invite (Sydent's ephemeral key), a no-op self-
   # check for a legacy self-signed one. Only ever done here, once, for a
   # join this server is originating — never inside AuthRules itself.
-  defp maybe_attach_third_party_invite(content, %{"mxid" => _, "token" => token} = signed, current_state)
+  defp maybe_attach_third_party_invite(
+         content,
+         %{"mxid" => _, "token" => token} = signed,
+         current_state
+       )
        when is_binary(token) do
-    invite_content = get_in(current_state[{"m.room.third_party_invite", token}], ["content"]) || %{}
+    invite_content =
+      get_in(current_state[{"m.room.third_party_invite", token}], ["content"]) || %{}
 
     if third_party_invite_pubkey_live?(invite_content) do
       Map.put(content, "third_party_invite", %{"signed" => signed})
@@ -1183,15 +1197,14 @@ defmodule AxonWeb.RoomController do
     end
   end
 
-  # `server_name` hints can legally arrive from a caller as a list (already
-  # normalized), a bare string (a single `?server_name=x` — see
-  # server_name_hints/1), or nil/absent — List.wrap handles all three. Every
+  # `via`/`server_name` hints can legally arrive from a caller as a list (already
+  # normalized), a bare string, or nil/absent — List.wrap handles all three. Every
   # branch below assumes a list from here on; this used to be the caller's
   # job and wasn't done consistently (the "#" branch crashed — Enum over a
   # raw string — on the single-hint case, the single most common one).
   #
   # Returns {room_id, hint_servers} or {nil, []}
-  defp resolve_room(room_id_or_alias, local_server, server_params) do
+  defp resolve_room(room_id_or_alias, server_params) do
     server_params = List.wrap(server_params)
 
     cond do
@@ -1210,7 +1223,7 @@ defmodule AxonWeb.RoomController do
           # List.wrap so a malformed alias with no server part yields no via
           # hint at all, rather than a [nil] we'd then try to connect to.
           via = if server_params != [], do: server_params, else: List.wrap(alias_server)
-          resolve_remote_alias(room_id_or_alias, via, local_server)
+          resolve_remote_alias(room_id_or_alias, via)
         end
 
       String.starts_with?(room_id_or_alias, "!") ->
@@ -1221,17 +1234,7 @@ defmodule AxonWeb.RoomController do
     end
   end
 
-  # The `server_name` query param (join/knock via-hints) can legally repeat
-  # (`?server_name=a&server_name=b`) — Plug's default query parser collapses
-  # repeated bare (non-bracketed) keys to just the last occurrence, so
-  # `params["server_name"]` alone would silently drop every hint but one.
-  # Reading the raw query string directly preserves all of them.
-  defp server_name_hints(conn) do
-    conn.query_string
-    |> URI.query_decoder()
-    |> Enum.filter(fn {k, _v} -> k == "server_name" end)
-    |> Enum.map(fn {_k, v} -> v end)
-  end
+  defp local_server, do: Application.fetch_env!(:axon_web, :server_name)
 
   # room_alias must go through URI.encode_www_form/1, not URI.encode/1 — see
   # AxonWeb.DirectoryController.get_remote_alias/2 for why: every Matrix
@@ -1239,7 +1242,7 @@ defmodule AxonWeb.RoomController do
   # Finch.build/5 re-parses the URL with URI.parse/1 before sending, which
   # treats an unescaped "#" as the start of the fragment — so the alias
   # never made it onto the wire and every federated alias-join 404'd.
-  defp resolve_remote_alias(room_alias, via_servers, _local_server) do
+  defp resolve_remote_alias(room_alias, via_servers) do
     Enum.find_value(via_servers, {nil, []}, fn server ->
       case AxonFederation.HttpClient.get(
              server,

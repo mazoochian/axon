@@ -105,9 +105,9 @@ defmodule AxonCore.UserStore do
         do: localpart_or_user_id,
         else: "@#{localpart_or_user_id}:#{server_name}"
 
-    with {:ok, user} <- fetch_user(user_id),
-         true <- not user.deactivated,
-         true <- Argon2.verify_pass(password, user.password_hash) do
+    user = Repo.get(User, user_id)
+
+    if verify_password(user, password) and not user.deactivated do
       ensure_device(user.user_id, device_id, display_name)
 
       case issue_login_tokens(user.user_id, device_id, refresh?) do
@@ -118,9 +118,18 @@ defmodule AxonCore.UserStore do
           {:error, :internal}
       end
     else
-      _ -> {:error, :forbidden}
+      {:error, :forbidden}
     end
   end
+
+  # Always runs one Argon2 verification, even for an unknown user or one with
+  # no password (OIDC/appservice-provisioned), so response timing doesn't
+  # reveal which user IDs exist.
+  defp verify_password(%User{password_hash: hash}, password)
+       when is_binary(hash) and is_binary(password),
+       do: Argon2.verify_pass(password, hash)
+
+  defp verify_password(_user, _password), do: Argon2.no_user_verify()
 
   # ---------------------------------------------------------------------------
   # Token management
@@ -206,21 +215,16 @@ defmodule AxonCore.UserStore do
           from(r in RefreshToken, where: r.user_id == ^user_id and r.device_id == ^device_id)
         )
 
-        # Purges device_keys/one_time_keys/fallback_keys too -- not just the
-        # `devices` row -- so a logged-out session's identity keys don't keep
-        # getting served by /keys/query forever.
-        KeyStore.purge_device(user_id, device_id)
-        KeyStore.record_device_list_update(user_id)
-
-        :ok
+        purge_devices(user_id, [device_id])
     end
   end
 
   @doc """
   Invalidates all tokens for a user (optionally sparing the device that
   `except_token` belongs to) — also drops every refresh token for the
-  user, other than ones belonging to the spared device, for the same
-  reason `logout/1` does.
+  user, other than ones belonging to the spared device, and deletes every
+  other device with its E2E key material, for the same reasons `logout/1`
+  does.
   """
   def logout_all(user_id, except_token \\ nil) do
     except_hash = except_token && token_hash(except_token)
@@ -237,6 +241,18 @@ defmodule AxonCore.UserStore do
     rq = if except_device_id, do: from(r in rq, where: r.device_id != ^except_device_id), else: rq
     Repo.delete_all(rq)
 
+    case user_id |> KeyStore.device_ids_for_user() |> List.delete(except_device_id) do
+      [] -> :ok
+      device_ids -> purge_devices(user_id, device_ids)
+    end
+  end
+
+  # Purges device_keys/one_time_keys/fallback_keys too -- not just the
+  # `devices` row -- so a logged-out session's identity keys don't keep
+  # getting served by /keys/query forever.
+  defp purge_devices(user_id, device_ids) do
+    Enum.each(device_ids, &KeyStore.purge_device(user_id, &1))
+    KeyStore.record_device_list_update(user_id)
     :ok
   end
 
@@ -391,20 +407,7 @@ defmodule AxonCore.UserStore do
         {:ok, user_id}
 
       nil ->
-        %User{}
-        |> User.changeset(%{user_id: user_id, localpart: localpart})
-        |> Repo.insert()
-        |> case do
-          {:ok, user} ->
-            Repo.insert(
-              UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: localpart})
-            )
-
-            {:ok, user.user_id}
-
-          {:error, _changeset} ->
-            {:error, :provisioning_failed}
-        end
+        insert_provisioned_user(%{user_id: user_id, localpart: localpart})
     end
   end
 
@@ -426,26 +429,29 @@ defmodule AxonCore.UserStore do
 
     case Repo.get(User, user_id) do
       nil ->
-        %User{}
-        |> User.changeset(%{user_id: user_id, localpart: localpart, oidc_subject: subject})
-        |> Repo.insert()
-        |> case do
-          {:ok, user} ->
-            Repo.insert(
-              UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: localpart})
-            )
-
-            {:ok, user.user_id}
-
-          {:error, _changeset} ->
-            {:error, :provisioning_failed}
-        end
+        insert_provisioned_user(%{user_id: user_id, localpart: localpart, oidc_subject: subject})
 
       %User{oidc_subject: nil} ->
         {:error, :localpart_taken_by_local_account}
 
       %User{} ->
         {:error, :localpart_taken_by_other_subject}
+    end
+  end
+
+  # A password-less account provisioned on first use, with a profile whose
+  # display name defaults to its localpart.
+  defp insert_provisioned_user(%{localpart: localpart} = attrs) do
+    case %User{} |> User.changeset(attrs) |> Repo.insert() do
+      {:ok, user} ->
+        Repo.insert(
+          UserProfile.changeset(%UserProfile{user_id: user.user_id}, %{displayname: localpart})
+        )
+
+        {:ok, user.user_id}
+
+      {:error, _changeset} ->
+        {:error, :provisioning_failed}
     end
   end
 
@@ -478,13 +484,6 @@ defmodule AxonCore.UserStore do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
-
-  defp fetch_user(user_id) do
-    case Repo.get(User, user_id) do
-      nil -> {:error, :not_found}
-      user -> {:ok, user}
-    end
-  end
 
   defp issue_token(user_id, device_id, expires_at_ms \\ nil) do
     raw = generate_raw_token()
@@ -570,9 +569,11 @@ defmodule AxonCore.UserStore do
     )
   end
 
-  defp token_hash(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
+  @doc "The lowercase-hex SHA-256 of a raw token, as stored in place of the token itself."
+  def token_hash(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
 
-  defp generate_device_id do
+  @doc "A fresh random device ID."
+  def generate_device_id do
     :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false) |> String.upcase()
   end
 end

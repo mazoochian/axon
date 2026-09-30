@@ -11,9 +11,7 @@ defmodule AxonFederation.ServerResolver do
   delegation, then `https://<server_name>:8448`.
   """
 
-  alias AxonFederation.AddressGuard
-
-  @user_agent "Axon/1.0"
+  alias AxonFederation.{AddressGuard, HttpClient}
 
   @doc "Returns the base URL (no trailing slash) to reach `server_name` at."
   @spec resolve(String.t()) :: String.t()
@@ -65,15 +63,15 @@ defmodule AxonFederation.ServerResolver do
   end
 
   defp explicit_port?(server_name) do
-    case String.split(server_name, ":") do
-      [_host, port] -> Regex.match?(~r/^\d+$/, port)
+    case AddressGuard.split_server_name(server_name) do
+      {_host, port} when is_binary(port) -> Regex.match?(~r/^\d+$/, port)
       _ -> false
     end
   end
 
   defp resolve_via_well_known(server_name) do
     well_known_url = "https://#{server_name}/.well-known/matrix/server"
-    req = Finch.build(:get, well_known_url, [{"user-agent", @user_agent}])
+    req = Finch.build(:get, well_known_url, [{"user-agent", HttpClient.user_agent()}])
 
     case Finch.request(req, Axon.Finch, receive_timeout: 5_000) do
       {:ok, %{status: 200, body: body}} ->

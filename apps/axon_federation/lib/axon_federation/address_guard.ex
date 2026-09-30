@@ -98,19 +98,27 @@ defmodule AxonFederation.AddressGuard do
     end
   end
 
-  # A server_name is `hostname[:port]`, and an IPv6 literal is bracketed
-  # (`[::1]:8448`) precisely so the colons inside it aren't the port
-  # separator. Splitting on the last colon only when it follows a `]` — or
-  # when there are no brackets at all — keeps `[::1]` intact instead of
-  # handing `:inet.parse_address/1` the string `"[::1"`.
-  defp host_of_server_name("[" <> _ = server_name) do
+  @doc """
+  Splits a server name into `{host, port}` (`port` is the raw string after
+  the separator, or `nil`). An IPv6 literal is bracketed (`[::1]:8448`)
+  precisely so the colons inside it aren't the port separator; its host
+  keeps the brackets.
+  """
+  @spec split_server_name(binary()) :: {binary(), binary() | nil}
+  def split_server_name("[" <> _ = server_name) do
     case String.split(server_name, "]", parts: 2) do
-      [bracketed, _rest] -> bracketed <> "]"
-      _ -> server_name
+      [bracketed, ":" <> port] -> {bracketed <> "]", port}
+      [bracketed, _rest] -> {bracketed <> "]", nil}
+      _ -> {server_name, nil}
     end
   end
 
-  defp host_of_server_name(server_name) do
-    server_name |> String.split(":", parts: 2) |> hd()
+  def split_server_name(server_name) do
+    case String.split(server_name, ":", parts: 2) do
+      [host, port] -> {host, port}
+      [host] -> {host, nil}
+    end
   end
+
+  defp host_of_server_name(server_name), do: server_name |> split_server_name() |> elem(0)
 end

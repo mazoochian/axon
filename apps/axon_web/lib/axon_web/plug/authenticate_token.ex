@@ -4,6 +4,7 @@ defmodule AxonWeb.Plug.AuthenticateToken do
   import Plug.Conn
   require Logger
   alias AxonCore.UserStore
+  alias AxonWeb.AppService.Manager
 
   def init(opts), do: opts
 
@@ -44,13 +45,14 @@ defmodule AxonWeb.Plug.AuthenticateToken do
 
   # An application service's as_token, per the AS spec — acts as its own
   # sender_localpart user by default, or as any user matching one of its
-  # registered namespaces via ?user_id= impersonation. The target user is
+  # registered namespaces via ?user_id= impersonation (local users only; see
+  # AxonWeb.AppService.Manager.owns_user?/2). The target user is
   # provisioned on first use (an appservice's ghost users never go
   # through /register): see AxonCore.UserStore.authenticate_via_appservice/3.
   defp authenticate_appservice(conn, raw_token) do
-    with {:ok, registration} <- AxonWeb.AppService.Manager.verify_as_token(raw_token),
-         target_user_id <- conn.query_params["user_id"] || sender_user_id(registration),
-         true <- AxonWeb.AppService.Manager.owns_user?(registration, target_user_id),
+    with {:ok, registration} <- Manager.verify_as_token(raw_token),
+         target_user_id <- conn.query_params["user_id"] || Manager.sender_user_id(registration),
+         true <- Manager.owns_user?(registration, target_user_id),
          [_, localpart] <- Regex.run(~r/^@([^:]+):/, target_user_id),
          server_name <- AxonCore.MatrixId.server_name(target_user_id),
          device_id <- "APPSERVICE_" <> registration["id"],
@@ -67,10 +69,6 @@ defmodule AxonWeb.Plug.AuthenticateToken do
         })
         |> halt()
     end
-  end
-
-  defp sender_user_id(registration) do
-    "@#{registration["sender_localpart"]}:#{Application.get_env(:axon_web, :server_name, "localhost")}"
   end
 
   defp finish_auth(conn, user_id, device_id, raw_token, opts \\ []) do

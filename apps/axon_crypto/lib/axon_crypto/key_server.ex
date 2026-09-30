@@ -17,9 +17,12 @@ defmodule AxonCrypto.KeyServer do
   use GenServer
   require Logger
 
-  defstruct [:server_name, :key_id, :public_key, :private_key, :valid_until_ts]
+  alias AxonCrypto.EventHash
+
+  defstruct [:server_name, :key_id, :public_key, :private_key]
 
   @key_expiry_ms 7 * 24 * 60 * 60 * 1000
+  @hour_ms 60 * 60 * 1000
 
   # Client API
 
@@ -67,7 +70,6 @@ defmodule AxonCrypto.KeyServer do
   def init(opts) do
     server_name = Keyword.fetch!(opts, :server_name)
     {key_id, public_key, private_key} = load_or_generate_keypair()
-    valid_until_ts = System.os_time(:millisecond) + @key_expiry_ms
 
     Logger.info("KeyServer started for #{server_name} with key_id #{key_id}")
 
@@ -75,8 +77,7 @@ defmodule AxonCrypto.KeyServer do
       server_name: server_name,
       key_id: key_id,
       public_key: public_key,
-      private_key: private_key,
-      valid_until_ts: valid_until_ts
+      private_key: private_key
     }
 
     {:ok, state}
@@ -85,6 +86,7 @@ defmodule AxonCrypto.KeyServer do
   @impl true
   def handle_call(:server_key_info, _from, state) do
     public_key_b64 = Base.encode64(state.public_key, padding: false)
+    valid_until_ts = valid_until_ts()
 
     # Build the self-signed key info document. Must match, field-for-field,
     # what AxonWeb.KeyController.server_keys/2 actually serves — the
@@ -94,31 +96,22 @@ defmodule AxonCrypto.KeyServer do
     # a document nobody ever receives, and fails for every real recipient.
     unsigned_doc = %{
       "server_name" => state.server_name,
-      "valid_until_ts" => state.valid_until_ts,
+      "valid_until_ts" => valid_until_ts,
       "verify_keys" => %{
         state.key_id => %{"key" => public_key_b64}
       },
       "old_verify_keys" => %{}
     }
 
-    sig_bytes =
-      :crypto.sign(
-        :eddsa,
-        :none,
-        AxonCrypto.CanonicalJSON.encode_to_binary(unsigned_doc),
-        [state.private_key, :ed25519]
-      )
-
-    sig_b64 = Base.encode64(sig_bytes, padding: false)
+    %{"signatures" => signatures} =
+      EventHash.sign_json(unsigned_doc, state.server_name, state.key_id, state.private_key)
 
     info = %{
       server_name: state.server_name,
       key_id: state.key_id,
       public_key_b64: public_key_b64,
-      valid_until_ts: state.valid_until_ts,
-      signatures: %{
-        state.server_name => %{state.key_id => sig_b64}
-      }
+      valid_until_ts: valid_until_ts,
+      signatures: signatures
     }
 
     {:reply, info, state}
@@ -129,21 +122,19 @@ defmodule AxonCrypto.KeyServer do
   end
 
   def handle_call({:sign, payload}, _from, state) do
-    sig_bytes = :crypto.sign(:eddsa, :none, payload, [state.private_key, :ed25519])
-    sig_b64 = Base.encode64(sig_bytes, padding: false)
-    {:reply, {state.key_id, sig_b64}, state}
+    {:reply, {state.key_id, EventHash.sign_bytes(payload, state.private_key)}, state}
   end
 
   def handle_call({:sign_json, object}, _from, state) do
     signed =
-      AxonCrypto.EventHash.sign_json(object, state.server_name, state.key_id, state.private_key)
+      EventHash.sign_json(object, state.server_name, state.key_id, state.private_key)
 
     {:reply, signed, state}
   end
 
   def handle_call({:sign_event, event, room_version}, _from, state) do
     signed =
-      AxonCrypto.EventHash.sign_event(
+      EventHash.sign_event(
         event,
         state.server_name,
         state.key_id,
@@ -152,6 +143,13 @@ defmodule AxonCrypto.KeyServer do
       )
 
     {:reply, signed, state}
+  end
+
+  # Computed per request so a long-running server never advertises an
+  # expired key; rounded up to the hour so responses are stable in between.
+  defp valid_until_ts do
+    now = System.os_time(:millisecond) + @key_expiry_ms
+    (div(now, @hour_ms) + 1) * @hour_ms
   end
 
   @doc "Generates a new Ed25519 keypair. Returns {key_id, public_key_bytes, private_key_bytes}."

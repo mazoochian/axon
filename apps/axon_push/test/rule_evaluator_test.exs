@@ -532,4 +532,172 @@ defmodule AxonPush.RuleEvaluatorTest do
       assert {:notify, ["notify"]} = RuleEvaluator.should_notify?(event, @room, @me, rules)
     end
   end
+
+  describe "field lookup and glob semantics" do
+    defp override(conditions) do
+      Map.merge(@empty_rules, %{
+        "override" => [
+          %{
+            "rule_id" => "custom",
+            "enabled" => true,
+            "conditions" => conditions,
+            "actions" => ["notify"]
+          }
+        ]
+      })
+    end
+
+    defp matches?(conditions, content, extra \\ %{}) do
+      event =
+        Map.merge(
+          %{"type" => "m.room.message", "sender" => "@alice:localhost", "content" => content},
+          extra
+        )
+
+      RuleEvaluator.should_notify?(event, @room, @me, override(conditions)) ==
+        {:notify, ["notify"]}
+    end
+
+    defp em(key, pattern), do: %{"kind" => "event_match", "key" => key, "pattern" => pattern}
+
+    test "non-string or missing fields never match and never crash" do
+      refute matches?([em("content.msgtype", "*")], %{"msgtype" => %{"x" => 1}})
+      refute matches?([em("content.msgtype", "")], %{})
+      refute matches?([em("content.body", "*")], %{"body" => %{"x" => 1}})
+      refute matches?([%{"kind" => "contains_display_name"}], %{"body" => ["me"]})
+
+      event = %{
+        "type" => "m.room.message",
+        "sender" => "@a:x",
+        "content" => %{"msgtype" => %{"x" => 1}, "body" => 5}
+      }
+
+      assert {:notify, _} =
+               RuleEvaluator.should_notify?(event, @room, @me, DefaultRules.rules(@me))
+    end
+
+    test "content.body matches on word boundaries, other keys match the whole value" do
+      assert matches?([em("content.body", "urgent")], %{"body" => "this is URGENT!"})
+      refute matches?([em("content.body", "urgent")], %{"body" => "insurgentes"})
+      assert matches?([em("content.body", "ur*t")], %{"body" => "so urgent"})
+      refute matches?([em("type", "m.room")], %{})
+      assert matches?([em("type", "M.ROOM.*")], %{})
+      assert matches?([em("type", "m.room.messag?")], %{})
+    end
+
+    test "content rules use word boundaries too" do
+      rules =
+        put_in(@empty_rules, ["content"], [
+          %{"rule_id" => "c", "enabled" => true, "pattern" => "cake", "actions" => ["notify"]}
+        ])
+
+      ev = fn body ->
+        %{"type" => "m.room.message", "sender" => "@a:x", "content" => %{"body" => body}}
+      end
+
+      assert {:notify, _} = RuleEvaluator.should_notify?(ev.("cake?"), @room, @me, rules)
+      assert :dont_notify = RuleEvaluator.should_notify?(ev.("cupcakes"), @room, @me, rules)
+    end
+
+    test "keys support escaped dots" do
+      cond = %{
+        "kind" => "event_property_is",
+        "key" => "content.m\\.relates_to.rel_type",
+        "value" => "m.replace"
+      }
+
+      assert matches?([cond], %{"m.relates_to" => %{"rel_type" => "m.replace"}})
+      refute matches?([cond], %{"m" => %{"relates_to" => %{"rel_type" => "m.replace"}}})
+
+      backslash = %{"kind" => "event_property_is", "key" => "content.a\\\\b", "value" => 1}
+      assert matches?([backslash], %{"a\\b" => 1})
+    end
+
+    test "event_property_is null does not match a missing property" do
+      refute matches?(
+               [%{"kind" => "event_property_is", "key" => "content.nope", "value" => nil}],
+               %{}
+             )
+    end
+
+    test "room_member_count without an operator means ==" do
+      assert matches?([%{"kind" => "room_member_count", "is" => "1"}], %{})
+      refute matches?([%{"kind" => "room_member_count", "is" => "2"}], %{})
+    end
+  end
+
+  describe "v1.18 mention and suppression rules" do
+    @rules_for_me DefaultRules.rules(@me)
+
+    defp evaluate(content, extra \\ %{}, room \\ @room) do
+      event =
+        Map.merge(
+          %{"type" => "m.room.message", "sender" => "@alice:localhost", "content" => content},
+          extra
+        )
+
+      RuleEvaluator.should_notify?(event, room, @me, @rules_for_me)
+    end
+
+    defp highlight?({:notify, actions}), do: AxonPush.Notifications.highlight?(actions)
+    defp highlight?(:dont_notify), do: false
+
+    test "is_user_mention highlights, and legacy body matching is off when m.mentions is present" do
+      assert highlight?(evaluate(%{"body" => "hi", "m.mentions" => %{"user_ids" => [@me]}}))
+      refute highlight?(evaluate(%{"body" => "hey me", "m.mentions" => %{}}))
+      assert highlight?(evaluate(%{"body" => "hey me"}))
+    end
+
+    test "edits, reactions and server ACL changes do not notify" do
+      assert :dont_notify ==
+               evaluate(%{"body" => "* fixed", "m.relates_to" => %{"rel_type" => "m.replace"}})
+
+      assert :dont_notify == evaluate(%{}, %{"type" => "m.reaction"})
+      assert :dont_notify == evaluate(%{}, %{"type" => "m.room.server_acl", "state_key" => ""})
+    end
+
+    defp put_state(room_id, type, sender, content) do
+      {:ok, _} =
+        AxonCore.EventStore.insert_event(
+          %{
+            "event_id" => "$#{System.unique_integer([:positive])}",
+            "room_id" => room_id,
+            "sender" => sender,
+            "type" => type,
+            "state_key" => "",
+            "content" => content,
+            "origin_server_ts" => System.os_time(:millisecond),
+            "origin" => "localhost",
+            "depth" => 1,
+            "auth_events" => [],
+            "prev_events" => [],
+            "signatures" => %{},
+            "hashes" => %{}
+          },
+          "10"
+        )
+    end
+
+    test "room mentions depend on the sender's notification power level" do
+      room = "!pl:localhost"
+      insert_member(room, @me)
+      put_state(room, "m.room.create", "@alice:localhost", %{"creator" => "@alice:localhost"})
+
+      room_mention = %{"body" => "hi all", "m.mentions" => %{"room" => true}}
+      assert highlight?(evaluate(room_mention, %{}, room))
+      refute highlight?(evaluate(room_mention, %{"sender" => "@bob:localhost"}, room))
+
+      put_state(room, "m.room.power_levels", "@alice:localhost", %{
+        "users" => %{"@alice:localhost" => 100},
+        "users_default" => 10,
+        "notifications" => %{"room" => 10}
+      })
+
+      assert highlight?(evaluate(room_mention, %{"sender" => "@bob:localhost"}, room))
+
+      assert highlight?(
+               evaluate(%{"body" => "@room hello"}, %{"sender" => "@bob:localhost"}, room)
+             )
+    end
+  end
 end

@@ -7,8 +7,6 @@ defmodule AxonFederation.RoomKnockTest do
 
   use AxonFederation.DataCase, async: false
 
-  import ExUnit.CaptureLog
-
   alias AxonCore.{EventStore, UserStore}
   alias AxonFederation.{FakeRemoteMatrixServer, KeyCache, RoomKnock}
 
@@ -160,14 +158,14 @@ defmodule AxonFederation.RoomKnockTest do
            ) == "11"
   end
 
-  test "a knock event that fails to insert (e.g. missing room_id) is logged, but the flow still completes",
-       %{
-         user_id: user_id
-       } do
+  test "a make_knock template for another room is refused before anything is sent", %{
+    user_id: user_id
+  } do
     room_id = remote_room_id()
 
     template = %{
       "type" => "m.room.member",
+      "room_id" => remote_room_id(),
       "sender" => user_id,
       "state_key" => user_id,
       "content" => %{"membership" => "knock"},
@@ -186,12 +184,9 @@ defmodule AxonFederation.RoomKnockTest do
 
     FakeRemoteMatrixServer.send_knock_response(@port, [])
 
-    log =
-      capture_log(fn ->
-        assert RoomKnock.knock_via_federation(room_id, user_id, [@server_name], nil) ==
-                 {:ok, room_id}
-      end)
+    assert RoomKnock.knock_via_federation(room_id, user_id, [@server_name], nil) ==
+             {:error, :all_servers_failed}
 
-    assert log =~ "Failed to insert knock event"
+    refute Enum.any?(FakeRemoteMatrixServer.requests(@port), &(&1.path =~ "send_knock"))
   end
 end

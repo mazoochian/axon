@@ -7,7 +7,8 @@ defmodule AxonCore.EventStore do
   """
 
   import Ecto.Query
-  alias AxonCore.{KeyStore, Repo}
+  import AxonCore.MapUtil, only: [maybe_put: 3]
+  alias AxonCore.{KeyStore, MatrixId, PowerLevels, Repo}
   alias AxonCore.Schema.{Event, Room, RoomMembership}
 
   # ---------------------------------------------------------------------------
@@ -31,94 +32,88 @@ defmodule AxonCore.EventStore do
   rejected while its prev_event is missing, then resent once that gap is
   closed and must appear as a new timeline event, not backdated).
 
-  An idempotent resend of an event that's already accepted (not
-  previously rejected) is unaffected: the ordering bump only fires on an
-  actual rejected -> accepted transition.
-
-  A row that already exists as **soft-failed**, by contrast, is never
-  touched at all — not even to leave it soft-failed while otherwise
-  proceeding. `insert_soft_failed_event/2`'s one-time-determination
-  guarantee ("matching Synapse's own... behavior") has to hold no matter
-  which of this module's several callers re-presents the same event_id
-  later (`AxonRoom.RoomProcess.apply_remote_event/2` re-running its own
-  auth check on a retried/backfilled PDU is the common case, but
-  `AxonFederation.RoomJoin`/`RoomKnock`/`RoomLeave` and
-  `AxonWeb.FederationController` all call this function directly too), so
-  it's enforced once here rather than relying on every call site to
-  re-check first. Without this, a caller that independently decides the
-  retried event is authorized against *some* current state would resolve
-  the on_conflict below and both flip `soft_failed` back to `false` *and*
-  re-run the state/membership writes — silently promoting an event the
-  soft-fail determination said must never advance room state.
+  A row that already exists as accepted **or soft-failed** is returned
+  untouched, and none of the derived-state writes (current state,
+  membership, redaction, push-rule reconciliation) are re-run. Re-applying
+  an old, already-accepted event (a retried `/send` transaction, a
+  `send_join` state list overlapping what we already have) would otherwise
+  roll `current_room_state` back to it. A soft-failed event in particular
+  must never be promoted: `insert_soft_failed_event/2` is a one-time
+  determination, whichever of this function's callers later re-presents
+  the same event_id. The existence check runs inside the transaction,
+  under a row lock, so concurrent inserts of one event_id apply it once.
   """
   def insert_event(event_map, room_version) do
     params = Event.from_wire(event_map, room_version)
 
-    case Repo.get_by(Event, event_id: params.event_id) do
-      %Event{soft_failed: true} = already_soft_failed ->
-        {:ok, already_soft_failed}
-
-      _ ->
-        do_insert_event(event_map, params)
-    end
-  end
-
-  defp do_insert_event(event_map, params) do
     Ecto.Multi.new()
-    |> Ecto.Multi.run(:existing, fn repo, _ ->
-      {:ok, repo.get_by(Event, event_id: params.event_id)}
-    end)
-    |> Ecto.Multi.insert(:event_raw, Event.changeset(%Event{}, params),
-      on_conflict: [set: [rejected: false, soft_failed: false]],
-      conflict_target: :event_id
-    )
-    |> Ecto.Multi.run(:event, fn repo, %{event_raw: _raw} ->
-      # Reload to get DB-assigned stream_ordering (BIGSERIAL).
-      # Also handles the on_conflict case — we still need the persisted row.
-      case repo.get_by(Event, event_id: params.event_id) do
-        nil -> {:error, :event_not_found}
-        event -> {:ok, event}
-      end
-    end)
-    |> Ecto.Multi.run(:unreject, fn repo, %{existing: existing, event: event} ->
-      if existing && existing.rejected do
-        repo.update_all(
-          from(e in Event,
-            where: e.event_id == ^event.event_id,
-            update: [set: [stream_ordering: fragment("nextval('events_stream_ordering_seq')")]]
-          ),
-          []
-        )
-
-        case repo.get_by(Event, event_id: event.event_id) do
-          nil -> {:error, :event_not_found}
-          refreshed -> {:ok, refreshed}
-        end
-      else
-        {:ok, event}
-      end
-    end)
-    |> Ecto.Multi.run(:state, fn repo, %{unreject: event} ->
-      update_current_state(repo, event)
-    end)
-    |> Ecto.Multi.run(:membership, fn repo, %{unreject: event} ->
-      update_membership(repo, event)
-    end)
-    |> Ecto.Multi.run(:room_upgrade_push_rules, fn repo, %{unreject: event} ->
-      maybe_copy_room_push_rules(repo, event)
-    end)
-    |> Ecto.Multi.run(:auth_edges, fn repo, %{unreject: event} ->
-      insert_auth_edges(repo, event)
-    end)
-    |> Ecto.Multi.run(:redaction, fn repo, %{unreject: event} ->
-      maybe_apply_redaction(repo, event_map, event)
+    |> Ecto.Multi.run(:event, fn repo, _ -> persist_accepted(repo, params) end)
+    |> Ecto.Multi.merge(fn
+      %{event: {:existing, _event}} -> Ecto.Multi.new()
+      %{event: {:applied, event}} -> derived_state_multi(event_map, event)
     end)
     |> Repo.transaction()
     |> case do
-      {:ok, %{unreject: event}} -> {:ok, event}
-      {:error, :event_raw, changeset, _} -> {:error, changeset}
+      {:ok, %{event: {_, event}}} -> {:ok, event}
+      {:error, :event, %Ecto.Changeset{} = changeset, _} -> {:error, changeset}
       {:error, step, reason, _} -> {:error, {step, reason}}
     end
+  end
+
+  defp persist_accepted(repo, params) do
+    existing =
+      repo.one(from(e in Event, where: e.event_id == ^params.event_id, lock: "FOR UPDATE"))
+
+    case existing do
+      nil -> insert_accepted(repo, params)
+      %Event{rejected: true} -> unreject(repo, existing)
+      %Event{} -> {:ok, {:existing, existing}}
+    end
+  end
+
+  defp insert_accepted(repo, params) do
+    case repo.insert(Event.changeset(%Event{}, params),
+           on_conflict: :nothing,
+           conflict_target: :event_id,
+           returning: true
+         ) do
+      # Lost a race with a concurrent insert of the same event_id; the row
+      # is committed now, so re-run the existing-row decision against it.
+      {:ok, %Event{id: nil}} -> persist_accepted(repo, params)
+      {:ok, event} -> {:ok, {:applied, event}}
+      {:error, changeset} -> {:error, changeset}
+    end
+  end
+
+  defp unreject(repo, %Event{event_id: event_id}) do
+    {1, [event]} =
+      repo.update_all(
+        from(e in Event,
+          where: e.event_id == ^event_id,
+          select: e,
+          update: [
+            set: [
+              rejected: false,
+              soft_failed: false,
+              stream_ordering: fragment("nextval('events_stream_ordering_seq')")
+            ]
+          ]
+        ),
+        []
+      )
+
+    {:ok, {:applied, event}}
+  end
+
+  defp derived_state_multi(event_map, event) do
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:state, fn repo, _ -> update_current_state(repo, event) end)
+    |> Ecto.Multi.run(:membership, fn repo, _ -> update_membership(repo, event) end)
+    |> Ecto.Multi.run(:room_upgrade_push_rules, fn repo, _ ->
+      maybe_copy_room_push_rules(repo, event)
+    end)
+    |> Ecto.Multi.run(:auth_edges, fn repo, _ -> insert_auth_edges(repo, event) end)
+    |> Ecto.Multi.run(:redaction, fn repo, _ -> maybe_apply_redaction(repo, event_map, event) end)
   end
 
   # An `m.room.redaction` event is always accepted and stored like any other
@@ -134,7 +129,7 @@ defmodule AxonCore.EventStore do
 
     with true <- is_binary(target_id),
          %Event{} = target <- repo.get_by(Event, event_id: target_id),
-         true <- redaction_permitted?(redaction_event.sender, target) do
+         true <- redaction_permitted?(redaction_event, target) do
       redacted_content =
         target
         |> event_to_map()
@@ -156,20 +151,18 @@ defmodule AxonCore.EventStore do
 
   defp maybe_apply_redaction(_repo, _event_map, _event), do: {:ok, :ok}
 
-  defp redaction_permitted?(sender, target) do
-    sender == target.sender or has_redact_power?(target.room_id, sender)
+  defp redaction_permitted?(
+         %Event{room_id: room_id, sender: sender},
+         %Event{room_id: room_id} = target
+       ) do
+    sender == target.sender or has_redact_power?(target, sender)
   end
 
-  defp has_redact_power?(room_id, user_id) do
-    pl =
-      case get_current_state_map(room_id)[{"m.room.power_levels", ""}] do
-        nil -> %{}
-        event -> event["content"] || %{}
-      end
+  defp redaction_permitted?(_redaction, _target), do: false
 
-    required = Map.get(pl, "redact", 50)
-    users = Map.get(pl, "users", %{})
-    Map.get(users, user_id, Map.get(pl, "users_default", 0)) >= required
+  defp has_redact_power?(%Event{room_id: room_id, room_version: version}, user_id) do
+    state = get_current_state_map(room_id)
+    PowerLevels.user_level(state, user_id, version) >= PowerLevels.required_level(state, "redact")
   end
 
   @doc """
@@ -189,33 +182,8 @@ defmodule AxonCore.EventStore do
   rejection must never downgrade an event that was already correctly
   applied.
   """
-  def insert_rejected_event(event_map, room_version) do
-    params =
-      event_map
-      |> Event.from_wire(room_version)
-      |> Map.put(:rejected, true)
-
-    Ecto.Multi.new()
-    |> Ecto.Multi.insert(:event_raw, Event.changeset(%Event{}, params),
-      on_conflict: :nothing,
-      conflict_target: :event_id
-    )
-    |> Ecto.Multi.run(:event, fn repo, %{event_raw: _raw} ->
-      case repo.get_by(Event, event_id: params.event_id) do
-        nil -> {:error, :event_not_found}
-        event -> {:ok, event}
-      end
-    end)
-    |> Ecto.Multi.run(:auth_edges, fn repo, %{event: event} ->
-      insert_auth_edges(repo, event)
-    end)
-    |> Repo.transaction()
-    |> case do
-      {:ok, %{event: event}} -> {:ok, event}
-      {:error, :event_raw, changeset, _} -> {:error, changeset}
-      {:error, step, reason, _} -> {:error, {step, reason}}
-    end
-  end
+  def insert_rejected_event(event_map, room_version),
+    do: insert_unapplied_event(event_map, room_version, :rejected)
 
   @doc """
   Persists an event that failed auth-checking against the room's *current*
@@ -244,11 +212,14 @@ defmodule AxonCore.EventStore do
 
   Same no-op-if-already-accepted guard as `insert_rejected_event/2`.
   """
-  def insert_soft_failed_event(event_map, room_version) do
+  def insert_soft_failed_event(event_map, room_version),
+    do: insert_unapplied_event(event_map, room_version, :soft_failed)
+
+  defp insert_unapplied_event(event_map, room_version, flag) do
     params =
       event_map
       |> Event.from_wire(room_version)
-      |> Map.put(:soft_failed, true)
+      |> Map.put(flag, true)
 
     Ecto.Multi.new()
     |> Ecto.Multi.insert(:event_raw, Event.changeset(%Event{}, params),
@@ -401,7 +372,7 @@ defmodule AxonCore.EventStore do
   defp maybe_copy_room_push_rules(_repo, _event), do: {:ok, :ok}
 
   defp reconcile_room_upgrade_push_rules(repo, old_room_id, new_room_id) do
-    with true <- valid_room_id?(old_room_id) and valid_room_id?(new_room_id),
+    with true <- MatrixId.valid_room_id?(old_room_id) and MatrixId.valid_room_id?(new_room_id),
          %Event{} = create <- current_state_event(repo, new_room_id, "m.room.create", ""),
          ^old_room_id <- get_in(create.content, ["predecessor", "room_id"]),
          %Event{} = tombstone <- current_state_event(repo, old_room_id, "m.room.tombstone", ""),
@@ -467,15 +438,6 @@ defmodule AxonCore.EventStore do
       conflict_target: [:user_id, :kind, :rule_id]
     )
   end
-
-  defp valid_room_id?("!" <> rest) do
-    case String.split(rest, ":", parts: 2) do
-      [localpart, server] -> localpart != "" and server != ""
-      _ -> false
-    end
-  end
-
-  defp valid_room_id?(_), do: false
 
   # A user newly joining a room now shares it with every other current
   # member — per spec, /sync device_lists.changed and /keys/changes must
@@ -599,6 +561,14 @@ defmodule AxonCore.EventStore do
   """
   def purge_room(room_id) do
     Repo.transaction(fn ->
+      room_event_ids = from(e in Event, where: e.room_id == ^room_id, select: e.event_id)
+
+      Repo.delete_all(
+        from(a in "event_auth_edges", where: a.event_id in subquery(room_event_ids))
+      )
+
+      Repo.delete_all(from(t in "client_txns", where: t.event_id in subquery(room_event_ids)))
+      Repo.delete_all(from(n in "notifications", where: n.room_id == ^room_id))
       Repo.delete_all(from(e in Event, where: e.room_id == ^room_id))
       Repo.delete_all(from(s in "current_room_state", where: s.room_id == ^room_id))
       Repo.delete_all(from(s in "room_state_snapshots", where: s.room_id == ^room_id))
@@ -1012,29 +982,27 @@ defmodule AxonCore.EventStore do
 
   @doc """
   Full-text search over `m.room.message` bodies across `room_ids`
-  (for `POST /search`). Returns `{[{event_id, rank}], total_count}`,
-  ordered by `order_by` ("rank" or "recent").
-  """
-  def search_messages(room_ids, search_term, order_by, limit, offset \\ 0)
+  (for `POST /search`), ordered by `order_by` ("rank" or "recent").
+  Rejected and soft-failed events are never returned.
 
-  def search_messages([], _search_term, _order_by, _limit, _offset), do: {[], 0, nil}
-
-  @doc """
-  Full-text search. `offset` (from a prior call's returned next-page
-  cursor, round-tripped through `/search`'s `next_batch`) skips the rows
-  already returned by earlier pages — plain `OFFSET`, not a keyset cursor,
-  since "rank" ordering has no single column to key off (ties are
-  expected, and meaningful only relative to the query) the way
-  `stream_ordering` would for "recent". Search result pages aren't
-  expected to stay stable under concurrent writes to the same degree
-  `/messages` pagination is, so the simpler, universally-correct-for-both-
-  orderings approach wins here.
+  `offset` (from a prior call's returned next-page cursor, round-tripped
+  through `/search`'s `next_batch`) skips the rows already returned by
+  earlier pages — plain `OFFSET`, not a keyset cursor, since "rank"
+  ordering has no single column to key off (ties are expected, and
+  meaningful only relative to the query) the way `stream_ordering` would
+  for "recent". Search result pages aren't expected to stay stable under
+  concurrent writes to the same degree `/messages` pagination is, so the
+  simpler, universally-correct-for-both-orderings approach wins here.
 
   Returns `{[{event_id, rank}], total_count, next_offset | nil}` —
   `next_offset` is set only when this page came back full (there may be
   more), never on the trailing empty page a client fetches to confirm
   the end.
   """
+  def search_messages(room_ids, search_term, order_by, limit, offset \\ 0)
+
+  def search_messages([], _search_term, _order_by, _limit, _offset), do: {[], 0, nil}
+
   def search_messages(room_ids, search_term, order_by, limit, offset) do
     order_sql = if order_by == "recent", do: "stream_ordering DESC", else: "rank DESC"
 
@@ -1044,7 +1012,7 @@ defmodule AxonCore.EventStore do
         """
         SELECT event_id, ts_rank(to_tsvector('english', content->>'body'), plainto_tsquery('english', $2)) AS rank
         FROM events
-        WHERE room_id = ANY($1) AND type = 'm.room.message' AND NOT rejected
+        WHERE room_id = ANY($1) AND type = 'm.room.message' AND NOT rejected AND NOT soft_failed
           AND to_tsvector('english', content->>'body') @@ plainto_tsquery('english', $2)
         ORDER BY #{order_sql}
         LIMIT $3 OFFSET $4
@@ -1058,7 +1026,7 @@ defmodule AxonCore.EventStore do
         """
         SELECT count(*)
         FROM events
-        WHERE room_id = ANY($1) AND type = 'm.room.message' AND NOT rejected
+        WHERE room_id = ANY($1) AND type = 'm.room.message' AND NOT rejected AND NOT soft_failed
           AND to_tsvector('english', content->>'body') @@ plainto_tsquery('english', $2)
         """,
         [room_ids, search_term]
@@ -1301,19 +1269,14 @@ defmodule AxonCore.EventStore do
   # Membership queries
   # ---------------------------------------------------------------------------
 
-  def get_joined_rooms(user_id) do
-    Repo.all(
-      from(m in RoomMembership,
-        where: m.user_id == ^user_id and m.membership == "join" and not m.forgotten,
-        select: m.room_id
-      )
-    )
-  end
+  def get_joined_rooms(user_id), do: rooms_with_membership(user_id, "join")
+  def get_invited_rooms(user_id), do: rooms_with_membership(user_id, "invite")
+  def get_knocked_rooms(user_id), do: rooms_with_membership(user_id, "knock")
 
-  def get_invited_rooms(user_id) do
+  defp rooms_with_membership(user_id, membership) do
     Repo.all(
       from(m in RoomMembership,
-        where: m.user_id == ^user_id and m.membership == "invite" and not m.forgotten,
+        where: m.user_id == ^user_id and m.membership == ^membership and not m.forgotten,
         select: m.room_id
       )
     )
@@ -1377,7 +1340,7 @@ defmodule AxonCore.EventStore do
         select: m.user_id
       )
     )
-    |> Enum.map(&(&1 |> AxonCore.MatrixId.server_name()))
+    |> Enum.map(&MatrixId.server_name/1)
     |> Enum.reject(&(&1 == local_server))
     |> Enum.uniq()
   end
@@ -1399,7 +1362,7 @@ defmodule AxonCore.EventStore do
         distinct: true
       )
     )
-    |> Enum.map(&(&1 |> AxonCore.MatrixId.server_name()))
+    |> Enum.map(&MatrixId.server_name/1)
     |> Enum.reject(&(&1 == local_server))
     |> Enum.uniq()
   end
@@ -1426,15 +1389,6 @@ defmodule AxonCore.EventStore do
     )
   end
 
-  def get_knocked_rooms(user_id) do
-    Repo.all(
-      from(m in RoomMembership,
-        where: m.user_id == ^user_id and m.membership == "knock" and not m.forgotten,
-        select: m.room_id
-      )
-    )
-  end
-
   @preview_state_types ~w(m.room.join_rules m.room.canonical_alias m.room.avatar m.room.name m.room.create m.room.encryption)
 
   @doc """
@@ -1456,58 +1410,50 @@ defmodule AxonCore.EventStore do
   end
 
   @doc "Persists a knock's room preview (stripped state events) for /sync to render."
-  def set_knock_preview_state(room_id, user_id, events) do
-    Repo.update_all(
-      from(m in "room_memberships",
-        where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "knock"
-      ),
-      set: [preview_state: %{"events" => events}]
-    )
-
-    :ok
-  end
+  def set_knock_preview_state(room_id, user_id, events),
+    do: set_preview_state(room_id, user_id, "knock", events)
 
   @doc "Returns the stored knock preview's stripped events for a room the user has knocked on."
-  def get_knock_preview_state(room_id, user_id) do
-    preview =
-      Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "knock",
-          select: m.preview_state
-        )
-      )
-
-    (preview || %{})["events"] || []
-  end
+  def get_knock_preview_state(room_id, user_id),
+    do: get_preview_state(room_id, user_id, "knock")
 
   @doc """
   Persists a federated invite's `invite_room_state` preview (per spec: a
   stripped snapshot of some room state the inviting server hands over
   since we have no other way to learn anything about a room we're not
-  otherwise resident in) — mirrors set_knock_preview_state/3 exactly.
+  otherwise resident in).
   """
-  def set_invite_preview_state(room_id, user_id, events) do
+  def set_invite_preview_state(room_id, user_id, events),
+    do: set_preview_state(room_id, user_id, "invite", events)
+
+  @doc "Returns the stored invite preview's stripped events for a room the user was invited to."
+  def get_invite_preview_state(room_id, user_id),
+    do: get_preview_state(room_id, user_id, "invite")
+
+  defp set_preview_state(room_id, user_id, membership, events) do
     Repo.update_all(
-      from(m in "room_memberships",
-        where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "invite"
-      ),
+      preview_membership_query(room_id, user_id, membership),
       set: [preview_state: %{"events" => events}]
     )
 
     :ok
   end
 
-  @doc "Returns the stored invite preview's stripped events for a room the user was invited to."
-  def get_invite_preview_state(room_id, user_id) do
+  defp get_preview_state(room_id, user_id, membership) do
     preview =
       Repo.one(
-        from(m in "room_memberships",
-          where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == "invite",
+        from(m in preview_membership_query(room_id, user_id, membership),
           select: m.preview_state
         )
       )
 
     (preview || %{})["events"] || []
+  end
+
+  defp preview_membership_query(room_id, user_id, membership) do
+    from(m in "room_memberships",
+      where: m.room_id == ^room_id and m.user_id == ^user_id and m.membership == ^membership
+    )
   end
 
   def get_left_rooms_since(user_id, since_ordering, opts \\ []) do
@@ -1526,30 +1472,6 @@ defmodule AxonCore.EventStore do
 
     q = if exclude_forgotten, do: from(m in q, where: not m.forgotten), else: q
     Repo.all(q)
-  end
-
-  @doc """
-  Returns the latest applicable leave/ban stream ordering for each room the
-  user has left in this sync window.
-
-  The materialized current membership row is authoritative, and its persisted
-  `event_id` supplies the matching stream-ordering cutoff.
-  """
-  def get_left_room_cutoffs_since(user_id, since_ordering, opts \\ []) do
-    exclude_forgotten = Keyword.get(opts, :exclude_forgotten, false)
-
-    query =
-      from(m in RoomMembership,
-        join: e in Event,
-        on: e.event_id == m.event_id,
-        where:
-          m.user_id == ^user_id and m.membership in ["leave", "ban"] and
-            e.stream_ordering > ^since_ordering and not e.rejected and not e.soft_failed,
-        select: {m.room_id, e.stream_ordering}
-      )
-
-    query = if exclude_forgotten, do: from([m, e] in query, where: not m.forgotten), else: query
-    Repo.all(query) |> Map.new()
   end
 
   def get_room_members(room_id, memberships \\ ["join"]) do
@@ -1602,6 +1524,8 @@ defmodule AxonCore.EventStore do
       m -> {:ok, m.membership}
     end
   end
+
+  def joined?(room_id, user_id), do: get_membership(room_id, user_id) == {:ok, "join"}
 
   # ---------------------------------------------------------------------------
   # Snapshots
@@ -1913,7 +1837,4 @@ defmodule AxonCore.EventStore do
     Repo.all(from(e in Event, where: e.event_id in ^event_ids))
     |> Map.new(fn e -> {e.event_id, event_to_map(e)} end)
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

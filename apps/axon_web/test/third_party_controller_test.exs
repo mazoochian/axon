@@ -186,6 +186,19 @@ defmodule AxonWeb.ThirdPartyControllerTest do
       refute Map.has_key?(req.query, "access_token")
     end
 
+    test "nested query params are dropped rather than crashing the forward" do
+      port = 19_825
+      start_supervised!({FakeAppService, port: port})
+      FakeAppService.thirdparty_user_response(port, "irc", 200, [])
+      put_registrations([registration("tp5b", port, protocols: ["irc"])])
+
+      conn = get_auth(user_conn(), "/_matrix/client/v3/thirdparty/user/irc?nick=a&x[y]=z")
+
+      assert conn.status == 200
+      [req] = FakeAppService.requests(port)
+      assert req.query == %{"nick" => "a"}
+    end
+
     test "404s M_NOT_FOUND for a protocol no AS declares" do
       conn = get_auth(user_conn(), "/_matrix/client/v3/thirdparty/user/nonexistent?nick=x")
 

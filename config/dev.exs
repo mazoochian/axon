@@ -46,6 +46,7 @@ config :axon_web, :registration_shared_secret, "complement"
 # machine (127.0.0.1:8448, a loopback address) is still reachable for media
 # federation. Prod keeps it on; see AxonFederation.AddressGuard.
 config :axon_federation, :allow_private_addresses, true
+config :axon_push, :allow_private_addresses, true
 
 # Delegated OAuth2/OIDC auth (MSC3861) — only turns on if OIDC_ISSUER is set
 # in the environment, so plain `mix phx.server` still uses password login.

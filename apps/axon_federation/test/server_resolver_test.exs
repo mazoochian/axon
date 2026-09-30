@@ -34,6 +34,14 @@ defmodule AxonFederation.ServerResolverTest do
     assert ServerResolver.resolve("example.org:9999") == "https://example.org:9999"
   end
 
+  test "a bracketed IPv6 literal with an explicit port is used as-is" do
+    assert ServerResolver.resolve("[::1]:8448") == "https://[::1]:8448"
+  end
+
+  test "a bracketed IPv6 literal without a port is not mistaken for host:port" do
+    assert ServerResolver.resolve("[::1]") == "https://[::1]:8448"
+  end
+
   test "an explicit-port server_name skips well-known even if a matching bare-name override exists" do
     # sanity: only exact server_name keys hit the override map, port or not
     Application.put_env(:axon_federation, :server_overrides, %{"hs2" => "http://127.0.0.1:1"})

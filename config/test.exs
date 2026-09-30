@@ -75,6 +75,7 @@ config :axon_web, :registration_shared_secret, "complement"
 # stays on suite-wide: fake remote servers are pervasive across the
 # federation test suite, not a handful of opt-in cases.
 config :axon_federation, :allow_private_addresses, true
+config :axon_push, :allow_private_addresses, true
 config :axon_media, :url_preview_allow_private_addresses, false
 
 config :logger, level: :warning

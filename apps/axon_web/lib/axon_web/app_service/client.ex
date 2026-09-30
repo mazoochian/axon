@@ -54,20 +54,18 @@ defmodule AxonWeb.AppService.Client do
   end
 
   defp query_json(registration, url) do
-    case request(:get, url, registration["hs_token"]) do
-      {:ok, %Finch.Response{status: status, body: body}} when status in 200..299 ->
-        case Jason.decode(body) do
-          {:ok, decoded} -> {:ok, decoded}
-          {:error, _} -> {:error, :invalid_json}
-        end
+    case AxonWeb.HttpJson.request(:get, url, AxonWeb.HttpJson.bearer(registration["hs_token"])) do
+      {:ok, decoded} ->
+        {:ok, decoded}
 
-      {:ok, %Finch.Response{status: 404}} ->
+      {:error, {:http_error, 404, _body}} ->
         {:error, :not_found}
 
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        {:error, {:http_error, status, body}}
+      {:error, {:http_error, _status, _body}} = error ->
+        error
 
       {:error, reason} ->
+        Logger.warning("AppService HTTP GET #{url} failed: #{inspect(reason)}")
         {:error, reason}
     end
   end
@@ -80,17 +78,4 @@ defmodule AxonWeb.AppService.Client do
   # query separator, which would otherwise let a segment like `../../admin`
   # redirect the outbound request to an unintended path on the AS.
   defp encode_path_segment(value), do: URI.encode(value, &URI.char_unreserved?/1)
-
-  defp request(method, url, hs_token) do
-    req = Finch.build(method, url, [{"authorization", "Bearer #{hs_token}"}])
-
-    case Finch.request(req, Axon.Finch, receive_timeout: 10_000) do
-      {:ok, resp} ->
-        {:ok, resp}
-
-      {:error, reason} ->
-        Logger.warning("AppService HTTP #{method} #{url} failed: #{inspect(reason)}")
-        {:error, reason}
-    end
-  end
 end

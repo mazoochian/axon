@@ -24,10 +24,9 @@ defmodule AxonPush.UserRules do
   """
 
   import Ecto.Query
+  import AxonCore.MapUtil, only: [maybe_put: 3]
   alias AxonCore.Repo
   alias AxonPush.DefaultRules
-
-  @rule_kinds ~w(override content room sender underride)
 
   @doc "Whether rule_id names one of this kind's server-default rules."
   def default_rule_id?(kind, rule_id) do
@@ -61,17 +60,19 @@ defmodule AxonPush.UserRules do
       )
       |> Enum.group_by(& &1.kind)
 
-    Map.new(@rule_kinds, fn kind -> {kind, merge_kind(kind, rows_by_kind[kind] || [])} end)
+    defaults = DefaultRules.rules(user_id)
+
+    Map.new(DefaultRules.kinds(), fn kind ->
+      {kind, merge_kind(defaults[kind], rows_by_kind[kind] || [])}
+    end)
   end
 
-  defp merge_kind(kind, rows) do
+  defp merge_kind(defaults, rows) do
     overrides = rows |> Enum.filter(& &1.is_default) |> Map.new(&{&1.rule_id, &1})
     custom = Enum.reject(rows, & &1.is_default)
 
     defaults =
-      DefaultRules.rules()
-      |> Map.get(kind, [])
-      |> Enum.map(fn default_rule ->
+      Enum.map(defaults, fn default_rule ->
         case overrides[default_rule["rule_id"]] do
           nil -> default_rule
           override -> apply_override(default_rule, override)
@@ -93,9 +94,6 @@ defmodule AxonPush.UserRules do
     |> maybe_put("conditions", row.conditions)
     |> maybe_put("actions", row.actions)
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   @doc "The single effective rule for {kind, rule_id}, or nil if it doesn't exist."
   def get_rule(user_id, kind, rule_id) do
@@ -133,24 +131,25 @@ defmodule AxonPush.UserRules do
     end
   end
 
-  @doc "Sets enabled on a rule (default or custom)."
+  @doc "Sets enabled on an existing rule (default or custom); `{:error, :not_found}` otherwise."
   def put_enabled(user_id, kind, rule_id, enabled) when is_boolean(enabled) do
-    is_default = default_rule_id?(kind, rule_id)
-
-    upsert(user_id, kind, rule_id, %{is_default: is_default},
-      replace: [:enabled],
-      set: %{enabled: enabled}
-    )
+    update_existing(user_id, kind, rule_id, :enabled, enabled)
   end
 
-  @doc "Sets actions on a rule (default or custom)."
+  @doc "Sets actions on an existing rule (default or custom); `{:error, :not_found}` otherwise."
   def put_actions(user_id, kind, rule_id, actions) when is_list(actions) do
-    is_default = default_rule_id?(kind, rule_id)
+    update_existing(user_id, kind, rule_id, :actions, actions)
+  end
 
-    upsert(user_id, kind, rule_id, %{is_default: is_default},
-      replace: [:actions],
-      set: %{actions: actions}
-    )
+  defp update_existing(user_id, kind, rule_id, column, value) do
+    if get_rule(user_id, kind, rule_id) do
+      upsert(user_id, kind, rule_id, %{is_default: default_rule_id?(kind, rule_id)},
+        replace: [column],
+        set: %{column => value}
+      )
+    else
+      {:error, :not_found}
+    end
   end
 
   @doc "Deletes a stored row — for a default-rule override this simply reverts to the true default."

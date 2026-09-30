@@ -19,7 +19,12 @@ defmodule AxonRoom.AuthRulesTest do
 
   defp create_event(creator \\ @creator) do
     {{"m.room.create", ""},
-     %{"type" => "m.room.create", "sender" => creator, "content" => %{"creator" => creator}}}
+     %{
+       "type" => "m.room.create",
+       "event_id" => "$create",
+       "sender" => creator,
+       "content" => %{"creator" => creator}
+     }}
   end
 
   defp member_event(user_id, membership, extra_content \\ %{}) do
@@ -45,6 +50,8 @@ defmodule AxonRoom.AuthRulesTest do
   end
 
   defp state(entries), do: Map.new(entries)
+
+  defp initial_join(event), do: Map.put(event, "prev_events", ["$create"])
 
   defp member_event_to_send(sender, target, membership, extra_content \\ %{}) do
     %{
@@ -110,8 +117,39 @@ defmodule AxonRoom.AuthRulesTest do
   describe "join" do
     test "creator can join their own just-created room before join_rules exists" do
       st = state([create_event()])
-      event = member_event_to_send(@creator, @creator, "join")
+      event = member_event_to_send(@creator, @creator, "join") |> initial_join()
       assert AuthRules.check(event, st, "11") == :ok
+    end
+
+    test "the creator cannot rejoin an invite-only room uninvited after the initial join" do
+      st = state([create_event(), join_rules_event("invite"), member_event(@creator, "leave")])
+      event = member_event_to_send(@creator, @creator, "join") |> Map.put("prev_events", ["$x"])
+      assert AuthRules.check(event, st, "11") == {:error, :not_invited}
+
+      assert AuthRules.check(event, Map.delete(st, {"m.room.join_rules", ""}), "11") ==
+               {:error, :not_invited}
+    end
+
+    test "the creator cannot rejoin a restricted room uninvited after the initial join" do
+      st =
+        state([create_event(), join_rules_event("restricted"), member_event(@creator, "leave")])
+
+      event = member_event_to_send(@creator, @creator, "join") |> Map.put("prev_events", ["$x"])
+      assert AuthRules.check(event, st, "11") == {:error, :not_invited}
+    end
+
+    test "only the create event's sender gets the initial-join exemption" do
+      st = state([create_event()])
+      event = member_event_to_send(@alice, @alice, "join") |> initial_join()
+      assert AuthRules.check(event, st, "11") == {:error, :not_invited}
+    end
+
+    test "a v12 additional creator still needs an invite to join an invite-only room" do
+      {key, create} = create_event()
+      create = put_in(create, ["content", "additional_creators"], [@alice])
+      st = state([{key, create}, member_event(@creator, "join"), join_rules_event("invite")])
+      event = member_event_to_send(@alice, @alice, "join") |> initial_join()
+      assert AuthRules.check(event, st, "12") == {:error, :not_invited}
     end
 
     test "a non-creator cannot join an implicit invite-only room without an invite" do
@@ -607,31 +645,139 @@ defmodule AxonRoom.AuthRulesTest do
   end
 
   # ---------------------------------------------------------------------------
-  # KNOWN GAP (not fixed here — see plan's fix-small-flag-big policy): the
-  # Matrix spec's m.room.power_levels auth rule (v11 rule 8) requires that no
-  # power-level value being changed may exceed the sender's OWN current power
-  # level (preventing self-escalation and demoting equals/superiors). This
-  # implementation only checks the generic state_default/events power gate —
-  # it does not compare the new values against the sender's own level. This
-  # test documents that gap; it is a genuine privilege-escalation-shaped
-  # finding, flagged in the Feature Spec Artifact rather than silently patched
-  # here (fixing it correctly means implementing the full per-key comparison
-  # rule, not a one-line change).
+  # m.room.power_levels changes (rules 10.1-10.10)
   # ---------------------------------------------------------------------------
 
-  describe "m.room.power_levels self-escalation (documented gap, not fixed here)" do
-    test "a user with exactly state_default power can grant themselves admin (100)" do
+  describe "m.room.power_levels changes" do
+    defp pl_state(content, extra \\ []) do
+      state([create_event(), member_event(@alice, "join"), power_levels_event(content) | extra])
+    end
+
+    defp pl_change(content), do: state_event(@alice, "m.room.power_levels", content)
+
+    test "a user cannot raise their own level above their current level" do
+      st = pl_state(%{"users" => %{@alice => 50}, "state_default" => 50})
+      event = pl_change(%{"users" => %{@alice => 100}, "state_default" => 50})
+      assert AuthRules.check(event, st, "11") == {:error, :insufficient_power}
+    end
+
+    test "a user can lower their own level" do
+      st = pl_state(%{"users" => %{@alice => 50}, "state_default" => 50})
+      event = pl_change(%{"users" => %{@alice => 10}, "state_default" => 10})
+      assert AuthRules.check(event, st, "11") == :ok
+    end
+
+    test "a user cannot change a peer at their own level, but can change one below it" do
+      st = pl_state(%{"users" => %{@alice => 50, @bob => 50, @creator => 10}})
+      demote_peer = pl_change(%{"users" => %{@alice => 50, @bob => 0, @creator => 10}})
+      assert AuthRules.check(demote_peer, st, "11") == {:error, :insufficient_power}
+
+      promote_lower = pl_change(%{"users" => %{@alice => 50, @bob => 50, @creator => 50}})
+      assert AuthRules.check(promote_lower, st, "11") == :ok
+
+      over_promote = pl_change(%{"users" => %{@alice => 50, @bob => 50, @creator => 51}})
+      assert AuthRules.check(over_promote, st, "11") == {:error, :insufficient_power}
+    end
+
+    test "top-level levels above the sender's level can be neither set nor changed" do
+      st = pl_state(%{"users" => %{@alice => 50}, "ban" => 100})
+
+      assert AuthRules.check(pl_change(%{"users" => %{@alice => 50}, "ban" => 40}), st, "11") ==
+               {:error, :insufficient_power}
+
+      st = pl_state(%{"users" => %{@alice => 50}})
+
+      assert AuthRules.check(pl_change(%{"users" => %{@alice => 50}, "kick" => 60}), st, "11") ==
+               {:error, :insufficient_power}
+
+      assert AuthRules.check(pl_change(%{"users" => %{@alice => 50}, "kick" => 40}), st, "11") ==
+               :ok
+    end
+
+    test "events and notifications entries are bounded by the sender's level" do
+      st = pl_state(%{"users" => %{@alice => 50}, "events" => %{"m.room.name" => 100}})
+
+      assert AuthRules.check(pl_change(%{"users" => %{@alice => 50}}), st, "11") ==
+               {:error, :insufficient_power}
+
+      st = pl_state(%{"users" => %{@alice => 50}})
+
+      assert AuthRules.check(
+               pl_change(%{"users" => %{@alice => 50}, "notifications" => %{"room" => 60}}),
+               st,
+               "11"
+             ) == {:error, :insufficient_power}
+
+      assert AuthRules.check(
+               pl_change(%{"users" => %{@alice => 50}, "events" => %{"m.room.topic" => 50}}),
+               st,
+               "11"
+             ) == :ok
+    end
+
+    test "room v10+ rejects non-integer levels; earlier versions accept integer strings" do
+      st = pl_state(%{"users" => %{@alice => 50}})
+      event = pl_change(%{"users" => %{@alice => 50}, "ban" => "50"})
+      assert AuthRules.check(event, st, "10") == {:error, :invalid_power_levels}
+      assert AuthRules.check(event, st, "9") == :ok
+    end
+
+    test "users/events/notifications must be objects of integers" do
+      st = pl_state(%{"users" => %{@alice => 50}})
+
+      for content <- [
+            %{"users" => [@alice]},
+            %{"users" => %{@alice => 50}, "events" => "nope"},
+            %{"users" => %{@alice => 50}, "notifications" => %{"room" => 1.5}},
+            %{"users" => %{"not-a-user" => 0, @alice => 50}}
+          ] do
+        assert AuthRules.check(pl_change(content), st, "11") == {:error, :invalid_power_levels}
+      end
+    end
+
+    test "the first power_levels event is not bounded by the sender's level" do
+      st = state([create_event(), member_event(@creator, "join")])
+      event = state_event(@creator, "m.room.power_levels", %{"users" => %{@creator => 200}})
+      assert AuthRules.check(event, st, "11") == :ok
+    end
+
+    test "a v12 creator can change any level" do
+      {key, create} = create_event()
+
+      st =
+        state([
+          {key, create},
+          member_event(@creator, "join"),
+          power_levels_event(%{"users" => %{@bob => 9_000}, "ban" => 9_000})
+        ])
+
+      event = state_event(@creator, "m.room.power_levels", %{"users" => %{@bob => 0}, "ban" => 1})
+      assert AuthRules.check(event, st, "12") == :ok
+    end
+
+    test "malformed stored levels are treated as absent instead of crashing" do
       st =
         state([
           create_event(),
           member_event(@alice, "join"),
-          power_levels_event(%{"users" => %{@alice => 50}, "state_default" => 50})
+          power_levels_event(%{"users" => "garbage", "users_default" => "x", "events" => [1]})
         ])
 
-      event = state_event(@alice, "m.room.power_levels", %{"users" => %{@alice => 100}})
-      # Spec-correct behavior would reject this (100 > sender's own level 50).
-      # Current implementation allows it.
-      assert AuthRules.check(event, st, "11") == :ok
+      assert AuthRules.check(message_event(@alice), st, "11") == :ok
+
+      assert AuthRules.check(state_event(@alice, "m.room.name", %{}), st, "11") ==
+               {:error, :insufficient_power}
+    end
+  end
+
+  describe "room_version/1" do
+    test "reads the create event's room_version, defaulting to \"1\" when absent" do
+      {key, create} = create_event()
+      assert AuthRules.room_version(state([{key, create}])) == "1"
+
+      assert AuthRules.room_version(
+               state([{key, put_in(create, ["content", "room_version"], "12")}])
+             ) == "12"
     end
   end
 
